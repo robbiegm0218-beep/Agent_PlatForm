@@ -24,6 +24,33 @@ body {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+.direct-open-notice {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background: #f7f7f5;
+}
+
+.direct-open-notice section {
+  width: min(440px, 100%);
+  padding: 28px;
+  border: 1px solid #deded8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.direct-open-notice h1 { margin: 18px 0 8px; font-size: 22px; }
+.direct-open-notice p { margin: 0 0 22px; color: #5e625c; line-height: 1.6; }
+.direct-open-notice a {
+  display: inline-block;
+  padding: 9px 14px;
+  border-radius: 6px;
+  background: #0f766e;
+  color: #ffffff;
+  text-decoration: none;
+}
+
 button,
 input,
 textarea {
@@ -460,6 +487,26 @@ form button:hover,
   background: var(--panel);
   color: var(--text);
 }
+
+.confirmation-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.confirmation-actions button {
+  min-height: 32px;
+}
+
+.artifact-link {
+  display: inline-block;
+  margin-top: 12px;
+  color: #0f766e;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.artifact-link:hover { text-decoration: underline; }
 
 .retry-button:hover {
   background: var(--panel-soft);

@@ -127,6 +127,19 @@ function showLogin() {
   els.workspaceView.classList.add("hidden");
 }
 
+function showDirectOpenNotice() {
+  document.body.innerHTML = `
+    <main class="direct-open-notice">
+      <section>
+        <div class="brand-mark">Agent_Platform</div>
+        <h1>请通过本地服务打开</h1>
+        <p>直接打开 HTML 页面无法连接登录、对话和文件生成服务。</p>
+        <a href="http://localhost:8765">打开 Agent_Platform</a>
+      </section>
+    </main>
+  `;
+}
+
 function showWorkspace() {
   els.loginView.classList.add("hidden");
   els.workspaceView.classList.remove("hidden");
@@ -158,6 +171,7 @@ async function loadThread(threadId) {
   renderThreads();
   renderMessages();
   await loadRuns();
+  await restorePendingConfirmation();
 }
 
 async function loadSkills() {
@@ -472,6 +486,22 @@ async function loadRuns() {
   const data = await api(`/api/threads/${state.currentThreadId}/runs`);
   state.runs = data.runs;
   renderRuns();
+}
+
+async function restorePendingConfirmation() {
+  const pending = state.runs.find((run) => run.status === "awaiting_confirmation");
+  if (!pending || els.messages.querySelector(".confirmation-actions")) return;
+  const detail = await api(`/api/runs/${pending.id}`);
+  if (!detail.confirmation || detail.confirmation.status !== "pending") return;
+  const assistant = appendAssistantMessage();
+  assistant.status.textContent = "处理状态 · 等待你的确认";
+  assistant.content.textContent = detail.confirmation.request;
+  const context = safeJson(detail.run.execution_context, {});
+  appendConfirmationActions(assistant, {
+    run_id: pending.id,
+    request: detail.confirmation.request,
+    kind: context.artifact_request?.kind || "",
+  }, "");
 }
 
 function renderRuns() {
@@ -816,6 +846,7 @@ async function sendMessage(content, { retry = false } = {}) {
 
   let assistant;
   let assistantContent = "";
+  let awaitingConfirmation = false;
   try {
     if (!state.messages.length && !retry) {
       els.messages.innerHTML = "";
@@ -871,12 +902,18 @@ async function sendMessage(content, { retry = false } = {}) {
           assistant.content.textContent = assistantContent;
           els.messages.scrollTop = els.messages.scrollHeight;
         }
+        if (event.event === "confirmation") {
+          awaitingConfirmation = true;
+          assistant.status.textContent = "处理状态 · 等待你的确认";
+          assistant.content.textContent = event.data.request || "此操作需要确认后才能执行。";
+          appendConfirmationActions(assistant, event.data, content);
+        }
         if (event.event === "error") {
           throw new Error(event.data.error || "运行失败");
         }
       }
     }
-    if (!assistantContent) {
+    if (!assistantContent && !awaitingConfirmation) {
       throw new Error("模型未返回内容");
     }
     assistant.status.textContent = "处理状态 · 已完成";
@@ -898,6 +935,100 @@ async function sendMessage(content, { retry = false } = {}) {
     await refreshThreadList();
     await loadRuns();
   }
+}
+
+function appendConfirmationActions(assistant, confirmation, sourceContent) {
+  if (assistant.wrapper.querySelector(".confirmation-actions")) return;
+  const actions = document.createElement("div");
+  actions.className = "confirmation-actions";
+  const approveButton = document.createElement("button");
+  approveButton.type = "button";
+  approveButton.textContent = "确认执行";
+  const rejectButton = document.createElement("button");
+  rejectButton.type = "button";
+  rejectButton.className = "secondary";
+  rejectButton.textContent = "取消";
+  const setBusy = (busy) => {
+    approveButton.disabled = busy;
+    rejectButton.disabled = busy;
+  };
+  approveButton.addEventListener("click", async () => {
+    setBusy(true);
+    assistant.status.textContent = "处理状态 · 正在继续运行";
+    try {
+      const result = await api(`/api/runs/${confirmation.run_id}/confirmation`, {
+        method: "POST",
+        body: JSON.stringify({ approved: true }),
+      });
+      assistant.status.textContent = "处理状态 · 已完成";
+      renderMessageContent(assistant.content, result.content || "");
+      if (result.content) state.messages.push({ role: "assistant", content: result.content });
+      actions.remove();
+      if (result.artifact) appendArtifactLink(assistant.wrapper, result.artifact);
+      await Promise.all([refreshThreadList(), loadRuns()]);
+    } catch (error) {
+      assistant.status.textContent = "处理状态 · 运行失败";
+      assistant.content.textContent = error.message || "文件生成失败";
+      setBusy(false);
+    }
+  });
+  rejectButton.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      await api(`/api/runs/${confirmation.run_id}/confirmation`, {
+        method: "POST",
+        body: JSON.stringify({ approved: false }),
+      });
+      assistant.status.textContent = "处理状态 · 已取消";
+      assistant.content.textContent = "已取消本次文件生成，未创建任何文件。";
+      actions.remove();
+      await loadRuns();
+    } catch (error) {
+      assistant.status.textContent = "处理状态 · 取消失败";
+      assistant.content.textContent = error.message || "取消失败";
+      setBusy(false);
+    }
+  });
+  actions.append(approveButton, rejectButton);
+  assistant.wrapper.appendChild(actions);
+}
+
+function appendArtifactLink(wrapper, artifact) {
+  const link = document.createElement("a");
+  link.className = "artifact-link";
+  link.href = "#";
+  link.textContent = `下载文件：${artifact.filename}`;
+  link.title = artifact.summary || "下载本次生成的文件";
+  link.addEventListener("click", async (event) => {
+    event.preventDefault();
+    link.setAttribute("aria-busy", "true");
+    const originalText = link.textContent;
+    link.textContent = "正在下载文件...";
+    try {
+      const response = await fetch(`/api/artifacts/${artifact.id}/download`, {
+        headers: { Authorization: `Bearer ${state.token}` },
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "文件下载失败");
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const download = document.createElement("a");
+      download.href = url;
+      download.download = artifact.filename;
+      document.body.appendChild(download);
+      download.click();
+      download.remove();
+      URL.revokeObjectURL(url);
+      link.textContent = originalText;
+    } catch (error) {
+      link.textContent = error.message || "文件下载失败";
+      window.setTimeout(() => { link.textContent = originalText; }, 2500);
+    } finally {
+      link.removeAttribute("aria-busy");
+    }
+  });
+  wrapper.appendChild(link);
 }
 
 function appendRetryButton(wrapper, content) {
@@ -1154,4 +1285,8 @@ els.logoutAllButton.addEventListener("click", async () => {
   showLogin();
 });
 
-boot();
+if (window.location.protocol === "file:") {
+  showDirectOpenNotice();
+} else {
+  boot();
+}

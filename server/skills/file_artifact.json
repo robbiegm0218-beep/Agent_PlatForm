@@ -1,0 +1,12 @@
+{
+  "id": "file_artifact",
+  "name": "文件生成",
+  "description": "生成本地 Markdown 和 Excel 文件；文件创建前必须由用户确认。",
+  "version": "1.0.0",
+  "prompt": "目标：在用户明确要求时提供 Markdown 或 Excel 本地文件。规则：先说明可生成的文件类型；文件写入必须等待平台确认卡片被用户批准；仅生成平台支持的 .md 或 .xlsx 格式。禁止：不要声称已创建未确认的文件，不要承诺 Word、PDF 或任意路径写入。",
+  "input_limit": 12000,
+  "default_enabled": true,
+  "status": "enabled",
+  "kind": "tool_skill",
+  "tool_ids": ["markdown_artifact", "xlsx_artifact"]
+}

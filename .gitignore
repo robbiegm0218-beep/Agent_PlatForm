@@ -4,4 +4,6 @@ __pycache__/
 agent_platform.db
 data/knowledge/
 data/evaluations/
+data/artifacts/
+server/node_modules
 .DS_Store

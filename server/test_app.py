@@ -5,6 +5,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from urllib.parse import quote
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -36,13 +37,13 @@ class AgentPlatformApiTests(unittest.TestCase):
         app.DEEPSEEK_BASE_URL = self.original_base_url
         self.temp_dir.cleanup()
 
-    def request_json(self, path, payload=None, token=None, method=None):
+    def request_json(self, path, payload=None, token=None, method=None, timeout=3):
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method or ("POST" if data else "GET"))
-        with urllib.request.urlopen(request, timeout=3) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def chat(self, payload):
@@ -55,6 +56,14 @@ class AgentPlatformApiTests(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=3) as response:
             raw = response.read().decode("utf-8")
         return [self.parse_event(event) for event in raw.strip().split("\n\n") if event]
+
+    def download_artifact(self, artifact_id):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/artifacts/{artifact_id}/download",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read(), response.headers.get_content_type()
 
     @staticmethod
     def parse_event(raw):
@@ -71,6 +80,11 @@ class AgentPlatformApiTests(unittest.TestCase):
         return result["token"]
 
     def test_multiple_turns_complete_and_history_is_stable(self):
+        apps = self.request_json("/api/apps", token=self.token)["apps"]
+        self.assertIn("local_artifacts", [app_item["id"] for app_item in apps])
+        skills = self.request_json("/api/skills", token=self.token)["skills"]
+        self.assertTrue(next(skill for skill in skills if skill["id"] == "file_artifact")["enabled"])
+
         first_events = self.chat({"thread_id": "", "content": "第一轮"})
         self.assertEqual(first_events[-1]["event"], "done")
         thread_id = next(event["data"]["thread_id"] for event in first_events if event["event"] == "meta")
@@ -89,7 +103,8 @@ class AgentPlatformApiTests(unittest.TestCase):
             [event["type"] for event in run_detail["events"]],
             ["started", "execution_context", "skill_routed", "knowledge_not_needed", "plan_created", "model_request", "completed"],
         )
-        self.assertEqual(json.loads(run_detail["run"]["skill_snapshot"])[0]["id"], "general_assistant")
+        self.assertIn("general_assistant", [skill["id"] for skill in json.loads(run_detail["run"]["skill_snapshot"])])
+        self.assertIn("file_artifact", [skill["id"] for skill in json.loads(run_detail["run"]["skill_snapshot"])])
         context = json.loads(run_detail["run"]["execution_context"])
         self.assertEqual(context["model"], app.DEEPSEEK_MODEL)
         self.assertEqual(context["allowed_tool_ids"], [])
@@ -114,6 +129,77 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.chat({"thread_id": thread_id, "content": "第四轮"})
         disabled_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         self.assertNotIn("code_assistant", [skill["id"] for skill in json.loads(disabled_run["skill_snapshot"])])
+
+    def test_markdown_artifact_waits_for_confirmation_and_is_audited(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "请生成 Markdown 文件，整理本次平台说明"})
+            self.assertEqual(events[-1]["event"], "confirmation")
+            meta = next(event["data"] for event in events if event["event"] == "meta")
+            run_id = meta["run_id"]
+            detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertEqual(detail["run"]["status"], "awaiting_confirmation")
+            self.assertTrue(detail["steps"][0]["requires_confirmation"])
+            self.assertEqual(detail["steps"][0]["status"], "awaiting_confirmation")
+
+            result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30)
+            self.assertTrue(result["approved"])
+            self.assertEqual(result["artifact"]["kind"], "markdown")
+            artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
+            self.assertEqual(artifacts[0]["id"], result["artifact"]["id"])
+            self.assertTrue(Path(artifacts[0]["storage_path"]).is_file())
+            detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertEqual(detail["run"]["status"], "completed")
+            self.assertIn("artifact_created", [event["type"] for event in detail["events"]])
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_file_capability_question_does_not_confirm_but_followup_generate_does(self):
+        question_events = self.chat({"thread_id": "", "content": "你可以生成 md 文件吗？"})
+        self.assertEqual(question_events[-1]["event"], "done")
+        thread_id = next(event["data"]["thread_id"] for event in question_events if event["event"] == "meta")
+        question_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        self.assertEqual(question_run["status"], "completed")
+
+        generate_events = self.chat({"thread_id": thread_id, "content": "生成"})
+        self.assertEqual(generate_events[-1]["event"], "confirmation")
+        self.assertEqual(generate_events[-1]["data"]["kind"], "markdown")
+
+    def test_rejected_artifact_request_creates_no_file(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "创建 md 文件，输出项目计划"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": False}, self.token)
+            self.assertFalse(result["approved"])
+            self.assertFalse(app.ARTIFACT_DIR.exists())
+            detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertEqual(detail["run"]["status"], "cancelled")
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_xlsx_artifact_uses_a_fixed_workbook_and_cleans_sidecar_files(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "请生成 xlsx 文件，输出项目计划"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30)
+            artifact = result["artifact"]
+            self.assertEqual(artifact["kind"], "xlsx")
+            artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
+            path = Path(artifacts[0]["storage_path"])
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.with_name(path.name + ".inspect.ndjson").exists())
+            downloaded, content_type = self.download_artifact(artifact["id"])
+            self.assertEqual(content_type, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.assertTrue(downloaded.startswith(b"PK"))
+            with zipfile.ZipFile(path) as workbook:
+                self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
 
     def test_local_tool_execution_is_bounded_and_audited(self):
         events = self.chat({"thread_id": "", "content": "请告诉我平台状态"})
@@ -220,6 +306,14 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(context["knowledge_route"], "retrieved")
         self.assertEqual(context["knowledge_match_count"], 1)
         self.assertIn("knowledge_retrieved", [event["type"] for event in self.request_json(f"/api/runs/{run['id']}", token=self.token)["events"]])
+
+        generic_events = self.chat({"thread_id": thread_id, "content": "请分析一下这个平台的界面布局"})
+        generic_answer = "".join(event["data"].get("content", "") for event in generic_events)
+        generic_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        generic_context = json.loads(generic_run["execution_context"])
+        self.assertNotIn("参考资料：", generic_answer)
+        self.assertEqual(generic_context["knowledge_route"], "not_needed")
+        self.assertEqual(generic_context["knowledge_intent"]["reason"], "not_recognized")
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])

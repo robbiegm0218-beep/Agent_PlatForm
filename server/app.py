@@ -11,6 +11,8 @@ import time
 import secrets
 import logging
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 import uuid
@@ -41,6 +43,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT_DIR / "web"
 DB_PATH = ROOT_DIR / "agent_platform.db"
 KNOWLEDGE_DIR = ROOT_DIR / "data" / "knowledge"
+ARTIFACT_DIR = ROOT_DIR / "data" / "artifacts"
+ARTIFACT_NODE = os.environ.get("ARTIFACT_NODE", shutil.which("node") or "node")
+ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
 
 
 def load_env_file(path: Path) -> None:
@@ -220,6 +225,13 @@ APPS = [
         "id": "local_skill_registry",
         "name": "本地技能库",
         "description": "第一版技能由代码维护，用户可在前台启用或禁用。",
+        "status": "enabled",
+        "category": "app",
+    },
+    {
+        "id": "local_artifacts",
+        "name": "本地文件产物",
+        "description": "可生成 Markdown 和 Excel 文件；创建文件前必须由用户确认。",
         "status": "enabled",
         "category": "app",
     },
@@ -420,6 +432,24 @@ def init_db() -> None:
                 position INTEGER NOT NULL,
                 content TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                summary TEXT DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_confirmations (
+                run_id TEXT PRIMARY KEY,
+                request TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision TEXT DEFAULT '',
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER
+            );
             """
         )
         ensure_column(conn, "threads", "context_summary", "TEXT DEFAULT ''")
@@ -475,9 +505,9 @@ def infer_task_profile(content: str, requested_model: str = "auto", requested_ta
     deep_markers = ("调研", "方案", "报告", "深度", "全面", "竞品", "商业计划", "架构设计", "复盘")
     standard_markers = ("改写", "撰写", "写一", "代码", "分析", "待办", "负责人", "设计")
     tool_markers = ("平台状态", "系统状态", "文件", "检索", "查找", "搜索")
-    evidence_markers = ("调研", "方案", "报告", "分析", "对比", "竞品", "依据", "资料", "事实")
     needs_tools = any(marker in content for marker in tool_markers)
-    needs_knowledge = any(marker in content for marker in evidence_markers)
+    knowledge_intent = classify_knowledge_intent(content)
+    needs_knowledge = knowledge_intent["needed"]
     complexity = "deep" if len(content) >= 80 or any(marker in content for marker in deep_markers) else "standard"
     if len(content) < 32 and complexity != "deep" and not any(marker in content for marker in standard_markers):
         complexity = "quick"
@@ -508,9 +538,31 @@ def infer_task_profile(content: str, requested_model: str = "auto", requested_ta
         "reason": reason,
         "needs_tools": needs_tools,
         "needs_knowledge": needs_knowledge,
+        "knowledge_intent": knowledge_intent,
         "max_output_tokens": profile["max_output_tokens"][complexity],
         "quality_check": complexity == "deep",
     }
+
+
+def classify_knowledge_intent(content: str) -> dict:
+    """Allow retrieval only for an explicit local-source request or a factual query."""
+    normalized = re.sub(r"\s+", "", content.lower())
+    local_source_markers = ("知识库", "本地资料", "上传资料", "参考资料", "附件", "文档中", "材料中")
+    if any(marker in normalized for marker in local_source_markers):
+        return {"needed": True, "reason": "explicit_local_source"}
+    if re.search(r"(?:根据|基于|查阅|引用|检索).{0,10}(?:资料|文档|材料|来源)", normalized):
+        return {"needed": True, "reason": "explicit_local_source"}
+
+    # A definition/data question can be answered from a matching local source, but UI and writing requests are not evidence requests.
+    operational_markers = ("平台", "技能", "模型", "版本", "接口", "服务", "对话", "文件夹", "改动范围", "今天", "星期", "代码")
+    factual_markers = ("什么是", "是什么", "定义", "含义", "说明", "介绍", "多少", "数据", "指标", "事实")
+    if (
+        len(normalized) >= 5
+        and any(marker in normalized for marker in factual_markers)
+        and not any(marker in normalized for marker in operational_markers)
+    ):
+        return {"needed": True, "reason": "factual_query"}
+    return {"needed": False, "reason": "not_recognized"}
 
 
 def allowed_tools_for_task(content: str) -> list[dict]:
@@ -636,6 +688,7 @@ def build_execution_context(user_id: str, task_profile: dict, active_skills: lis
         "task_preview": content[:160],
         "knowledge_refs": knowledge_refs,
         "knowledge_route": "retrieved" if knowledge_refs else ("required_no_match" if task_profile["needs_knowledge"] else "not_needed"),
+        "knowledge_intent": task_profile["knowledge_intent"],
         "knowledge_match_count": len(knowledge_refs),
     }
 
@@ -779,6 +832,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/knowledge":
             self.list_knowledge(user)
             return
+        if self.path == "/api/artifacts":
+            self.list_artifacts(user)
+            return
+        if self.path.startswith("/api/artifacts/") and self.path.endswith("/download"):
+            self.download_artifact(user)
+            return
         if self.path.startswith("/api/knowledge/search"):
             self.search_knowledge_api(user)
             return
@@ -810,6 +869,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_json({"apps": [
                 {**APPS[0], "status": "已连接" if DEEPSEEK_API_KEY else "未配置"},
                 {**APPS[1], "status": f"已启用 · {len(SKILLS)} 项 · v1"},
+                {**APPS[2], "status": "已启用 · 创建前需确认"},
             ]})
             return
         if self.path == "/api/tools":
@@ -841,6 +901,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/folders":
             self.create_folder(user)
+            return
+        if self.path.startswith("/api/runs/") and self.path.endswith("/confirmation"):
+            self.resolve_confirmation(user)
             return
         if self.path == "/api/chat":
             self.chat(user)
@@ -1099,7 +1162,46 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             steps = conn.execute(
                 "SELECT * FROM run_steps WHERE run_id = ? ORDER BY position ASC", (run_id,)
             ).fetchall()
-        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps]})
+            confirmation = conn.execute(
+                "SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None})
+
+    def resolve_confirmation(self, user: dict) -> None:
+        run_id = self.path.split("/")[-2]
+        approved = self.read_json().get("approved")
+        if not isinstance(approved, bool):
+            self.send_error_json("确认结果无效")
+            return
+        with db() as conn:
+            run = conn.execute("SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
+            confirmation = conn.execute("SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)).fetchone()
+            if not run or not confirmation:
+                self.send_error_json("待确认运行不存在", HTTPStatus.NOT_FOUND)
+                return
+            if confirmation["status"] != "pending" or run["status"] != "awaiting_confirmation":
+                self.send_error_json("该运行已处理", HTTPStatus.CONFLICT)
+                return
+            status = "approved" if approved else "rejected"
+            conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ?", (status, "用户批准" if approved else "用户拒绝", now(), run_id))
+            if not approved:
+                conn.execute("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?", ("cancelled", now(), run_id))
+                conn.execute(
+                    "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'",
+                    ("cancelled", now(), run_id),
+                )
+            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "confirmation_resolved", json.dumps({"approved": approved}), now()))
+        if not approved:
+            self.send_json({"ok": True, "approved": False, "run_id": run_id})
+            return
+
+        try:
+            result = complete_confirmed_artifact_run(run_id, user["id"])
+        except Exception as exc:
+            LOGGER.warning("confirmed_run_failed run_id=%s error=%s", run_id, str(exc)[:160])
+            self.send_error_json(str(exc), HTTPStatus.BAD_GATEWAY)
+            return
+        self.send_json({"ok": True, "approved": True, "run_id": run_id, **result})
 
     def get_metrics(self, user: dict) -> None:
         with db() as conn:
@@ -1134,6 +1236,33 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (user["id"],),
             ).fetchall()
         self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader)})
+
+    def list_artifacts(self, user: dict) -> None:
+        with db() as conn:
+            rows = conn.execute("SELECT * FROM artifacts WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)).fetchall()
+        self.send_json({"artifacts": [row_to_dict(row) for row in rows]})
+
+    def download_artifact(self, user: dict) -> None:
+        artifact_id = self.path.split("/")[-2]
+        with db() as conn:
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE id = ? AND user_id = ?", (artifact_id, user["id"])
+            ).fetchone()
+        if not artifact:
+            self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
+            return
+        path = Path(artifact["storage_path"])
+        allowed_root = ARTIFACT_DIR.resolve()
+        if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
+            self.send_error_json("文件产物不可用", HTTPStatus.NOT_FOUND)
+            return
+        content_type = "text/markdown; charset=utf-8" if artifact["kind"] == "markdown" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{artifact["filename"]}"')
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
+        self.wfile.write(path.read_bytes())
 
     def search_knowledge_api(self, user: dict) -> None:
         query = parse_qs(urlparse(self.path).query).get("query", [""])[0].strip()
@@ -1371,6 +1500,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
                     (content[:24], now(), thread_id),
                 )
+            # Resolve short commands such as “生成” against prior committed user intent.
+            artifact_kind = requested_artifact_kind(content, thread_id)
             if retry:
                 last_user_message = conn.execute(
                     """
@@ -1389,8 +1520,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     (new_id("msg"), thread_id, "user", content, now()),
                 )
             active_skills = requested_active_skills if requested_active_skills is not None else enabled_skills(user["id"], thread_id)
-            knowledge_refs = search_knowledge(user["id"], content)
+            knowledge_refs = search_knowledge(user["id"], content) if task_profile["needs_knowledge"] else []
             execution_context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs)
+            artifact_enabled = any(skill["id"] == "file_artifact" for skill in active_skills)
+            if artifact_kind and not artifact_enabled:
+                self.send_error_json("本地文件产物技能未启用，请先在“技能和应用”中启用后再生成文件。", HTTPStatus.BAD_REQUEST)
+                return
+            if artifact_kind:
+                execution_context["artifact_request"] = {"kind": artifact_kind, "target": "本地受控产物目录"}
             actual_model = execution_context["model"]
             execution_plan = build_execution_plan(content, active_skills, execution_context["tools"])
             run_id = new_id("run")
@@ -1402,7 +1539,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (
                     run_id,
                     thread_id,
-                    "running",
+                    "awaiting_confirmation" if artifact_kind else "running",
                     actual_model,
                     now(),
                     json.dumps(active_skills, ensure_ascii=False),
@@ -1427,7 +1564,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             )
             conn.execute(
                 "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, knowledge_event, json.dumps({"count": len(knowledge_refs)}, ensure_ascii=False), now()),
+                (new_id("event"), run_id, knowledge_event, json.dumps({"count": len(knowledge_refs), "intent": task_profile["knowledge_intent"]["reason"]}, ensure_ascii=False), now()),
             )
             conn.execute(
                 "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1439,10 +1576,20 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (new_id("step"), run_id, index, step["title"], "pending", 0, now())
+                    (new_id("step"), run_id, index, step["title"], "awaiting_confirmation" if artifact_kind and index == 1 else "pending", 1 if artifact_kind and index == 1 else 0, now())
                     for index, step in enumerate(execution_plan, start=1)
                 ],
             )
+            if artifact_kind:
+                request = artifact_confirmation_text(artifact_kind)
+                conn.execute(
+                    "INSERT INTO run_confirmations (run_id, request, status, created_at) VALUES (?, ?, ?, ?)",
+                    (run_id, request, "pending", now()),
+                )
+                conn.execute(
+                    "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (new_id("event"), run_id, "confirmation_requested", json.dumps({"kind": artifact_kind, "target": "data/artifacts"}, ensure_ascii=False), now()),
+                )
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1457,6 +1604,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.write_event("status", {"summary": event_summary("skill_routed", {"skills": [skill["name"] for skill in active_skills]})})
             self.write_event("status", {"summary": event_summary(knowledge_event, {"count": len(knowledge_refs)})})
             self.write_event("status", {"summary": event_summary("plan_created", {"steps": execution_plan})})
+            if artifact_kind:
+                self.write_event("confirmation", {"run_id": run_id, "request": artifact_confirmation_text(artifact_kind), "kind": artifact_kind})
+                return
             with db() as conn:
                 conn.execute(
                     "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1635,6 +1785,13 @@ def build_system_prompt(execution_context: dict) -> str:
         system_prompt += "\n\n[工具规则]\n仅在必要时调用当前提供的只读工具。工具结果仅作为事实依据，不能泄露敏感配置。"
     else:
         system_prompt += "\n\n[工具规则]\n本次任务未授权工具调用，请直接基于已提供上下文回答。"
+    if any(skill["id"] == "file_artifact" for skill in active_skills):
+        system_prompt += (
+            "\n\n[本地文件产物]\n平台已启用本地 Markdown（.md）和 Excel（.xlsx）生成能力。"
+            "当用户询问是否支持时，应明确回答支持；当用户明确要求生成时，平台会先展示确认操作，"
+            "用户确认后才会写入 data/artifacts/ 并返回下载入口。不要对能力询问、模糊回复或“确定”声称已经弹出确认卡；"
+            "只有平台实际返回确认卡后才能说明等待确认。不得声称已经生成，除非收到实际产物结果。"
+        )
     references = execution_context.get("knowledge_refs", [])
     if references:
         source_text = "\n\n".join(f"资料：{item['filename']}\n内容：{item['excerpt']}" for item in references)
@@ -1653,12 +1810,151 @@ def append_knowledge_sources(answer: str, references: list[dict], knowledge_rout
     return answer
 
 
+def requested_artifact_kind_from_content(content: str) -> str:
+    """Recognize actual file-creation commands, not capability questions."""
+    normalized = re.sub(r"\s+", "", content.lower())
+    if artifact_kind_from_text(normalized) and normalized.endswith(("吗", "么", "？", "?")):
+        return ""
+    if re.search(r"(?:能否|是否|怎么|如何|支持|可以|可否|能不能|会不会).{0,12}(?:生成|创建|导出|保存)", normalized):
+        return ""
+    if not re.search(r"(?:生成|创建|导出|保存(?:为)?).{0,20}", normalized):
+        return ""
+    return artifact_kind_from_text(normalized)
+
+
+def artifact_kind_from_text(content: str) -> str:
+    normalized = re.sub(r"\s+", "", content.lower())
+    if re.search(r"(?:\.xlsx\b|xlsx|excel|表格)", normalized):
+        return "xlsx"
+    if re.search(r"(?:\.md\b|markdown|md文件|md文档)", normalized):
+        return "markdown"
+    return ""
+
+
+def requested_artifact_kind(content: str, thread_id: str = "") -> str:
+    """Use an immediately preceding file type only for a short, explicit creation command."""
+    kind = requested_artifact_kind_from_content(content)
+    if kind or not thread_id:
+        return kind
+    normalized = re.sub(r"\s+", "", content.lower()).strip("。！!")
+    if normalized not in {"生成", "创建", "导出", "保存", "生成文件", "创建文件"}:
+        return ""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT content FROM messages WHERE thread_id = ? AND role = 'user' ORDER BY created_at DESC, id DESC LIMIT 6",
+            (thread_id,),
+        ).fetchall()
+    for row in rows:
+        prior_kind = artifact_kind_from_text(row["content"])
+        if prior_kind:
+            return prior_kind
+    return ""
+
+
+def artifact_confirmation_text(kind: str) -> str:
+    label = "Excel（.xlsx）" if kind == "xlsx" else "Markdown（.md）"
+    return f"将根据本次任务生成 {label} 文件，并写入本机 data/artifacts/ 目录。确认后才会创建文件。"
+
+
+def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, answer: str) -> dict:
+    if kind not in {"markdown", "xlsx"}:
+        raise ValueError("不支持的文件类型")
+    artifact_id = new_id("artifact")
+    extension = ".xlsx" if kind == "xlsx" else ".md"
+    filename = f"{artifact_id}{extension}"
+    storage_dir = ARTIFACT_DIR / user_id
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    path = (storage_dir / filename).resolve()
+    if storage_dir.resolve() not in path.parents or path.exists():
+        raise ValueError("文件产物路径无效")
+    title = source_content.strip().splitlines()[0][:80] or "Agent_Platform 输出"
+    try:
+        if kind == "markdown":
+            path.write_text(f"# {title}\n\n{answer.strip()}\n", encoding="utf-8")
+        else:
+            result = subprocess.run(
+                [ARTIFACT_NODE, str(ARTIFACT_SCRIPT), str(path), title, answer],
+                cwd=str(ROOT_DIR), text=True, capture_output=True, timeout=30,
+            )
+            if result.returncode != 0 or not path.exists():
+                raise RuntimeError((result.stderr or result.stdout or "Excel 生成器未返回文件").strip()[:500])
+            # artifact-tool may create an adjacent inspection file; it is not a user artifact.
+            path.with_name(path.name + ".inspect.ndjson").unlink(missing_ok=True)
+    except Exception:
+        path.unlink(missing_ok=True)
+        path.with_name(path.name + ".inspect.ndjson").unlink(missing_ok=True)
+        raise
+    summary = f"由运行 {run_id} 生成的{'Excel' if kind == 'xlsx' else 'Markdown'}文件"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (artifact_id, user_id, run_id, filename, kind, str(path), summary, now()),
+        )
+        conn.execute(
+            "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (new_id("event"), run_id, "artifact_created", json.dumps({"artifact_id": artifact_id, "filename": filename, "kind": kind}, ensure_ascii=False), now()),
+        )
+    return {"id": artifact_id, "filename": filename, "kind": kind, "summary": summary}
+
+
+def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
+    with db() as conn:
+        run = conn.execute(
+            "SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?",
+            (run_id, user_id),
+        ).fetchone()
+        user_message = conn.execute(
+            "SELECT content FROM messages WHERE thread_id = ? AND role = 'user' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (run["thread_id"],),
+        ).fetchone() if run else None
+        if not run or not user_message:
+            raise ValueError("待确认运行不存在")
+        context = json.loads(run["execution_context"] or "{}")
+        request = context.get("artifact_request") or {}
+        kind = request.get("kind")
+        if kind not in {"markdown", "xlsx"}:
+            raise ValueError("该运行没有可执行的文件产物请求")
+        conn.execute("UPDATE runs SET status = ? WHERE id = ?", ("running", run_id))
+        conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'", ("running", now(), run_id))
+        conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "model_request", json.dumps({"model": run["model"]}), now()))
+
+    def emit_runtime_event(event_type: str, payload: dict) -> None:
+        with db() as event_conn:
+            event_conn.execute(
+                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (new_id("event"), run_id, event_type, json.dumps(payload, ensure_ascii=False), now()),
+            )
+
+    try:
+        source_content = user_message["content"]
+        draft = "".join(stream_answer(run["thread_id"], source_content, context, emit_runtime_event))
+        answer, reflection = reflect_answer(source_content, draft, context, emit_runtime_event)
+        answer = append_knowledge_sources(answer, context.get("knowledge_refs", []), context.get("knowledge_route", ""))
+        artifact = create_artifact(user_id, run_id, kind, source_content, answer)
+        with db() as conn:
+            conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], "assistant", answer, now()))
+            conn.execute("UPDATE runs SET status = ?, completed_at = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ? WHERE id = ?", ("completed", now(), json.dumps(reflection, ensure_ascii=False), estimate_tokens(source_content), estimate_tokens(answer), conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"], run_id))
+            conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now(), run["thread_id"]))
+            conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')", ("completed", now(), run_id))
+            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "completed", json.dumps({"length": len(answer)}, ensure_ascii=False), now()))
+        return {"content": answer, "artifact": artifact}
+    except Exception as exc:
+        with db() as conn:
+            conn.execute("UPDATE runs SET status = ?, completed_at = ?, error = ? WHERE id = ?", ("failed", now(), str(exc), run_id))
+            conn.execute("UPDATE run_steps SET status = ?, error = ?, updated_at = ? WHERE run_id = ? AND status = 'running'", ("failed", str(exc), now(), run_id))
+            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "failed", json.dumps({"error": str(exc)}, ensure_ascii=False), now()))
+        raise
+
+
 def stream_answer(thread_id: str, user_content: str, execution_context: dict, on_event) -> object:
     system_prompt = build_system_prompt(execution_context)
 
     if is_skill_inventory_question(user_content):
-        names = "、".join(skill["name"] for skill in active_skills) or "当前没有启用技能"
-        answer = f"当前可调用的技能：{names}。"
+        names = "、".join(skill["name"] for skill in execution_context["skills"]) or "当前没有启用技能"
+        artifact_note = "已启用本地 Markdown 和 Excel 文件生成，创建前需要确认。" if any(
+            skill["id"] == "file_artifact" for skill in execution_context["skills"]
+        ) else ""
+        answer = f"当前可调用的技能：{names}。{artifact_note}"
         yield from chunk_text(answer, 10)
         return
 
