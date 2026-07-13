@@ -2,6 +2,8 @@ const state = {
   token: localStorage.getItem("agent_platform_token") || "",
   user: null,
   threads: [],
+  folders: [],
+  collapsedFolderIds: new Set(),
   currentThreadId: "",
   messages: [],
   runs: [],
@@ -22,6 +24,7 @@ const els = {
   passwordInput: document.querySelector("#passwordInput"),
   threadList: document.querySelector("#threadList"),
   threadSearch: document.querySelector("#threadSearch"),
+  newFolderButton: document.querySelector("#newFolderButton"),
   newThreadButton: document.querySelector("#newThreadButton"),
   chatPage: document.querySelector("#chatPage"),
   skillsPage: document.querySelector("#skillsPage"),
@@ -31,7 +34,6 @@ const els = {
   threadTitle: document.querySelector("#threadTitle"),
   modelStatus: document.querySelector("#modelStatus"),
   runDetailsButton: document.querySelector("#runDetailsButton"),
-  threadSkillsButton: document.querySelector("#threadSkillsButton"),
   runDrawer: document.querySelector("#runDrawer"),
   closeRunDrawer: document.querySelector("#closeRunDrawer"),
   runList: document.querySelector("#runList"),
@@ -74,7 +76,9 @@ function api(path, options = {}) {
   }).then(async (response) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.error || "请求失败");
+      const error = new Error(data.error || "请求失败");
+      error.status = response.status;
+      throw error;
     }
     return data;
   });
@@ -90,12 +94,32 @@ async function boot() {
     state.user = user;
     els.modelStatus.textContent = health.deepseek_configured ? `DeepSeek / ${health.model}` : "DeepSeek / 本地模拟";
     showWorkspace();
-    await refreshAll();
+    try {
+      await refreshAll();
+    } catch (error) {
+      showWorkspaceLoadError(error);
+    }
   } catch (error) {
-    localStorage.removeItem("agent_platform_token");
-    state.token = "";
+    if (error.status === 401) {
+      localStorage.removeItem("agent_platform_token");
+      state.token = "";
+      showLogin();
+      return;
+    }
+    els.loginError.textContent = `无法连接本地服务：${error.message}`;
     showLogin();
   }
+}
+
+function showWorkspaceLoadError(error) {
+  els.messages.innerHTML = "";
+  const notice = document.createElement("div");
+  notice.className = "empty-state";
+  notice.innerHTML = "<h1>工作区暂时无法加载</h1>";
+  const detail = document.createElement("p");
+  detail.textContent = error.message;
+  notice.appendChild(detail);
+  els.messages.appendChild(notice);
 }
 
 function showLogin() {
@@ -111,7 +135,7 @@ function showWorkspace() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadThreads(), loadSkills(), loadApps(), loadModels(), loadKnowledge()]);
+  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge()]);
   renderThreads();
   renderMessages();
 }
@@ -119,6 +143,11 @@ async function refreshAll() {
 async function loadThreads() {
   const data = await api("/api/threads");
   state.threads = data.threads;
+}
+
+async function loadFolders() {
+  const data = await api("/api/folders");
+  state.folders = data.folders;
 }
 
 async function loadThread(threadId) {
@@ -298,7 +327,64 @@ async function searchKnowledge() {
 function renderThreads() {
   els.threadList.innerHTML = "";
   const query = els.threadSearch.value.trim().toLowerCase();
-  state.threads.filter((thread) => thread.title.toLowerCase().includes(query)).forEach((thread) => {
+  const threads = state.threads.filter((thread) => thread.title.toLowerCase().includes(query));
+  const grouped = new Map(state.folders.map((folder) => [folder.id, []]));
+  const ungrouped = [];
+  threads.forEach((thread) => {
+    const group = grouped.get(thread.folder_id);
+    if (group) group.push(thread);
+    else ungrouped.push(thread);
+  });
+
+  if (ungrouped.length || !state.folders.length) renderThreadGroup("未归类", ungrouped);
+  state.folders.forEach((folder) => renderThreadGroup(folder.name, grouped.get(folder.id) || [], folder));
+}
+
+function renderThreadGroup(title, threads, folder = null) {
+  const group = document.createElement("section");
+  group.className = `thread-group ${folder ? "thread-folder-group" : "thread-ungrouped-group"}`;
+  const collapsed = folder && state.collapsedFolderIds.has(folder.id);
+  group.classList.toggle("collapsed", Boolean(collapsed));
+  const header = document.createElement("div");
+  header.className = "thread-group-header";
+  const heading = document.createElement(folder ? "button" : "div");
+  heading.className = "thread-group-title";
+  if (folder) {
+    heading.type = "button";
+    heading.classList.add("folder-toggle");
+    heading.setAttribute("aria-expanded", String(!collapsed));
+    heading.title = collapsed ? `展开文件夹：${folder.name}` : `收起文件夹：${folder.name}`;
+    heading.addEventListener("click", () => {
+      if (state.collapsedFolderIds.has(folder.id)) state.collapsedFolderIds.delete(folder.id);
+      else state.collapsedFolderIds.add(folder.id);
+      renderThreads();
+    });
+    const disclosure = document.createElement("span");
+    disclosure.className = "folder-disclosure";
+    disclosure.textContent = "›";
+    heading.appendChild(disclosure);
+    const icon = document.createElement("span");
+    icon.className = "folder-icon";
+    icon.setAttribute("aria-hidden", "true");
+    heading.appendChild(icon);
+  }
+  const label = document.createElement("span");
+  label.className = folder ? "folder-name" : "ungrouped-label";
+  label.textContent = title;
+  heading.appendChild(label);
+  header.appendChild(heading);
+  if (folder) {
+    const menu = document.createElement("button");
+    menu.className = "folder-menu";
+    menu.type = "button";
+    menu.textContent = "⋯";
+    menu.title = `管理文件夹：${folder.name}`;
+    menu.setAttribute("aria-label", `管理文件夹：${folder.name}`);
+    menu.addEventListener("click", () => manageFolder(folder));
+    header.appendChild(menu);
+  }
+  group.appendChild(header);
+  threads.forEach((thread) => {
     const row = document.createElement("div");
     row.className = "thread-row";
     const button = document.createElement("button");
@@ -316,18 +402,32 @@ function renderThreads() {
     menu.setAttribute("aria-label", `管理对话：${thread.title}`);
     menu.addEventListener("click", () => manageThread(thread));
     row.append(button, menu);
-    els.threadList.appendChild(row);
+    group.appendChild(row);
   });
+  els.threadList.appendChild(group);
 }
 
 async function manageThread(thread) {
-  const action = window.prompt("输入 r 重命名，输入 d 删除", "r");
+  const action = window.prompt("输入 r 重命名，输入 m 移动到文件夹，输入 d 删除", "r");
   if (action === "r") {
     const title = window.prompt("输入新的对话名称", thread.title);
     if (!title?.trim()) return;
     await api(`/api/threads/${thread.id}`, { method: "PATCH", body: JSON.stringify({ title }) });
     await refreshThreadList();
     if (thread.id === state.currentThreadId) els.threadTitle.textContent = title.trim();
+  }
+  if (action === "m") {
+    const choices = ["0. 未归类", ...state.folders.map((folder, index) => `${index + 1}. ${folder.name}`)];
+    const selected = window.prompt(`输入目标序号：\n${choices.join("\n")}`, "0");
+    if (selected === null) return;
+    const index = Number.parseInt(selected, 10);
+    if (!Number.isInteger(index) || index < 0 || index > state.folders.length) {
+      window.alert("请输入有效的文件夹序号。");
+      return;
+    }
+    const folderId = index === 0 ? "" : state.folders[index - 1].id;
+    await api(`/api/threads/${thread.id}`, { method: "PATCH", body: JSON.stringify({ folder_id: folderId }) });
+    await refreshThreadList();
   }
   if (action === "d" && window.confirm(`删除“${thread.title}”？此操作不可恢复。`)) {
     await api(`/api/threads/${thread.id}`, { method: "DELETE" });
@@ -340,10 +440,34 @@ async function manageThread(thread) {
   }
 }
 
+async function createFolder() {
+  const name = window.prompt("输入文件夹名称");
+  if (!name?.trim()) return;
+  try {
+    await api("/api/folders", { method: "POST", body: JSON.stringify({ name }) });
+    await refreshThreadList();
+  } catch (error) {
+    window.alert(`创建文件夹失败：${error.message}`);
+  }
+}
+
+async function manageFolder(folder) {
+  const action = window.prompt("输入 r 重命名，输入 d 删除文件夹", "r");
+  if (action === "r") {
+    const name = window.prompt("输入新的文件夹名称", folder.name);
+    if (!name?.trim()) return;
+    await api(`/api/folders/${folder.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+    await refreshThreadList();
+  }
+  if (action === "d" && window.confirm(`删除文件夹“${folder.name}”？其中的对话会保留在“未归类”。`)) {
+    await api(`/api/folders/${folder.id}`, { method: "DELETE" });
+    await refreshThreadList();
+  }
+}
+
 async function loadRuns() {
   state.runs = [];
   els.runDetailsButton.disabled = !state.currentThreadId;
-  els.threadSkillsButton.disabled = !state.currentThreadId;
   if (!state.currentThreadId) return;
   const data = await api(`/api/threads/${state.currentThreadId}/runs`);
   state.runs = data.runs;
@@ -434,13 +558,16 @@ function renderMessageContent(element, content, role = "assistant") {
 
   const references = document.createElement("div");
   references.className = "message-sources";
-  references.append(document.createTextNode("参考资料："));
-  content.slice(markerIndex + marker.length).split("、").filter(Boolean).forEach((filename, index) => {
-    if (index) references.append(document.createTextNode("、"));
+  const label = document.createElement("span");
+  label.className = "message-sources-label";
+  label.textContent = "本地资料命中";
+  references.append(label);
+  content.slice(markerIndex + marker.length).split("、").filter(Boolean).forEach((sourceLabel) => {
     const source = document.createElement("button");
     source.type = "button";
     source.className = "knowledge-source-link";
-    source.textContent = filename;
+    const filename = sourceLabel.replace(/（片段\s*\d+）$/, "");
+    source.textContent = sourceLabel;
     source.title = `查看本地资料：${filename}`;
     source.addEventListener("click", async () => {
       switchView("knowledge");
@@ -785,7 +912,7 @@ function appendRetryButton(wrapper, content) {
 
 async function refreshThreadList() {
   try {
-    await loadThreads();
+    await Promise.all([loadThreads(), loadFolders()]);
     renderThreads();
     const active = state.threads.find((thread) => thread.id === state.currentThreadId);
     if (active) els.threadTitle.textContent = active.title;
@@ -828,7 +955,11 @@ els.loginForm.addEventListener("submit", async (event) => {
     state.user = data.user;
     localStorage.setItem("agent_platform_token", state.token);
     showWorkspace();
-    await refreshAll();
+    try {
+      await refreshAll();
+    } catch (error) {
+      showWorkspaceLoadError(error);
+    }
   } catch (error) {
     els.loginError.textContent = error.message;
   }
@@ -896,11 +1027,11 @@ els.newThreadButton.addEventListener("click", () => {
   renderMessages();
   state.runs = [];
   els.runDetailsButton.disabled = true;
-  els.threadSkillsButton.disabled = true;
   els.runDrawer.classList.add("hidden");
 });
 
 els.threadSearch.addEventListener("input", renderThreads);
+els.newFolderButton.addEventListener("click", createFolder);
 
 els.runDetailsButton.addEventListener("click", () => {
   els.runDrawer.classList.remove("hidden");
@@ -976,17 +1107,6 @@ let knowledgeSearchTimer;
 els.knowledgeSearch.addEventListener("input", () => {
   window.clearTimeout(knowledgeSearchTimer);
   knowledgeSearchTimer = window.setTimeout(() => searchKnowledge(), 180);
-});
-
-els.threadSkillsButton.addEventListener("click", async () => {
-  const current = await api(`/api/threads/${state.currentThreadId}/skills`);
-  const availableSkills = state.skills.filter((skill) => skill.enabled);
-  const selectedNames = availableSkills.filter((skill) => current.skill_ids.includes(skill.id)).map((skill) => skill.name).join("、");
-  const input = window.prompt(`输入本次要使用的技能名称，用顿号或逗号分隔。\n可选：${availableSkills.map((skill) => skill.name).join("、")}\n已关闭的技能不会用于对话。`, selectedNames);
-  if (input === null) return;
-  const names = input.split(/[、,，]/).map((name) => name.trim()).filter(Boolean);
-  const skillIds = availableSkills.filter((skill) => names.includes(skill.name)).map((skill) => skill.id);
-  await api(`/api/threads/${state.currentThreadId}/skills`, { method: "PATCH", body: JSON.stringify({ skill_ids: skillIds }) });
 });
 
 document.querySelectorAll(".nav-button[data-view]").forEach((button) => {

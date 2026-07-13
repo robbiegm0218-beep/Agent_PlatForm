@@ -87,7 +87,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         run_detail = self.request_json(f"/api/runs/{runs[0]['id']}", token=self.token)
         self.assertEqual(
             [event["type"] for event in run_detail["events"]],
-            ["started", "execution_context", "skill_routed", "plan_created", "model_request", "completed"],
+            ["started", "execution_context", "skill_routed", "knowledge_not_needed", "plan_created", "model_request", "completed"],
         )
         self.assertEqual(json.loads(run_detail["run"]["skill_snapshot"])[0]["id"], "general_assistant")
         context = json.loads(run_detail["run"]["execution_context"])
@@ -173,6 +173,26 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(app.infer_task_profile("分析这段代码")["task_tier"], "standard")
         self.assertEqual(app.infer_task_profile("补充下一步待办")["task_tier"], "standard")
 
+    def test_thread_folders_group_and_preserve_threads_on_delete(self):
+        folder = self.request_json("/api/folders", {"name": "改动范围"}, self.token)["folder"]
+        thread = self.request_json(
+            "/api/threads", {"title": "接口改造", "folder_id": folder["id"]}, self.token
+        )["thread"]
+        self.assertEqual(thread["folder_id"], folder["id"])
+        self.assertEqual(self.request_json("/api/folders", token=self.token)["folders"][0]["name"], "改动范围")
+
+        moved = self.request_json(
+            f"/api/threads/{thread['id']}", {"folder_id": ""}, self.token, method="PATCH"
+        )["thread"]
+        self.assertEqual(moved["folder_id"], "")
+
+        self.request_json(
+            f"/api/threads/{thread['id']}", {"folder_id": folder["id"]}, self.token, method="PATCH"
+        )
+        self.request_json(f"/api/folders/{folder['id']}", token=self.token, method="DELETE")
+        retained = self.request_json(f"/api/threads/{thread['id']}", token=self.token)["thread"]
+        self.assertEqual(retained["folder_id"], "")
+
     def test_local_knowledge_upload_retrieval_citation_and_delete(self):
         source = "# 产品资料\n\n北极星指标是每周完成首次核心任务的活跃用户数。"
         uploaded = self.request_json(
@@ -192,11 +212,14 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         events = self.chat({"thread_id": "", "content": "请说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
-        self.assertIn("参考资料：product.md", answer)
+        self.assertIn("参考资料：product.md（片段 1）", answer)
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         context = json.loads(run["execution_context"])
         self.assertEqual(context["knowledge_refs"][0]["filename"], "product.md")
+        self.assertEqual(context["knowledge_route"], "retrieved")
+        self.assertEqual(context["knowledge_match_count"], 1)
+        self.assertIn("knowledge_retrieved", [event["type"] for event in self.request_json(f"/api/runs/{run['id']}", token=self.token)["events"]])
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])

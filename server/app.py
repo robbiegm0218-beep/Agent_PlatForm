@@ -340,7 +340,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS threads (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
+                folder_id TEXT DEFAULT '',
                 title TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS thread_folders (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -414,6 +423,7 @@ def init_db() -> None:
             """
         )
         ensure_column(conn, "threads", "context_summary", "TEXT DEFAULT ''")
+        ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
         ensure_column(conn, "runs", "skill_snapshot", "TEXT DEFAULT '[]'")
         ensure_column(conn, "runs", "execution_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "runs", "plan_snapshot", "TEXT DEFAULT '[]'")
@@ -571,15 +581,22 @@ def search_knowledge(user_id: str, query: str, limit: int = 4) -> list[dict]:
             (user_id,),
         ).fetchall()
     scored = []
+    minimum_score = 1 if len(terms) == 1 else 2
     for row in rows:
         content = row["content"]
         score = sum(content.lower().count(term) for term in terms)
-        if score:
+        if score >= minimum_score:
             scored.append((score, row))
     scored.sort(key=lambda item: (-item[0], item[1]["position"]))
     return [
-        {"document_id": row["document_id"], "filename": row["filename"], "position": row["position"], "excerpt": row["content"][:700]}
-        for _, row in scored[:limit]
+        {
+            "document_id": row["document_id"],
+            "filename": row["filename"],
+            "position": row["position"],
+            "excerpt": row["content"][:700],
+            "score": score,
+        }
+        for score, row in scored[:limit]
     ]
 
 
@@ -619,6 +636,7 @@ def build_execution_context(user_id: str, task_profile: dict, active_skills: lis
         "task_preview": content[:160],
         "knowledge_refs": knowledge_refs,
         "knowledge_route": "retrieved" if knowledge_refs else ("required_no_match" if task_profile["needs_knowledge"] else "not_needed"),
+        "knowledge_match_count": len(knowledge_refs),
     }
 
 
@@ -640,6 +658,12 @@ def event_summary(event_type: str, payload: dict) -> str:
         return "已根据质量检查修订回答"
     if event_type == "reflection_completed":
         return f"质量检查：{payload.get('summary', '已完成')}"
+    if event_type == "knowledge_retrieved":
+        return f"本地知识库命中 {payload.get('count', 0)} 个资料片段"
+    if event_type == "knowledge_no_match":
+        return "本地知识库未命中，回答将标注为建议或待验证项"
+    if event_type == "knowledge_not_needed":
+        return "本次问题未使用本地资料"
     return "正在处理任务"
 
 
@@ -761,6 +785,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/threads":
             self.list_threads(user)
             return
+        if self.path == "/api/folders":
+            self.list_folders(user)
+            return
         if self.path.startswith("/api/runs/"):
             self.get_run(user)
             return
@@ -812,6 +839,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/threads":
             self.create_thread(user)
             return
+        if self.path == "/api/folders":
+            self.create_folder(user)
+            return
         if self.path == "/api/chat":
             self.chat(user)
             return
@@ -824,11 +854,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/me":
             self.update_me(user)
             return
+        if self.path.startswith("/api/folders/"):
+            self.update_folder(user)
+            return
         if self.path.startswith("/api/threads/"):
             if self.path.endswith("/skills"):
                 self.update_thread_skills(user)
                 return
-            self.rename_thread(user)
+            self.update_thread(user)
             return
         if self.path.startswith("/api/skills/"):
             self.update_skill(user)
@@ -852,6 +885,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 conn.execute("DELETE FROM messages WHERE thread_id = ?", (thread_id,))
                 conn.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
             self.send_json({"ok": True})
+            return
+        if self.path.startswith("/api/folders/"):
+            self.delete_folder(user)
             return
         if self.path.startswith("/api/skills/"):
             self.delete_skill(user)
@@ -906,6 +942,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
         self.send_json({"threads": [row_to_dict(row) for row in rows]})
 
+    def list_folders(self, user: dict) -> None:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM thread_folders WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+                (user["id"],),
+            ).fetchall()
+        self.send_json({"folders": [row_to_dict(row) for row in rows]})
+
     def get_thread(self, user: dict) -> None:
         thread_id = self.path.split("/")[-1]
         with db() as conn:
@@ -925,25 +969,95 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def create_thread(self, user: dict) -> None:
         payload = self.read_json()
         title = payload.get("title", "新对话").strip() or "新对话"
+        folder_id = self.validate_folder_id(user["id"], payload.get("folder_id", ""))
         thread_id = new_id("thread")
         with db() as conn:
             conn.execute(
-                "INSERT INTO threads (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (thread_id, user["id"], title, now(), now()),
+                "INSERT INTO threads (id, user_id, folder_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (thread_id, user["id"], folder_id, title, now(), now()),
             )
             thread = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
         self.send_json({"thread": row_to_dict(thread)})
 
-    def rename_thread(self, user: dict) -> None:
-        thread_id = self.path.split("/")[-1]
-        title = self.read_json().get("title", "").strip()
-        if not title:
-            self.send_error_json("对话名称不能为空")
+    def validate_folder_id(self, user_id: str, folder_id: object) -> str:
+        folder_id = str(folder_id or "")
+        if not folder_id:
+            return ""
+        with db() as conn:
+            folder = conn.execute(
+                "SELECT id FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user_id)
+            ).fetchone()
+        if not folder:
+            raise ValueError("文件夹不存在")
+        return folder_id
+
+    def create_folder(self, user: dict) -> None:
+        name = self.read_json().get("name", "").strip()
+        if not name:
+            self.send_error_json("文件夹名称不能为空")
+            return
+        folder_id = new_id("folder")
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO thread_folders (id, user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (folder_id, user["id"], name[:80], now(), now()),
+            )
+            folder = conn.execute("SELECT * FROM thread_folders WHERE id = ?", (folder_id,)).fetchone()
+        self.send_json({"folder": row_to_dict(folder)})
+
+    def update_folder(self, user: dict) -> None:
+        folder_id = self.path.split("/")[-1]
+        name = self.read_json().get("name", "").strip()
+        if not name:
+            self.send_error_json("文件夹名称不能为空")
             return
         with db() as conn:
             conn.execute(
-                "UPDATE threads SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-                (title[:80], now(), thread_id, user["id"]),
+                "UPDATE thread_folders SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (name[:80], now(), folder_id, user["id"]),
+            )
+            folder = conn.execute(
+                "SELECT * FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
+            ).fetchone()
+        if not folder:
+            self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
+            return
+        self.send_json({"folder": row_to_dict(folder)})
+
+    def delete_folder(self, user: dict) -> None:
+        folder_id = self.path.split("/")[-1]
+        with db() as conn:
+            folder = conn.execute(
+                "SELECT id FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
+            ).fetchone()
+            if not folder:
+                self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
+                return
+            conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id = ? AND user_id = ?", (folder_id, user["id"]))
+            conn.execute("DELETE FROM thread_folders WHERE id = ?", (folder_id,))
+        self.send_json({"ok": True})
+
+    def update_thread(self, user: dict) -> None:
+        thread_id = self.path.split("/")[-1]
+        payload = self.read_json()
+        if "title" not in payload and "folder_id" not in payload:
+            self.send_error_json("没有可更新的对话信息")
+            return
+        with db() as conn:
+            thread = conn.execute(
+                "SELECT * FROM threads WHERE id = ? AND user_id = ?", (thread_id, user["id"])
+            ).fetchone()
+            if not thread:
+                self.send_error_json("对话不存在", HTTPStatus.NOT_FOUND)
+                return
+            title = payload.get("title", thread["title"]).strip()
+            if not title:
+                self.send_error_json("对话名称不能为空")
+                return
+            folder_id = self.validate_folder_id(user["id"], payload.get("folder_id", thread["folder_id"]))
+            conn.execute(
+                "UPDATE threads SET title = ?, folder_id = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (title[:80], folder_id, now(), thread_id, user["id"]),
             )
             thread = conn.execute(
                 "SELECT * FROM threads WHERE id = ? AND user_id = ?", (thread_id, user["id"])
@@ -1308,6 +1422,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
                 (new_id("event"), run_id, "skill_routed", json.dumps({"route": execution_context["skill_route"], "skills": [skill["name"] for skill in active_skills]}, ensure_ascii=False), now()),
             )
+            knowledge_event = "knowledge_retrieved" if knowledge_refs else (
+                "knowledge_no_match" if task_profile["needs_knowledge"] else "knowledge_not_needed"
+            )
+            conn.execute(
+                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (new_id("event"), run_id, knowledge_event, json.dumps({"count": len(knowledge_refs)}, ensure_ascii=False), now()),
+            )
             conn.execute(
                 "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
                 (new_id("event"), run_id, "plan_created", json.dumps({"steps": execution_plan}, ensure_ascii=False), now()),
@@ -1334,6 +1455,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         try:
             self.write_event("meta", {"thread_id": thread_id, "run_id": run_id, "model": actual_model})
             self.write_event("status", {"summary": event_summary("skill_routed", {"skills": [skill["name"] for skill in active_skills]})})
+            self.write_event("status", {"summary": event_summary(knowledge_event, {"count": len(knowledge_refs)})})
             self.write_event("status", {"summary": event_summary("plan_created", {"steps": execution_plan})})
             with db() as conn:
                 conn.execute(
@@ -1523,9 +1645,9 @@ def build_system_prompt(execution_context: dict) -> str:
 
 
 def append_knowledge_sources(answer: str, references: list[dict], knowledge_route: str) -> str:
-    filenames = list(dict.fromkeys(item["filename"] for item in references))
-    if filenames:
-        return answer.rstrip() + "\n\n参考资料：" + "、".join(filenames)
+    labels = list(dict.fromkeys(f"{item['filename']}（片段 {item['position'] + 1}）" for item in references))
+    if labels:
+        return answer.rstrip() + "\n\n参考资料：" + "、".join(labels)
     if knowledge_route == "required_no_match":
         return answer.rstrip() + "\n\n说明：以下内容为基于任务描述的模型建议，未检索到可用本地资料，不应作为事实结论。"
     return answer
