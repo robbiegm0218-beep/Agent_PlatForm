@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "name": "个人 Agent 平台基准评测",
+  "cases": [
+    {
+      "id": "general_qa",
+      "category": "普通问答",
+      "prompt": "解释北极星指标是什么。",
+      "expected_route": {"task_tier": "quick", "needs_tools": false, "needs_knowledge": false},
+      "manual_review": {"dimensions": ["目标完成度", "结构清晰度"], "reference_answer": "说明定义、适用场景和一个可执行示例。"}
+    },
+    {
+      "id": "chinese_writing",
+      "category": "中文写作",
+      "prompt": "把以下通知改写得简洁专业：项目会议明天上午举行。",
+      "expected_route": {"task_tier": "standard", "needs_tools": false, "needs_knowledge": false},
+      "manual_review": {"dimensions": ["目标完成度", "结构清晰度", "技能遵循"], "reference_answer": "保留时间信息，补足正式而精简的通知结构。"}
+    },
+    {
+      "id": "product_research",
+      "category": "产品调研",
+      "prompt": "基于本地资料制定产品竞品调研方案，并列出待验证假设。",
+      "expected_route": {"task_tier": "deep", "needs_tools": false, "needs_knowledge": true},
+      "manual_review": {"dimensions": ["事实依据", "目标完成度", "结构清晰度"], "reference_answer": "引用本地资料；无命中时明确待验证，不编造事实。"}
+    },
+    {
+      "id": "project_plan",
+      "category": "项目方案",
+      "prompt": "为新功能上线写一个包含阶段、风险和验收标准的项目方案。",
+      "expected_route": {"task_tier": "deep", "needs_tools": false, "needs_knowledge": true},
+      "manual_review": {"dimensions": ["目标完成度", "事实依据", "结构清晰度"], "reference_answer": "按阶段给出可验收的计划，并区分事实依据与建议。"}
+    },
+    {
+      "id": "code_analysis",
+      "category": "代码分析",
+      "prompt": "分析这段代码的潜在空指针问题，并给出修复建议。",
+      "expected_route": {"task_tier": "standard", "needs_tools": false, "needs_knowledge": true},
+      "manual_review": {"dimensions": ["目标完成度", "结构清晰度", "技能遵循"], "reference_answer": "指出触发条件、影响范围、修复方式和验证建议。"}
+    },
+    {
+      "id": "file_search",
+      "category": "文件检索",
+      "prompt": "搜索工作区中与配置有关的文件。",
+      "expected_route": {"task_tier": "quick", "needs_tools": true, "needs_knowledge": false},
+      "manual_review": {"dimensions": ["工具正确性", "目标完成度"], "reference_answer": "只调用允许的只读文件检索工具，并报告结果边界。"}
+    },
+    {
+      "id": "multi_turn",
+      "category": "多轮续聊",
+      "prompt": "根据刚才确认的约束，补充下一步待办和负责人建议。",
+      "expected_route": {"task_tier": "standard", "needs_tools": false, "needs_knowledge": false},
+      "manual_review": {"dimensions": ["目标完成度", "结构清晰度"], "reference_answer": "延续已确认约束，不重复无关背景，并给出可执行待办。"}
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent_Platform</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main id="app">
+      <section id="loginView" class="login-shell">
+        <div class="login-panel">
+          <div class="brand-mark">Agent_Platform</div>
+          <h1>登录</h1>
+          <p>进入你的个人 Agent 工作台</p>
+          <form id="loginForm">
+            <label>
+              邮箱
+              <input id="emailInput" type="email" value="admin@example.com" autocomplete="email" required />
+            </label>
+            <label>
+              密码
+              <input id="passwordInput" type="password" value="admin123" autocomplete="current-password" required />
+            </label>
+            <button type="submit">登录</button>
+            <div id="loginError" class="form-error"></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="workspaceView" class="workspace hidden">
+        <aside class="sidebar">
+          <div class="sidebar-top">
+            <div class="logo">Agent_Platform</div>
+            <button id="newThreadButton" class="nav-button active" data-view="chat">新建对话</button>
+            <button class="nav-button" data-view="skills">技能和应用</button>
+            <button class="nav-button" data-view="knowledge">知识库</button>
+          </div>
+          <div class="thread-search"><input id="threadSearch" type="search" placeholder="搜索对话" /></div>
+          <div class="thread-list" id="threadList"></div>
+          <div class="sidebar-bottom">
+            <button class="nav-button" data-view="settings">个人设置</button>
+          </div>
+        </aside>
+
+        <section id="chatPage" class="page chat-page">
+          <header class="page-header">
+            <div>
+              <h2 id="threadTitle">新对话</h2>
+              <span id="modelStatus">DeepSeek / 本地模拟</span>
+            </div>
+            <button id="runDetailsButton" class="icon-text-button" type="button" disabled>运行详情</button>
+            <button id="threadSkillsButton" class="icon-text-button" type="button" disabled>本次技能</button>
+          </header>
+          <div id="messages" class="messages">
+            <div class="empty-state">
+              <h1>今天要完成什么？</h1>
+              <p>输入任务后，Agent 会根据已启用的技能回复。</p>
+            </div>
+          </div>
+          <form id="chatForm" class="composer">
+            <div id="chatInput" class="chat-input" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="给 Agent_Platform 发送消息"></div>
+            <div class="composer-footer">
+              <div class="composer-context">
+                <div class="skill-picker-wrap">
+                  <button id="skillPickerButton" class="skill-picker-button" type="button" aria-expanded="false">选择技能</button>
+                  <div id="skillPickerMenu" class="skill-picker-menu hidden" role="menu"></div>
+                </div>
+                <select id="taskModeSelect" aria-label="选择任务档位">
+                  <option value="auto">自动档位</option>
+                  <option value="quick">快速</option>
+                  <option value="standard">标准</option>
+                  <option value="deep">深度</option>
+                </select>
+                <select id="modelSelect" aria-label="选择模型"></select>
+              </div>
+              <button id="sendButton" type="submit">发送</button>
+            </div>
+          </form>
+        </section>
+
+        <aside id="runDrawer" class="run-drawer hidden" aria-label="运行详情">
+          <div class="drawer-header"><h2>运行详情</h2><button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button></div>
+          <div id="runList" class="run-list"></div>
+          <div id="runDetail" class="run-detail">选择一条运行记录查看详情。</div>
+        </aside>
+
+        <section id="skillsPage" class="page hidden">
+          <header class="page-header">
+            <div>
+              <h2>技能和应用</h2>
+              <span>管理当前 Agent 可使用的本地能力</span>
+            </div>
+            <button id="uploadSkillButton" class="icon-text-button" type="button">上传技能</button>
+            <input id="skillFileInput" type="file" accept="application/json,.json,text/markdown,.md" class="hidden" />
+          </header>
+          <div class="tabs">
+            <button class="tab active" data-tab="skills">技能</button>
+            <button class="tab" data-tab="apps">应用</button>
+          </div>
+          <div id="skillsGrid" class="card-grid"></div>
+          <div id="appsGrid" class="card-grid hidden"></div>
+        </section>
+
+        <section id="settingsPage" class="page hidden">
+          <header class="page-header">
+            <div>
+              <h2>个人设置</h2>
+              <span>修改个人信息或退出登录</span>
+            </div>
+          </header>
+          <form id="settingsForm" class="settings-panel">
+            <label>
+              昵称
+              <input id="nameInput" type="text" required />
+            </label>
+            <label>
+              邮箱
+              <input id="settingsEmail" type="email" disabled />
+            </label>
+            <div class="settings-actions">
+              <button type="submit">保存</button>
+              <button id="logoutAllButton" type="button" class="secondary">退出所有设备</button>
+              <button id="logoutButton" type="button" class="secondary">退出登录</button>
+            </div>
+            <div id="settingsNotice" class="notice"></div>
+          </form>
+        </section>
+
+        <section id="knowledgePage" class="page hidden">
+          <header class="page-header">
+            <div>
+              <h2>知识库</h2>
+              <span>本地资料仅在检索命中后用于对话</span>
+            </div>
+            <button id="uploadKnowledgeButton" class="icon-text-button" type="button">上传资料</button>
+            <input id="knowledgeFileInput" type="file" accept=".md,.txt,.docx,.pdf,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" class="hidden" />
+          </header>
+          <div class="knowledge-toolbar">
+            <input id="knowledgeSearch" type="search" placeholder="检索本地资料" />
+          </div>
+          <div id="knowledgeResults" class="knowledge-results hidden"></div>
+          <div id="knowledgeList" class="card-grid"></div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
