@@ -180,7 +180,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
 
-    def test_xlsx_artifact_uses_a_fixed_workbook_and_cleans_sidecar_files(self):
+    def test_xlsx_artifact_uses_a_fixed_workbook(self):
         original_artifact_dir = app.ARTIFACT_DIR
         app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
         try:

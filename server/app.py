@@ -29,9 +29,9 @@ try:
 except ImportError:
     PdfReader = None
 try:
-    from server.local_extensions import CallableModelAdapter, LocalTool, LocalToolRegistry, LocalWorkflowRunner
+    from server.local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
 except ModuleNotFoundError:
-    from local_extensions import CallableModelAdapter, LocalTool, LocalToolRegistry, LocalWorkflowRunner
+    from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
 
 try:
     import certifi
@@ -1900,11 +1900,7 @@ def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, a
             )
             if result.returncode != 0 or not path.exists():
                 raise RuntimeError((result.stderr or result.stdout or "Excel 生成器未返回文件").strip()[:500])
-            # artifact-tool may create an adjacent inspection file; it is not a user artifact.
-            path.with_name(path.name + ".inspect.ndjson").unlink(missing_ok=True)
     except Exception:
-        path.unlink(missing_ok=True)
-        path.with_name(path.name + ".inspect.ndjson").unlink(missing_ok=True)
         raise
     summary = f"由运行 {run_id} 生成的{'Excel' if kind == 'xlsx' else 'Markdown'}文件"
     with db() as conn:
@@ -2032,7 +2028,7 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
         "JSON 字段必须为 passed(boolean)、issues(string数组，最多3项)、summary(string)。"
     )
     try:
-        evaluation_message = deepseek_chat_turn([
+        evaluation_message = deepseek_chat([
             {"role": "system", "content": evaluation_prompt},
             {"role": "user", "content": f"用户任务：\n{user_content}\n\n待检查回答：\n{draft_answer}"},
         ], [], execution_context["model"], execution_context["max_output_tokens"])
@@ -2045,7 +2041,7 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
     answer = draft_answer
     if not assessment["passed"]:
         try:
-            revision_message = deepseek_chat_turn([
+            revision_message = deepseek_chat([
                 {"role": "system", "content": "根据质量检查修订回答。只输出修订后的最终回答，不展示检查过程或思维过程。"},
                 {"role": "user", "content": f"用户任务：\n{user_content}\n\n原回答：\n{draft_answer}\n\n检查问题：\n" + "\n".join(assessment["issues"])},
             ], [], execution_context["model"], execution_context["max_output_tokens"])
@@ -2090,13 +2086,17 @@ def run_deepseek_agent(thread_id: str, system_prompt: str, execution_context: di
     allowed_tool_ids = set(execution_context["allowed_tool_ids"])
     tools = LOCAL_TOOLS.callable_definitions(allowed_tool_ids)
     for _step in range(execution_context["max_tool_steps"]):
-        message = deepseek_chat_turn(messages, tools, execution_context["model"], execution_context["max_output_tokens"])
+        message = None
+        for event in deepseek_chat(messages, tools, execution_context["model"], execution_context["max_output_tokens"], stream=True):
+            if event["type"] == "content":
+                yield event["text"]
+            elif event["type"] == "done":
+                message = event["message"]
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             content = (message.get("content") or "").strip()
             if not content:
                 raise RuntimeError("DeepSeek 返回为空")
-            yield from chunk_text(content, 12)
             return
 
         messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
@@ -2133,11 +2133,15 @@ def run_deepseek_agent(thread_id: str, system_prompt: str, execution_context: di
             })
 
     messages.append({"role": "system", "content": "工具调用已达到上限。请基于已获得的信息直接给出最终回答，不要再调用工具。"})
-    message = deepseek_chat_turn(messages, [], execution_context["model"], execution_context["max_output_tokens"])
+    message = None
+    for event in deepseek_chat(messages, [], execution_context["model"], execution_context["max_output_tokens"], stream=True):
+        if event["type"] == "content":
+            yield event["text"]
+        elif event["type"] == "done":
+            message = event["message"]
     content = (message.get("content") or "").strip()
     if not content:
         raise RuntimeError("工具调用达到上限且模型未返回最终回答")
-    yield from chunk_text(content, 12)
 
 
 def summarize_tool_result(result: dict) -> str:
@@ -2148,11 +2152,59 @@ def summarize_tool_result(result: dict) -> str:
     return "工具已返回结果"
 
 
-def deepseek_chat_turn(messages: list[dict], tools: list[dict], model: str = DEEPSEEK_MODEL, max_output_tokens: int = MAX_RESPONSE_TOKENS) -> dict:
+def _read_sse_stream(response) -> dict:
+    """Read a DeepSeek SSE stream and return the assembled message dict."""
+    content_parts = []
+    tool_calls_index: dict[int, dict] = {}
+    for line in response:
+        line = line.decode("utf-8").strip()
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            break
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        delta = data.get("choices", [{}])[0].get("delta", {})
+        if "content" in delta and delta["content"]:
+            content_parts.append(delta["content"])
+        if "tool_calls" in delta:
+            for tc in delta["tool_calls"]:
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_index:
+                    tool_calls_index[idx] = {
+                        "id": tc.get("id") or "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls_index[idx]
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                func = tc.get("function", {})
+                if func.get("name"):
+                    entry["function"]["name"] += func["name"]
+                if func.get("arguments"):
+                    entry["function"]["arguments"] += func["arguments"]
+    content = "".join(content_parts)
+    tool_calls = [tool_calls_index[i] for i in sorted(tool_calls_index.keys())] if tool_calls_index else None
+    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
+
+
+def deepseek_chat(messages: list[dict], tools: list[dict], model: str = DEEPSEEK_MODEL, max_output_tokens: int = MAX_RESPONSE_TOKENS, stream: bool = False):
+    """Call DeepSeek API with streaming enabled.
+
+    Always uses stream=True at the API level.  If *stream* is True the
+    function is a generator that yields ``{"type": "content", "text": …}``
+    events for each content delta, and a final ``{"type": "done", "message":
+    …}`` event carrying the assembled message dict.  If *stream* is False
+    (the default) it returns the assembled message dict directly.
+    """
     payload = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         "temperature": 0.4,
         "max_tokens": max_output_tokens,
     }
@@ -2170,9 +2222,46 @@ def deepseek_chat_turn(messages: list[dict], tools: list[dict], model: str = DEE
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60, context=deepseek_ssl_context()) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return payload.get("choices", [{}])[0].get("message", {})
+        with urllib.request.urlopen(req, timeout=300, context=deepseek_ssl_context()) as response:
+            if not stream:
+                return _read_sse_stream(response)
+            content_parts = []
+            tool_calls_index: dict[int, dict] = {}
+            for line in response:
+                line = line.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                delta = data.get("choices", [{}])[0].get("delta", {})
+                if "content" in delta and delta["content"]:
+                    content_parts.append(delta["content"])
+                    yield {"type": "content", "text": delta["content"]}
+                if "tool_calls" in delta:
+                    for tc in delta["tool_calls"]:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_index:
+                            tool_calls_index[idx] = {
+                                "id": tc.get("id") or "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        entry = tool_calls_index[idx]
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        func = tc.get("function", {})
+                        if func.get("name"):
+                            entry["function"]["name"] += func["name"]
+                        if func.get("arguments"):
+                            entry["function"]["arguments"] += func["arguments"]
+            content = "".join(content_parts)
+            tool_calls = [tool_calls_index[i] for i in sorted(tool_calls_index.keys())] if tool_calls_index else None
+            yield {"type": "done", "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
         raise RuntimeError(f"DeepSeek 请求失败：{exc.code} {detail}") from exc
@@ -2186,64 +2275,6 @@ def deepseek_chat_turn(messages: list[dict], tools: list[dict], model: str = DEE
             ) from exc
         raise RuntimeError(f"DeepSeek 请求失败：{reason}") from exc
 
-
-def stream_deepseek(system_prompt: str, messages: list[dict]):
-    request_messages = [{"role": "system", "content": system_prompt}]
-    for message in messages:
-        request_messages.append({"role": message["role"], "content": message["content"]})
-
-    body = json.dumps(
-        {
-            "model": DEEPSEEK_MODEL,
-            "messages": request_messages,
-            "stream": False,
-            "temperature": 0.4,
-            "max_tokens": MAX_RESPONSE_TOKENS,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{DEEPSEEK_BASE_URL}/chat/completions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        ssl_context = deepseek_ssl_context()
-        with urllib.request.urlopen(req, timeout=60, context=ssl_context) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not content:
-                raise RuntimeError("DeepSeek 返回为空")
-            for piece in chunk_text(content, 12):
-                yield piece
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"DeepSeek 请求失败：{exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        reason = str(exc.reason)
-        if "CERTIFICATE_VERIFY_FAILED" in reason:
-            raise RuntimeError(
-                "DeepSeek 请求失败：本机 HTTPS 证书校验失败。"
-                "本地开发可在 .env 中设置 DEEPSEEK_SSL_VERIFY=false；"
-                "生产环境建议安装正确 CA 证书后保持校验开启。"
-            ) from exc
-        raise RuntimeError(f"DeepSeek 请求失败：{reason}") from exc
-
-
-def deepseek_ssl_context():
-    if not DEEPSEEK_SSL_VERIFY:
-        return ssl._create_unverified_context()
-    if DEEPSEEK_CA_FILE:
-        return ssl.create_default_context(cafile=DEEPSEEK_CA_FILE)
-    if certifi:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
-
-
-MODEL_ADAPTER = CallableModelAdapter(DEEPSEEK_MODEL, stream_deepseek)
 
 
 def chunk_text(text: str, size: int):
