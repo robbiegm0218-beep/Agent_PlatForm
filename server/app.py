@@ -958,6 +958,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/knowledge/"):
             self.delete_knowledge(user)
             return
+        if self.path.startswith("/api/artifacts/"):
+            self.delete_artifact(user)
+            return
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
     def login(self) -> None:
@@ -1165,7 +1168,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             confirmation = conn.execute(
                 "SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)
             ).fetchone()
-        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None})
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "artifact": row_to_dict(artifact) if artifact else None})
 
     def resolve_confirmation(self, user: dict) -> None:
         run_id = self.path.split("/")[-2]
@@ -1263,6 +1269,22 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(path.stat().st_size))
         self.end_headers()
         self.wfile.write(path.read_bytes())
+
+    def delete_artifact(self, user: dict) -> None:
+        artifact_id = self.path.split("/")[-1]
+        with db() as conn:
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE id = ? AND user_id = ?",
+                (artifact_id, user["id"]),
+            ).fetchone()
+        if not artifact:
+            self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
+            return
+        path = Path(artifact["storage_path"])
+        path.unlink(missing_ok=True)
+        with db() as conn:
+            conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
+        self.send_json({"ok": True})
 
     def search_knowledge_api(self, user: dict) -> None:
         query = parse_qs(urlparse(self.path).query).get("query", [""])[0].strip()

@@ -9,6 +9,7 @@ const state = {
   runs: [],
   skills: [],
   models: [],
+  artifacts: [],
   knowledgeDocuments: [],
   selectedSkillIds: [],
   activeView: "chat",
@@ -60,6 +61,8 @@ const els = {
   knowledgeSearch: document.querySelector("#knowledgeSearch"),
   knowledgeList: document.querySelector("#knowledgeList"),
   knowledgeResults: document.querySelector("#knowledgeResults"),
+  artifactsPage: document.querySelector("#artifactsPage"),
+  artifactsGrid: document.querySelector("#artifactsGrid"),
 };
 
 function api(path, options = {}) {
@@ -148,7 +151,7 @@ function showWorkspace() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge()]);
+  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadArtifacts()]);
   renderThreads();
   renderMessages();
 }
@@ -293,6 +296,74 @@ async function loadKnowledge() {
   const data = await api("/api/knowledge");
   state.knowledgeDocuments = data.documents;
   renderKnowledge(data.documents);
+}
+
+async function loadArtifacts() {
+  try {
+    const data = await api("/api/artifacts");
+    state.artifacts = data.artifacts;
+    renderArtifacts();
+  } catch (error) {
+    // Artifacts page is secondary; failure should not block the workspace.
+  }
+}
+
+function renderArtifacts() {
+  els.artifactsGrid.innerHTML = "";
+  if (!state.artifacts.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.innerHTML = "<h2>暂无产物</h2><p>在对话中启用文件生成技能后，确认生成的文件会出现在这里。</p>";
+    els.artifactsGrid.appendChild(empty);
+    return;
+  }
+  state.artifacts.forEach((artifact) => {
+    const card = document.createElement("article");
+    card.className = "capability-card";
+    const kindLabel = artifact.kind === "xlsx" ? "Excel (.xlsx)" : "Markdown (.md)";
+    const date = new Date(artifact.created_at / 1e6).toLocaleString("zh-CN");
+    card.innerHTML = `
+      <h3>${escapeHtml(artifact.filename)}</h3>
+      <p>${escapeHtml(kindLabel)} · ${date} · ${escapeHtml(artifact.summary)}</p>
+      <div class="card-footer">
+        <span class="status-pill">${escapeHtml(kindLabel)}</span>
+        <button class="skill-action" type="button">下载</button>
+        <button class="skill-action danger" type="button">删除</button>
+      </div>
+    `;
+    const [downloadButton, deleteButton] = card.querySelectorAll(".skill-action");
+    downloadButton.addEventListener("click", () => downloadArtifact(artifact));
+    deleteButton.addEventListener("click", () => deleteArtifact(artifact));
+    els.artifactsGrid.appendChild(card);
+  });
+}
+
+async function downloadArtifact(artifact) {
+  try {
+    const response = await fetch(`/api/artifacts/${artifact.id}/download`, {
+      headers: { Authorization: `Bearer ${state.token}` },
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || "文件下载失败");
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = artifact.filename;
+    document.body.appendChild(download);
+    download.click();
+    download.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    window.alert(error.message);
+  }
+}
+
+async function deleteArtifact(artifact) {
+  if (!window.confirm(`删除产物"${artifact.filename}"？此操作不可恢复。`)) return;
+  await api(`/api/artifacts/${artifact.id}`, { method: "DELETE" });
+  await loadArtifacts();
 }
 
 function renderKnowledge(documents) {
@@ -518,7 +589,7 @@ function renderRuns() {
 
 async function loadRunDetail(runId) {
   const data = await api(`/api/runs/${runId}`);
-  const { run, events, steps } = data;
+  const { run, events, steps, artifact } = data;
   const elapsed = run.completed_at ? `${Math.max(0, Math.round((run.completed_at - run.started_at) / 1e9 * 10) / 10)} 秒` : "运行中";
   const skills = JSON.parse(run.skill_snapshot || "[]").map((skill) => skill.name).join("、") || "无";
   const plan = steps?.length ? steps : safeJson(run.plan_snapshot, []);
@@ -534,6 +605,47 @@ async function loadRunDetail(runId) {
     ? `${reflection.summary || "已完成"}${reflection.revision_count ? `，已修订 ${reflection.revision_count} 次` : ""}`
     : "未触发";
   els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${run.error ? `\n错误：${run.error}` : ""}`;
+
+  if (artifact) {
+    const artifactBlock = document.createElement("div");
+    artifactBlock.style.cssText = "margin-top:14px;padding-top:14px;border-top:1px solid var(--line)";
+    const link = document.createElement("a");
+    link.className = "artifact-link";
+    link.href = "#";
+    link.textContent = `下载文件：${artifact.filename}`;
+    link.title = artifact.summary || "下载生成的文件";
+    link.addEventListener("click", async (event) => {
+      event.preventDefault();
+      link.setAttribute("aria-busy", "true");
+      const originalText = link.textContent;
+      link.textContent = "正在下载文件...";
+      try {
+        const response = await fetch(`/api/artifacts/${artifact.id}/download`, {
+          headers: { Authorization: `Bearer ${state.token}` },
+        });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || "文件下载失败");
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const download = document.createElement("a");
+        download.href = url;
+        download.download = artifact.filename;
+        document.body.appendChild(download);
+        download.click();
+        download.remove();
+        URL.revokeObjectURL(url);
+        link.textContent = originalText;
+      } catch (error) {
+        link.textContent = error.message || "文件下载失败";
+        window.setTimeout(() => { link.textContent = originalText; }, 2500);
+      } finally {
+        link.removeAttribute("aria-busy");
+      }
+    });
+    artifactBlock.appendChild(link);
+    els.runDetail.appendChild(artifactBlock);
+  }
 }
 
 function safeJson(value, fallback) {
@@ -833,6 +945,8 @@ function switchView(view) {
   els.skillsPage.classList.toggle("hidden", view !== "skills");
   els.settingsPage.classList.toggle("hidden", view !== "settings");
   els.knowledgePage.classList.toggle("hidden", view !== "knowledge");
+  els.artifactsPage.classList.toggle("hidden", view !== "artifacts");
+  if (view === "artifacts") loadArtifacts();
   document.querySelectorAll(".nav-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
   });

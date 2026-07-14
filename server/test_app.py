@@ -333,6 +333,49 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in history["messages"]], ["user", "assistant"])
         self.assertEqual(history["messages"][0]["content"], "请重试")
 
+    def test_delete_artifact_removes_file_and_record(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "请生成 Markdown 文件，整理本次平台说明"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            result = self.request_json(
+                f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30
+            )
+            artifact_id = result["artifact"]["id"]
+            artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
+            self.assertEqual(len(artifacts), 1)
+
+            delete_result = self.request_json(
+                f"/api/artifacts/{artifact_id}", token=self.token, method="DELETE"
+            )
+            self.assertTrue(delete_result.get("ok"))
+
+            artifacts_after = self.request_json("/api/artifacts", token=self.token)["artifacts"]
+            self.assertEqual(len(artifacts_after), 0)
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.request_json(f"/api/artifacts/{artifact_id}", token=self.token, method="DELETE")
+            self.assertEqual(ctx.exception.code, 404)
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_get_run_includes_linked_artifact(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "请生成 Markdown 文件，整理本次平台说明"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            self.request_json(
+                f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30
+            )
+            detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertIsNotNone(detail["artifact"])
+            self.assertEqual(detail["artifact"]["kind"], "markdown")
+            self.assertTrue(detail["artifact"]["filename"].endswith(".md"))
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,7 @@
             <button id="newThreadButton" class="nav-button active" data-view="chat">新建对话</button>
             <button class="nav-button" data-view="skills">技能和应用</button>
             <button class="nav-button" data-view="knowledge">知识库</button>
+            <button class="nav-button" data-view="artifacts">产物</button>
           </div>
           <div class="thread-tools">
             <input id="threadSearch" type="search" placeholder="搜索对话" />
@@ -143,6 +144,19 @@
           </div>
           <div id="knowledgeResults" class="knowledge-results hidden"></div>
           <div id="knowledgeList" class="card-grid"></div>
+        </section>
+
+        <section id="artifactsPage" class="page hidden">
+          <header class="page-header">
+            <div>
+              <h2>产物</h2>
+              <span>查看和管理所有已生成的文件</span>
+            </div>
+          </header>
+          <div class="artifacts-info">
+            <p>支持生成 <strong>Markdown（.md）</strong> 和 <strong>Excel（.xlsx）</strong> 文件。所有文件在创建前需要确认，生成后保存到本地 data/artifacts/ 目录。确认后的文件可在此页下载或删除。</p>
+          </div>
+          <div id="artifactsGrid" class="card-grid"></div>
         </section>
       </section>
     </main>
