@@ -2276,6 +2276,15 @@ def deepseek_chat(messages: list[dict], tools: list[dict], model: str = DEEPSEEK
         raise RuntimeError(f"DeepSeek 请求失败：{reason}") from exc
 
 
+def deepseek_ssl_context():
+    if not DEEPSEEK_SSL_VERIFY:
+        return ssl._create_unverified_context()
+    if DEEPSEEK_CA_FILE:
+        return ssl.create_default_context(cafile=DEEPSEEK_CA_FILE)
+    if certifi:
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
 
 def chunk_text(text: str, size: int):
     for index in range(0, len(text), size):
