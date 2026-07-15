@@ -580,7 +580,12 @@ function renderRuns() {
   state.runs.forEach((run) => {
     const button = document.createElement("button");
     button.className = `run-item ${run.status}`;
-    button.textContent = `${run.status === "completed" ? "已完成" : run.status === "failed" ? "失败" : "运行中"} · ${run.model}`;
+    const statusLabel = run.status === "completed" ? "已完成"
+      : run.status === "failed" ? "失败"
+        : run.status === "cancelled" ? "已取消"
+          : run.status === "awaiting_confirmation" ? "待确认"
+            : "运行中";
+    button.textContent = `${statusLabel} · ${run.model}`;
     button.addEventListener("click", () => loadRunDetail(run.id));
     els.runList.appendChild(button);
   });
@@ -645,6 +650,28 @@ async function loadRunDetail(runId) {
     });
     artifactBlock.appendChild(link);
     els.runDetail.appendChild(artifactBlock);
+  }
+
+  if (["running", "awaiting_confirmation"].includes(run.status)) {
+    const actions = document.createElement("div");
+    actions.className = "confirmation-actions";
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.className = "secondary";
+    cancelButton.textContent = run.status === "awaiting_confirmation" ? "取消待确认任务" : "取消运行";
+    cancelButton.addEventListener("click", async () => {
+      cancelButton.disabled = true;
+      try {
+        await api(`/api/runs/${run.id}/cancel`, { method: "POST", body: "{}" });
+        await loadRuns();
+        await loadRunDetail(run.id);
+      } catch (error) {
+        cancelButton.disabled = false;
+        cancelButton.textContent = error.message || "取消失败";
+      }
+    });
+    actions.appendChild(cancelButton);
+    els.runDetail.appendChild(actions);
   }
 }
 
@@ -961,6 +988,7 @@ async function sendMessage(content, { retry = false } = {}) {
   let assistant;
   let assistantContent = "";
   let awaitingConfirmation = false;
+  let cancelled = false;
   try {
     if (!state.messages.length && !retry) {
       els.messages.innerHTML = "";
@@ -1022,11 +1050,17 @@ async function sendMessage(content, { retry = false } = {}) {
           assistant.content.textContent = event.data.request || "此操作需要确认后才能执行。";
           appendConfirmationActions(assistant, event.data, content);
         }
+        if (event.event === "cancelled") {
+          cancelled = true;
+          assistant.status.textContent = "处理状态 · 已取消";
+          assistant.content.textContent = "本次运行已取消，未保存后续回答。";
+        }
         if (event.event === "error") {
           throw new Error(event.data.error || "运行失败");
         }
       }
     }
+    if (cancelled) return;
     if (!assistantContent && !awaitingConfirmation) {
       throw new Error("模型未返回内容");
     }

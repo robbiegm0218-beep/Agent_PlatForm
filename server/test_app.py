@@ -9,6 +9,7 @@ import zipfile
 from urllib.parse import quote
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from server import app
 
@@ -79,6 +80,38 @@ class AgentPlatformApiTests(unittest.TestCase):
         )
         return result["token"]
 
+    def test_health_reports_database_readiness_without_login(self):
+        health = self.request_json("/api/health", method="GET")
+
+        self.assertTrue(health["ok"])
+        self.assertTrue(health["database_ready"])
+        self.assertEqual(health["database"], "sqlite")
+        self.assertEqual(health["environment"], "development")
+
+    def test_production_bootstrap_requires_explicit_admin_credentials(self):
+        with patch.dict(
+            app.os.environ,
+            {"AGENT_PLATFORM_ENV": "production", "ADMIN_EMAIL": "", "ADMIN_PASSWORD": ""},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ADMIN_EMAIL 和 ADMIN_PASSWORD"):
+                app.bootstrap_admin_credentials()
+
+        with patch.dict(
+            app.os.environ,
+            {
+                "AGENT_PLATFORM_ENV": "production",
+                "ADMIN_EMAIL": "OWNER@EXAMPLE.COM ",
+                "ADMIN_PASSWORD": "a-strong-password",
+                "ADMIN_NAME": "平台管理员",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                app.bootstrap_admin_credentials(),
+                ("owner@example.com", "a-strong-password", "平台管理员"),
+            )
+
     def test_multiple_turns_complete_and_history_is_stable(self):
         apps = self.request_json("/api/apps", token=self.token)["apps"]
         self.assertIn("local_artifacts", [app_item["id"] for app_item in apps])
@@ -99,6 +132,11 @@ class AgentPlatformApiTests(unittest.TestCase):
         runs = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"]
         self.assertEqual(len(runs), 2)
         run_detail = self.request_json(f"/api/runs/{runs[0]['id']}", token=self.token)
+        self.assertEqual(
+            [event["sequence"] for event in run_detail["events"]],
+            list(range(1, len(run_detail["events"]) + 1)),
+        )
+        self.assertTrue(all(event["schema_version"] == 1 for event in run_detail["events"]))
         self.assertEqual(
             [event["type"] for event in run_detail["events"]],
             ["started", "execution_context", "skill_routed", "knowledge_not_needed", "plan_created", "model_request", "completed"],
@@ -180,6 +218,28 @@ class AgentPlatformApiTests(unittest.TestCase):
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
 
+    def test_user_can_cancel_a_pending_run_without_creating_an_artifact(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            events = self.chat({"thread_id": "", "content": "请生成 Markdown 文件，整理本次平台说明"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+
+            result = self.request_json(f"/api/runs/{run_id}/cancel", {}, self.token)
+            self.assertEqual(result["status"], "cancelled")
+            detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertEqual(detail["run"]["status"], "cancelled")
+            self.assertEqual(detail["confirmation"]["status"], "cancelled")
+            self.assertTrue(all(step["status"] == "cancelled" for step in detail["steps"]))
+            self.assertIn("cancelled", [event["type"] for event in detail["events"]])
+            self.assertFalse(app.ARTIFACT_DIR.exists())
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token)
+            self.assertEqual(ctx.exception.code, 409)
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
     def test_xlsx_artifact_uses_a_fixed_workbook(self):
         original_artifact_dir = app.ARTIFACT_DIR
         app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
@@ -211,6 +271,10 @@ class AgentPlatformApiTests(unittest.TestCase):
         event_types = [event["type"] for event in detail["events"]]
         self.assertIn("tool_call", event_types)
         self.assertIn("tool_result", event_types)
+        tool_call = next(json.loads(event["payload"]) for event in detail["events"] if event["type"] == "tool_call")
+        tool_result = next(json.loads(event["payload"]) for event in detail["events"] if event["type"] == "tool_result")
+        self.assertTrue(tool_call["tool_call_id"])
+        self.assertEqual(tool_call["tool_call_id"], tool_result["tool_call_id"])
 
     def test_high_value_task_records_reflection_without_private_reasoning(self):
         events = self.chat({"thread_id": "", "content": "请写一份产品调研方案"})
@@ -332,6 +396,35 @@ class AgentPlatformApiTests(unittest.TestCase):
         history = self.request_json(f"/api/threads/{thread_id}", token=self.token)
         self.assertEqual([message["role"] for message in history["messages"]], ["user", "assistant"])
         self.assertEqual(history["messages"][0]["content"], "请重试")
+
+    def test_startup_reconciles_interrupted_runs_but_preserves_confirmations(self):
+        with app.db() as conn:
+            conn.execute(
+                "INSERT INTO threads (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                ("thread_recovery", "user_test", "恢复测试", app.now(), app.now()),
+            )
+            conn.execute(
+                "INSERT INTO runs (id, thread_id, status, model, started_at) VALUES (?, ?, ?, ?, ?)",
+                ("run_interrupted", "thread_recovery", "running", "test", app.now()),
+            )
+            conn.execute(
+                "INSERT INTO runs (id, thread_id, status, model, started_at) VALUES (?, ?, ?, ?, ?)",
+                ("run_waiting", "thread_recovery", "awaiting_confirmation", "test", app.now()),
+            )
+
+        app.init_db()
+
+        with app.db() as conn:
+            interrupted = conn.execute("SELECT status, error FROM runs WHERE id = 'run_interrupted'").fetchone()
+            waiting = conn.execute("SELECT status FROM runs WHERE id = 'run_waiting'").fetchone()
+            recovery_event = conn.execute(
+                "SELECT type, sequence FROM run_events WHERE run_id = 'run_interrupted'"
+            ).fetchone()
+        self.assertEqual(interrupted["status"], "failed")
+        self.assertIn("请重试", interrupted["error"])
+        self.assertEqual(waiting["status"], "awaiting_confirmation")
+        self.assertEqual(recovery_event["type"], "run_recovered")
+        self.assertEqual(recovery_event["sequence"], 1)
 
     def test_delete_artifact_removes_file_and_record(self):
         original_artifact_dir = app.ARTIFACT_DIR

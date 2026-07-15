@@ -12,6 +12,7 @@
 - 应用展示
 - 个人设置
 - DeepSeek API 配置、模型路由和任务档位
+- 可审计 Run 生命周期、稳定事件顺序与服务重启故障收敛
 - 本地知识库：Markdown、TXT、Word 上传、检索、引用和删除（PDF 需安装 `pypdf`）
 - 未配置 DeepSeek 时本地模拟回复
 
@@ -32,6 +33,28 @@ http://localhost:8765
 ```text
 邮箱：admin@example.com
 密码：admin123
+```
+
+## 生产启动
+
+生产环境不会创建默认 `admin@example.com / admin123` 账号，必须显式配置首个管理员：
+
+```bash
+export AGENT_PLATFORM_ENV="production"
+export ADMIN_EMAIL="owner@example.com"
+export ADMIN_PASSWORD="请使用高强度且唯一的密码"
+export ADMIN_NAME="平台管理员" # 可选
+python3 server/app.py
+```
+
+`/api/health` 不需要登录，可供部署探针检查 SQLite 是否可用。应用默认只监听本机地址；正式对外服务时，应由反向代理提供 HTTPS、访问控制与日志留存，不要直接暴露开发进程。
+
+若部署环境不由容器或进程管理器收集标准输出，可启用本地日志轮转：
+
+```bash
+export AGENT_LOG_FILE="/var/log/agent-platform/app.log"
+export AGENT_LOG_MAX_BYTES="10485760" # 单个文件上限，默认 10 MiB
+export AGENT_LOG_BACKUP_COUNT="5"      # 保留轮转文件数量，默认 5
 ```
 
 ## DeepSeek 配置
@@ -70,13 +93,28 @@ DEEPSEEK_SSL_VERIFY="false"
 
 这只建议用于本地开发。正式部署时应安装正确 CA 证书，并保持 `DEEPSEEK_SSL_VERIFY="true"`。
 
+## 部署验收命令
+
+以下命令都不会输出 API Key 或私有对话内容：
+
+```bash
+# 仅校验 DeepSeek 配置，不发送请求
+python3 server/smoke_deepseek.py --dry-run
+
+# 在目标部署环境发送一次最小真实模型请求
+python3 server/smoke_deepseek.py
+
+# 备份、恢复到临时目录并校验 SQLite 完整性和关键表计数；不会修改源数据库
+python3 server/recovery_drill.py --database agent_platform.db
+```
+
 ## 回归测试
 
 ```bash
-python3 -m unittest server.test_app -v
+python3 -m unittest server.test_agent_runtime server.test_model_provider server.test_tool_policy server.test_agent_loop server.test_extensions server.test_operations server.test_app -v
 ```
 
-该测试使用临时数据库和本地模拟模型，覆盖连续对话、历史消息顺序，以及模型失败后的重试行为。
+该测试使用临时数据库和本地模拟模型，覆盖连续对话、运行审计、取消、审批、健康检查、生产启动凭据校验和数据库恢复演练。
 
 ## 本地评测
 

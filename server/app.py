@@ -6,16 +6,14 @@ import io
 import json
 import os
 import sqlite3
-import ssl
 import time
 import secrets
 import logging
 import re
 import shutil
 import subprocess
-import urllib.error
-import urllib.request
 import uuid
+from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -30,8 +28,16 @@ except ImportError:
     PdfReader = None
 try:
     from server.local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
+    from server.agent_runtime import AgentRuntimeStore, RuntimeDependencies
+    from server.agent_loop import AgentLoopDependencies, SingleAgentLoop
+    from server.model_provider import DeepSeekConfig, DeepSeekProvider
+    from server.tool_policy import ToolPolicy
 except ModuleNotFoundError:
     from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
+    from agent_runtime import AgentRuntimeStore, RuntimeDependencies
+    from agent_loop import AgentLoopDependencies, SingleAgentLoop
+    from model_provider import DeepSeekConfig, DeepSeekProvider
+    from tool_policy import ToolPolicy
 
 try:
     import certifi
@@ -46,6 +52,20 @@ KNOWLEDGE_DIR = ROOT_DIR / "data" / "knowledge"
 ARTIFACT_DIR = ROOT_DIR / "data" / "artifacts"
 ARTIFACT_NODE = os.environ.get("ARTIFACT_NODE", shutil.which("node") or "node")
 ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
+
+
+def deployment_environment() -> str:
+    return os.environ.get("AGENT_PLATFORM_ENV", "development").strip().lower()
+
+
+def bootstrap_admin_credentials() -> tuple[str, str, str]:
+    if deployment_environment() == "production":
+        email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+        password = os.environ.get("ADMIN_PASSWORD", "")
+        if not email or not password:
+            raise RuntimeError("生产环境必须设置 ADMIN_EMAIL 和 ADMIN_PASSWORD")
+        return email, password, os.environ.get("ADMIN_NAME", "Admin").strip() or "Admin"
+    return "admin@example.com", "admin123", "Admin"
 
 
 def load_env_file(path: Path) -> None:
@@ -85,7 +105,32 @@ MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
 REQUEST_WINDOW_NS = 60 * 1_000_000_000
 REQUESTS_BY_USER: dict[str, list[int]] = {}
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG_FILE = os.environ.get("AGENT_LOG_FILE", "").strip()
+LOG_MAX_BYTES = int(os.environ.get("AGENT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.environ.get("AGENT_LOG_BACKUP_COUNT", "5"))
+
+
+def configure_logging() -> None:
+    """Keep container/stdout logging by default; add bounded local files when requested."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if LOG_FILE:
+        try:
+            log_path = Path(LOG_FILE).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(
+                RotatingFileHandler(
+                    log_path,
+                    maxBytes=max(LOG_MAX_BYTES, 1024),
+                    backupCount=max(LOG_BACKUP_COUNT, 1),
+                    encoding="utf-8",
+                )
+            )
+        except OSError as exc:
+            logging.getLogger("agent_platform").warning("file_logging_unavailable error=%s", str(exc)[:160])
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+
+
+configure_logging()
 LOGGER = logging.getLogger("agent_platform")
 
 SKILLS_DIR = ROOT_DIR / "server" / "skills"
@@ -291,6 +336,7 @@ LOCAL_TOOLS = LocalToolRegistry([
         execute_fn=search_workspace_files,
     ),
 ])
+TOOL_POLICY = ToolPolicy(LOCAL_TOOLS)
 WORKFLOW_RUNNER = LocalWorkflowRunner()
 
 
@@ -300,6 +346,24 @@ def now() -> int:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+RUNTIME_STORE = AgentRuntimeStore(RuntimeDependencies(new_id=new_id, now=now))
+
+
+class RunCancelled(RuntimeError):
+    pass
+
+
+def append_run_event(conn: sqlite3.Connection, run_id: str, event_type: str, payload: dict | None = None) -> int:
+    return RUNTIME_STORE.append_event(conn, run_id, event_type, payload)
+
+
+def ensure_run_active(run_id: str) -> None:
+    with db() as conn:
+        row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row and row["status"] == "cancelled":
+        raise RunCancelled("运行已取消")
 
 
 def hash_password(password: str) -> str:
@@ -331,6 +395,8 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    # Fail before touching the database when production bootstrap is incomplete.
+    admin_email, admin_password, admin_name = bootstrap_admin_credentials()
     with db() as conn:
         conn.executescript(
             """
@@ -389,6 +455,8 @@ def init_db() -> None:
                 run_id TEXT NOT NULL,
                 type TEXT NOT NULL,
                 payload TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                sequence INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
 
@@ -461,13 +529,28 @@ def init_db() -> None:
         ensure_column(conn, "runs", "input_tokens_estimate", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "output_tokens_estimate", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "tool_call_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "run_events", "schema_version", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(conn, "run_events", "sequence", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "sessions", "expires_at", "INTEGER DEFAULT 0")
-        user = conn.execute("SELECT id FROM users WHERE email = ?", ("admin@example.com",)).fetchone()
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_sequence ON run_events(run_id, sequence) WHERE sequence > 0"
+        )
+        interrupted_runs = conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()
+        for interrupted_run in interrupted_runs:
+            run_id = interrupted_run["id"]
+            recovery_error = "服务重启前运行未完成，请重试"
+            RUNTIME_STORE.transition_run(conn, run_id, "failed", error=recovery_error)
+            conn.execute(
+                "UPDATE run_steps SET status = 'failed', error = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
+                (recovery_error, now(), run_id),
+            )
+            append_run_event(conn, run_id, "run_recovered", {"outcome": "failed", "retryable": True})
+        user = conn.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
         if not user:
             user_id = new_id("user")
             conn.execute(
                 "INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, "admin@example.com", hash_password("admin123"), "Admin", now()),
+                (user_id, admin_email, hash_password(admin_password), admin_name, now()),
             )
             for skill in SKILLS:
                 conn.execute(
@@ -566,12 +649,7 @@ def classify_knowledge_intent(content: str) -> dict:
 
 
 def allowed_tools_for_task(content: str) -> list[dict]:
-    tool_definitions = [tool for tool in LOCAL_TOOLS.list() if tool["enabled"] and tool["risk"] == "read_only"]
-    if "平台状态" in content or "系统状态" in content:
-        return [tool for tool in tool_definitions if tool["id"] == "platform_status"]
-    if any(marker in content for marker in ("文件", "检索", "查找", "搜索")):
-        return [tool for tool in tool_definitions if tool["id"] == "search_workspace_files"]
-    return []
+    return TOOL_POLICY.resolve(content)
 
 
 def extract_knowledge_text(filename: str, raw: bytes) -> str:
@@ -797,13 +875,22 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def handle_api_get(self) -> None:
         user = self.require_user() if self.path != "/api/health" else None
         if self.path == "/api/health":
+            try:
+                with db() as conn:
+                    conn.execute("SELECT 1").fetchone()
+            except sqlite3.Error as exc:
+                LOGGER.error("health_check_failed error=%s", str(exc)[:160])
+                self.send_json({"ok": False, "database_ready": False, "database": "sqlite"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             self.send_json(
                 {
                     "ok": True,
+                    "environment": deployment_environment(),
                     "model": DEEPSEEK_MODEL,
                     "deepseek_configured": bool(DEEPSEEK_API_KEY),
                     "deepseek_ssl_verify": DEEPSEEK_SSL_VERIFY,
                     "database": "sqlite",
+                    "database_ready": True,
                     "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
                 }
             )
@@ -904,6 +991,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/runs/") and self.path.endswith("/confirmation"):
             self.resolve_confirmation(user)
+            return
+        if self.path.startswith("/api/runs/") and self.path.endswith("/cancel"):
+            self.cancel_run(user)
             return
         if self.path == "/api/chat":
             self.chat(user)
@@ -1160,7 +1250,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
                 return
             events = conn.execute(
-                "SELECT * FROM run_events WHERE run_id = ? ORDER BY created_at ASC, id ASC", (run_id,)
+                "SELECT * FROM run_events WHERE run_id = ? ORDER BY sequence ASC, created_at ASC, id ASC", (run_id,)
             ).fetchall()
             steps = conn.execute(
                 "SELECT * FROM run_steps WHERE run_id = ? ORDER BY position ASC", (run_id,)
@@ -1191,12 +1281,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             status = "approved" if approved else "rejected"
             conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ?", (status, "用户批准" if approved else "用户拒绝", now(), run_id))
             if not approved:
-                conn.execute("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?", ("cancelled", now(), run_id))
+                RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
                 conn.execute(
                     "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'",
                     ("cancelled", now(), run_id),
                 )
-            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "confirmation_resolved", json.dumps({"approved": approved}), now()))
+            append_run_event(conn, run_id, "confirmation_resolved", {"approved": approved})
         if not approved:
             self.send_json({"ok": True, "approved": False, "run_id": run_id})
             return
@@ -1208,6 +1298,36 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json(str(exc), HTTPStatus.BAD_GATEWAY)
             return
         self.send_json({"ok": True, "approved": True, "run_id": run_id, **result})
+
+    def cancel_run(self, user: dict) -> None:
+        run_id = self.path.split("/")[-2]
+        with db() as conn:
+            run = conn.execute(
+                "SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?",
+                (run_id, user["id"]),
+            ).fetchone()
+            if not run:
+                self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
+                return
+            if run["status"] not in {"running", "awaiting_confirmation"}:
+                self.send_error_json("该运行无法取消", HTTPStatus.CONFLICT)
+                return
+            context = json.loads(run["execution_context"] or "{}")
+            if run["status"] == "running" and context.get("artifact_request"):
+                self.send_error_json("文件产物正在执行，无法安全中断", HTTPStatus.CONFLICT)
+                return
+            if run["status"] == "awaiting_confirmation":
+                conn.execute(
+                    "UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'",
+                    ("cancelled", "用户取消", now(), run_id),
+                )
+            RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
+            conn.execute(
+                "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running', 'awaiting_confirmation')",
+                ("cancelled", now(), run_id),
+            )
+            append_run_event(conn, run_id, "cancelled", {"source": "user"})
+        self.send_json({"ok": True, "run_id": run_id, "status": "cancelled"})
 
     def get_metrics(self, user: dict) -> None:
         with db() as conn:
@@ -1561,7 +1681,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (
                     run_id,
                     thread_id,
-                    "awaiting_confirmation" if artifact_kind else "running",
+                    "running",
                     actual_model,
                     now(),
                     json.dumps(active_skills, ensure_ascii=False),
@@ -1569,29 +1689,24 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     json.dumps(execution_plan, ensure_ascii=False),
                 ),
             )
-            conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, "started", "{}", now()),
-            )
-            conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, "execution_context", json.dumps({"model": actual_model, "task_tier": execution_context["task_tier"], "tool_ids": execution_context["allowed_tool_ids"]}, ensure_ascii=False), now()),
-            )
-            conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, "skill_routed", json.dumps({"route": execution_context["skill_route"], "skills": [skill["name"] for skill in active_skills]}, ensure_ascii=False), now()),
-            )
+            append_run_event(conn, run_id, "started")
+            append_run_event(conn, run_id, "execution_context", {
+                "model": actual_model,
+                "task_tier": execution_context["task_tier"],
+                "tool_ids": execution_context["allowed_tool_ids"],
+            })
+            append_run_event(conn, run_id, "skill_routed", {
+                "route": execution_context["skill_route"],
+                "skills": [skill["name"] for skill in active_skills],
+            })
             knowledge_event = "knowledge_retrieved" if knowledge_refs else (
                 "knowledge_no_match" if task_profile["needs_knowledge"] else "knowledge_not_needed"
             )
-            conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, knowledge_event, json.dumps({"count": len(knowledge_refs), "intent": task_profile["knowledge_intent"]["reason"]}, ensure_ascii=False), now()),
-            )
-            conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, "plan_created", json.dumps({"steps": execution_plan}, ensure_ascii=False), now()),
-            )
+            append_run_event(conn, run_id, knowledge_event, {
+                "count": len(knowledge_refs),
+                "intent": task_profile["knowledge_intent"]["reason"],
+            })
+            append_run_event(conn, run_id, "plan_created", {"steps": execution_plan})
             conn.executemany(
                 """
                 INSERT INTO run_steps (id, run_id, position, title, status, requires_confirmation, updated_at)
@@ -1603,15 +1718,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 ],
             )
             if artifact_kind:
+                RUNTIME_STORE.transition_run(conn, run_id, "awaiting_confirmation")
                 request = artifact_confirmation_text(artifact_kind)
                 conn.execute(
                     "INSERT INTO run_confirmations (run_id, request, status, created_at) VALUES (?, ?, ?, ?)",
                     (run_id, request, "pending", now()),
                 )
-                conn.execute(
-                    "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (new_id("event"), run_id, "confirmation_requested", json.dumps({"kind": artifact_kind, "target": "data/artifacts"}, ensure_ascii=False), now()),
-                )
+                append_run_event(conn, run_id, "confirmation_requested", {
+                    "kind": artifact_kind,
+                    "target": "data/artifacts",
+                })
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1630,24 +1746,28 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.write_event("confirmation", {"run_id": run_id, "request": artifact_confirmation_text(artifact_kind), "kind": artifact_kind})
                 return
             with db() as conn:
-                conn.execute(
-                    "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (new_id("event"), run_id, "model_request", json.dumps({"model": actual_model, "task_tier": execution_context["task_tier"]}), now()),
-                )
+                append_run_event(conn, run_id, "model_request", {
+                    "model": actual_model,
+                    "task_tier": execution_context["task_tier"],
+                })
                 conn.execute(
                     "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND position = 1",
                     ("running", now(), run_id),
                 )
             def emit_runtime_event(event_type: str, payload: dict) -> None:
+                ensure_run_active(run_id)
                 with db() as event_conn:
-                    event_conn.execute(
-                        "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (new_id("event"), run_id, event_type, json.dumps(payload, ensure_ascii=False), now()),
-                    )
+                    append_run_event(event_conn, run_id, event_type, payload)
                 self.write_event("status", {"summary": event_summary(event_type, payload)})
 
-            draft_answer = "".join(stream_answer(thread_id, content, execution_context, emit_runtime_event))
+            draft_parts = []
+            for chunk in stream_answer(thread_id, content, execution_context, emit_runtime_event):
+                ensure_run_active(run_id)
+                draft_parts.append(chunk)
+            draft_answer = "".join(draft_parts)
+            ensure_run_active(run_id)
             final_answer, reflection = reflect_answer(content, draft_answer, execution_context, emit_runtime_event)
+            ensure_run_active(run_id)
             final_answer = append_knowledge_sources(final_answer, execution_context["knowledge_refs"], execution_context["knowledge_route"])
             answer = ""
             for chunk in chunk_text(final_answer, 12):
@@ -1658,15 +1778,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
                     (new_id("msg"), thread_id, "assistant", answer, now()),
                 )
+                RUNTIME_STORE.transition_run(conn, run_id, "completed")
                 conn.execute(
                     """
                     UPDATE runs
-                    SET status = ?, completed_at = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ?
+                    SET reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ?
                     WHERE id = ?
                     """,
                     (
-                        "completed",
-                        now(),
                         json.dumps(reflection, ensure_ascii=False),
                         estimate_tokens(content),
                         estimate_tokens(answer),
@@ -1679,22 +1798,20 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
                     ("completed", now(), run_id),
                 )
-                conn.execute(
-                    "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (new_id("event"), run_id, "completed", json.dumps({"length": len(answer)}, ensure_ascii=False), now()),
-                )
+                append_run_event(conn, run_id, "completed", {"length": len(answer)})
             self.write_event("done", {"content": answer})
             LOGGER.info("run_completed run_id=%s thread_id=%s model=%s", run_id, thread_id, actual_model)
+        except RunCancelled:
+            self.write_event("cancelled", {"run_id": run_id})
+            LOGGER.info("run_cancelled run_id=%s thread_id=%s", run_id, thread_id)
         except Exception as exc:
             with db() as conn:
-                conn.execute(
-                    "UPDATE runs SET status = ?, completed_at = ?, error = ? WHERE id = ?",
-                    ("failed", now(), str(exc), run_id),
-                )
-                conn.execute(
-                    "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (new_id("event"), run_id, "failed", json.dumps({"error": str(exc)}, ensure_ascii=False), now()),
-                )
+                status = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if status and status["status"] == "cancelled":
+                    self.write_event("cancelled", {"run_id": run_id})
+                    return
+                RUNTIME_STORE.transition_run(conn, run_id, "failed", error=str(exc))
+                append_run_event(conn, run_id, "failed", {"error": str(exc)})
                 conn.execute(
                     "UPDATE run_steps SET status = ?, error = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
                     ("failed", str(exc), now(), run_id),
@@ -1908,10 +2025,11 @@ def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, a
             "INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (artifact_id, user_id, run_id, filename, kind, str(path), summary, now()),
         )
-        conn.execute(
-            "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            (new_id("event"), run_id, "artifact_created", json.dumps({"artifact_id": artifact_id, "filename": filename, "kind": kind}, ensure_ascii=False), now()),
-        )
+        append_run_event(conn, run_id, "artifact_created", {
+            "artifact_id": artifact_id,
+            "filename": filename,
+            "kind": kind,
+        })
     return {"id": artifact_id, "filename": filename, "kind": kind, "summary": summary}
 
 
@@ -1932,16 +2050,13 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         kind = request.get("kind")
         if kind not in {"markdown", "xlsx"}:
             raise ValueError("该运行没有可执行的文件产物请求")
-        conn.execute("UPDATE runs SET status = ? WHERE id = ?", ("running", run_id))
+        RUNTIME_STORE.transition_run(conn, run_id, "running")
         conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'", ("running", now(), run_id))
-        conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "model_request", json.dumps({"model": run["model"]}), now()))
+        append_run_event(conn, run_id, "model_request", {"model": run["model"]})
 
     def emit_runtime_event(event_type: str, payload: dict) -> None:
         with db() as event_conn:
-            event_conn.execute(
-                "INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                (new_id("event"), run_id, event_type, json.dumps(payload, ensure_ascii=False), now()),
-            )
+            append_run_event(event_conn, run_id, event_type, payload)
 
     try:
         source_content = user_message["content"]
@@ -1951,16 +2066,17 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         artifact = create_artifact(user_id, run_id, kind, source_content, answer)
         with db() as conn:
             conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], "assistant", answer, now()))
-            conn.execute("UPDATE runs SET status = ?, completed_at = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ? WHERE id = ?", ("completed", now(), json.dumps(reflection, ensure_ascii=False), estimate_tokens(source_content), estimate_tokens(answer), conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"], run_id))
+            RUNTIME_STORE.transition_run(conn, run_id, "completed")
+            conn.execute("UPDATE runs SET reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ? WHERE id = ?", (json.dumps(reflection, ensure_ascii=False), estimate_tokens(source_content), estimate_tokens(answer), conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"], run_id))
             conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now(), run["thread_id"]))
             conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')", ("completed", now(), run_id))
-            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "completed", json.dumps({"length": len(answer)}, ensure_ascii=False), now()))
+            append_run_event(conn, run_id, "completed", {"length": len(answer)})
         return {"content": answer, "artifact": artifact}
     except Exception as exc:
         with db() as conn:
-            conn.execute("UPDATE runs SET status = ?, completed_at = ?, error = ? WHERE id = ?", ("failed", now(), str(exc), run_id))
+            RUNTIME_STORE.transition_run(conn, run_id, "failed", error=str(exc))
             conn.execute("UPDATE run_steps SET status = ?, error = ?, updated_at = ? WHERE run_id = ? AND status = 'running'", ("failed", str(exc), now(), run_id))
-            conn.execute("INSERT INTO run_events (id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("event"), run_id, "failed", json.dumps({"error": str(exc)}, ensure_ascii=False), now()))
+            append_run_event(conn, run_id, "failed", {"error": str(exc)})
         raise
 
 
@@ -1982,10 +2098,11 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
 
     if "平台状态" in user_content or "系统状态" in user_content:
         tool_id = "platform_status"
+        tool_call_id = new_id("toolcall")
         tool = LOCAL_TOOLS.get(tool_id)
-        on_event("tool_call", {"tool_id": tool_id, "tool_name": tool.name, "arguments": {}})
+        on_event("tool_call", {"tool_call_id": tool_call_id, "tool_id": tool_id, "tool_name": tool.name, "arguments": {}})
         result = LOCAL_TOOLS.execute(tool_id, {}, set(execution_context["allowed_tool_ids"]))
-        on_event("tool_result", {"tool_id": tool_id, "tool_name": tool.name, "summary": "已读取平台状态"})
+        on_event("tool_result", {"tool_call_id": tool_call_id, "tool_id": tool_id, "tool_name": tool.name, "summary": "已读取平台状态"})
         answer = f"当前平台状态：模型为 {result['model']}，DeepSeek 配置状态为 {'已连接' if result['deepseek_configured'] else '未配置'}，本地存储为 {result['storage']}。"
         yield from chunk_text(answer, 10)
         return
@@ -2082,66 +2199,16 @@ def parse_reflection(content: str) -> dict:
 
 
 def run_deepseek_agent(thread_id: str, system_prompt: str, execution_context: dict, on_event):
-    messages = [{"role": "system", "content": system_prompt}] + recent_messages(thread_id)
-    allowed_tool_ids = set(execution_context["allowed_tool_ids"])
-    tools = LOCAL_TOOLS.callable_definitions(allowed_tool_ids)
-    for _step in range(execution_context["max_tool_steps"]):
-        message = None
-        for event in deepseek_chat(messages, tools, execution_context["model"], execution_context["max_output_tokens"], stream=True):
-            if event["type"] == "content":
-                yield event["text"]
-            elif event["type"] == "done":
-                message = event["message"]
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            content = (message.get("content") or "").strip()
-            if not content:
-                raise RuntimeError("DeepSeek 返回为空")
-            return
-
-        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
-        for call in tool_calls:
-            function = call.get("function", {})
-            tool_id = function.get("name", "")
-            tool = LOCAL_TOOLS.get(tool_id)
-            try:
-                arguments = json.loads(function.get("arguments") or "{}")
-                if not isinstance(arguments, dict):
-                    raise ValueError("工具参数必须是对象")
-                on_event("tool_call", {
-                    "tool_id": tool_id,
-                    "tool_name": tool.name if tool else tool_id,
-                    "arguments": arguments,
-                })
-                result = LOCAL_TOOLS.execute(tool_id, arguments, allowed_tool_ids)
-                on_event("tool_result", {
-                    "tool_id": tool_id,
-                    "tool_name": tool.name if tool else tool_id,
-                    "summary": summarize_tool_result(result),
-                })
-            except (ValueError, TypeError, json.JSONDecodeError) as exc:
-                result = {"error": str(exc)}
-                on_event("tool_error", {
-                    "tool_id": tool_id,
-                    "tool_name": tool.name if tool else tool_id,
-                    "error": str(exc),
-                })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.get("id", new_id("toolcall")),
-                "content": json.dumps(result, ensure_ascii=False),
-            })
-
-    messages.append({"role": "system", "content": "工具调用已达到上限。请基于已获得的信息直接给出最终回答，不要再调用工具。"})
-    message = None
-    for event in deepseek_chat(messages, [], execution_context["model"], execution_context["max_output_tokens"], stream=True):
-        if event["type"] == "content":
-            yield event["text"]
-        elif event["type"] == "done":
-            message = event["message"]
-    content = (message.get("content") or "").strip()
-    if not content:
-        raise RuntimeError("工具调用达到上限且模型未返回最终回答")
+    loop = SingleAgentLoop(AgentLoopDependencies(
+        load_messages=recent_messages,
+        stream_model=lambda messages, tools, context: deepseek_chat(
+            messages, tools, context["model"], context["max_output_tokens"], stream=True
+        ),
+        tools=LOCAL_TOOLS,
+        new_id=new_id,
+        summarize_tool_result=summarize_tool_result,
+    ))
+    yield from loop.stream(thread_id, system_prompt, execution_context, on_event)
 
 
 def summarize_tool_result(result: dict) -> str:
@@ -2152,138 +2219,16 @@ def summarize_tool_result(result: dict) -> str:
     return "工具已返回结果"
 
 
-def _read_sse_stream(response) -> dict:
-    """Read a DeepSeek SSE stream and return the assembled message dict."""
-    content_parts = []
-    tool_calls_index: dict[int, dict] = {}
-    for line in response:
-        line = line.decode("utf-8").strip()
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str == "[DONE]":
-            break
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-        delta = data.get("choices", [{}])[0].get("delta", {})
-        if "content" in delta and delta["content"]:
-            content_parts.append(delta["content"])
-        if "tool_calls" in delta:
-            for tc in delta["tool_calls"]:
-                idx = tc.get("index", 0)
-                if idx not in tool_calls_index:
-                    tool_calls_index[idx] = {
-                        "id": tc.get("id") or "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                entry = tool_calls_index[idx]
-                if tc.get("id"):
-                    entry["id"] = tc["id"]
-                func = tc.get("function", {})
-                if func.get("name"):
-                    entry["function"]["name"] += func["name"]
-                if func.get("arguments"):
-                    entry["function"]["arguments"] += func["arguments"]
-    content = "".join(content_parts)
-    tool_calls = [tool_calls_index[i] for i in sorted(tool_calls_index.keys())] if tool_calls_index else None
-    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
-
-
 def deepseek_chat(messages: list[dict], tools: list[dict], model: str = DEEPSEEK_MODEL, max_output_tokens: int = MAX_RESPONSE_TOKENS, stream: bool = False):
-    """Call DeepSeek API with streaming enabled.
-
-    Always uses stream=True at the API level.  If *stream* is True the
-    function is a generator that yields ``{"type": "content", "text": …}``
-    events for each content delta, and a final ``{"type": "done", "message":
-    …}`` event carrying the assembled message dict.  If *stream* is False
-    (the default) it returns the assembled message dict directly.
-    """
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.4,
-        "max_tokens": max_output_tokens,
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{DEEPSEEK_BASE_URL}/chat/completions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=300, context=deepseek_ssl_context()) as response:
-            if not stream:
-                return _read_sse_stream(response)
-            content_parts = []
-            tool_calls_index: dict[int, dict] = {}
-            for line in response:
-                line = line.decode("utf-8").strip()
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                delta = data.get("choices", [{}])[0].get("delta", {})
-                if "content" in delta and delta["content"]:
-                    content_parts.append(delta["content"])
-                    yield {"type": "content", "text": delta["content"]}
-                if "tool_calls" in delta:
-                    for tc in delta["tool_calls"]:
-                        idx = tc.get("index", 0)
-                        if idx not in tool_calls_index:
-                            tool_calls_index[idx] = {
-                                "id": tc.get("id") or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        entry = tool_calls_index[idx]
-                        if tc.get("id"):
-                            entry["id"] = tc["id"]
-                        func = tc.get("function", {})
-                        if func.get("name"):
-                            entry["function"]["name"] += func["name"]
-                        if func.get("arguments"):
-                            entry["function"]["arguments"] += func["arguments"]
-            content = "".join(content_parts)
-            tool_calls = [tool_calls_index[i] for i in sorted(tool_calls_index.keys())] if tool_calls_index else None
-            yield {"type": "done", "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"DeepSeek 请求失败：{exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        reason = str(exc.reason)
-        if "CERTIFICATE_VERIFY_FAILED" in reason:
-            raise RuntimeError(
-                "DeepSeek 请求失败：本机 HTTPS 证书校验失败。"
-                "本地开发可在 .env 中设置 DEEPSEEK_SSL_VERIFY=false；"
-                "生产环境建议安装正确 CA 证书后保持校验开启。"
-            ) from exc
-        raise RuntimeError(f"DeepSeek 请求失败：{reason}") from exc
-
-
-def deepseek_ssl_context():
-    if not DEEPSEEK_SSL_VERIFY:
-        return ssl._create_unverified_context()
-    if DEEPSEEK_CA_FILE:
-        return ssl.create_default_context(cafile=DEEPSEEK_CA_FILE)
-    if certifi:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
+    provider = DeepSeekProvider(DeepSeekConfig(
+        api_key=DEEPSEEK_API_KEY,
+        base_url=DEEPSEEK_BASE_URL,
+        ssl_verify=DEEPSEEK_SSL_VERIFY,
+        ca_file=DEEPSEEK_CA_FILE,
+    ), certifi_module=certifi)
+    if stream:
+        return provider.stream(messages, tools, model, max_output_tokens)
+    return provider.complete(messages, tools, model, max_output_tokens)
 
 
 def chunk_text(text: str, size: int):
