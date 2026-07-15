@@ -94,12 +94,15 @@ class SingleAgentLoop:
                 "arguments": arguments,
             })
             content = self._dependencies.tools.execute(tool_id, arguments, allowed_tool_ids)
-            on_event("tool_result", {
+            payload = {
                 "tool_call_id": tool_call_id,
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "summary": self._dependencies.summarize_tool_result(content),
-            })
+            }
+            if tool_id == "web_search" and isinstance(content.get("sources"), list):
+                payload["sources"] = content["sources"][:10]
+            on_event("tool_result", payload)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             content = {"error": str(exc)}
             on_event("tool_error", {

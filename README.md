@@ -9,11 +9,12 @@
 | 面向用户的能力 | 底层保障 |
 | --- | --- |
 | 登录、会话、文件夹、对话历史与 Markdown 回答渲染 | SQLite 持久化、PBKDF2-SHA256 密码散列、会话过期与按用户限流 |
-| DeepSeek 流式对话、快速/标准/深度任务档位、技能启用 | Provider 与 SSE 解析独立、确定性模型/工具路由、有限步 Agent Loop |
-| Markdown、TXT、Word、可选 PDF 知识库上传、检索与引用 | 仅注入命中片段；资料按用户隔离，可删除 |
+| DeepSeek 默认模型与 OpenAI 兼容供应商接入、快速/标准/深度任务档位 | Provider 注册表、环境变量密钥隔离、确定性模型/工具路由、有限步 Agent Loop |
+| Markdown、TXT、Word、可选 PDF 知识库上传、检索与引用 | 仅注入命中片段；资料按用户隔离，可删除；命中资料显示在对话右侧 |
+| JSON、Markdown、标准 Agent Skill ZIP 技能包管理 | 版本归档、启用/停用与回滚；ZIP 资源受限保存，脚本不会执行 |
 | Markdown、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限 |
 | 运行详情、步骤、工具调用与取消 | Run 状态机、事件序号和版本、服务重启时遗留运行自动收敛 |
-| 平台状态、工作区文件名检索 | 最小权限工具策略；当前只向模型暴露匹配意图的只读工具 |
+| 平台状态、工作区文件名检索、可选网页检索 | 最小权限工具策略；网页检索默认关闭，来源进入 Run 审计与对话右侧面板 |
 
 ## 架构与执行边界
 
@@ -85,6 +86,49 @@ DEEPSEEK_SSL_VERIFY="true"
 
 本地排查证书问题时可临时设置 `DEEPSEEK_SSL_VERIFY=false`；生产环境应配置正确 CA 并保持校验开启。
 
+### 可选：接入 OpenAI 兼容供应商
+
+DeepSeek 保持默认稳定路径。若需要增加其他 OpenAI Chat Completions 兼容供应商，可将供应商目录写入 `AGENT_MODEL_PROVIDERS`，密钥仍只通过各自的环境变量提供：
+
+```bash
+OPENAI_API_KEY="your_api_key"
+AGENT_MODEL_PROVIDERS='[
+  {
+    "provider_id": "openai",
+    "display_name": "OpenAI",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "models": ["gpt-4.1-mini"]
+  }
+]'
+```
+
+平台只接受 HTTPS 地址、合法的模型 ID 和大写环境变量名称；不会从 JSON 中读取或保存密钥。外部模型默认不参与工具调用，出现工具意图时会自动回退到 DeepSeek。未设置对应 Key 时不发送网络请求，并保持本地模拟回复路径。
+
+### 可选：启用受控网页检索
+
+网页检索默认关闭。当前实现兼容 Tavily 风格的 JSON 搜索接口；只有显式开启且配置 Key 后，模型在用户明确要求“搜索网页/互联网/在线资料”时才会看到该工具。
+
+```bash
+WEB_SEARCH_ENABLED="true"
+WEB_SEARCH_API_KEY_ENV="TAVILY_API_KEY"
+TAVILY_API_KEY="your_api_key"
+WEB_SEARCH_ENDPOINT="https://api.tavily.com/search" # 可选，必须为 HTTPS
+WEB_SEARCH_TIMEOUT_SECONDS="8"                       # 1-20 秒
+WEB_SEARCH_MAX_RESULTS="5"                           # 1-10 条
+MAX_CONTEXT_TOKENS="8000"                            # 自动续聊阈值
+```
+
+搜索结果只保存标题、链接和摘要，并写入本次 Run 的来源审计。未配置、超时或上游异常时，平台不会伪造来源，也不会发送密钥到页面或日志。上下文超过预算时会自动创建“（续）”对话并携带安全交接摘要；原对话保持完整历史。
+
+### 技能包兼容性与安全边界
+
+上传入口兼容平台原有的 JSON / Markdown 技能，以及标准 Agent Skill ZIP 包。标准包可使用根目录或单层包装目录，并以 `SKILL.md` 为入口：其 YAML frontmatter 必须至少包含 `name` 与 `description`。可选资源包括 `references/`、`assets/`、`agents/openai.yaml` 和 `scripts/`。
+
+技能和应用页提供原生文件选择与拖放导入，不依赖浏览器对 ZIP MIME 类型的筛选；文件选中后再执行格式判断与后端安全校验。仓库内的 [`examples/research-brief/`](examples/research-brief/) 是可用于打包导入验证的标准 Skill 示例目录。
+
+`scripts/` 中的 Python、Shell、Node 或其他代码只会作为技能资源保存到受控目录，**不会自动执行，也不会因此获得工具权限**。需要执行代码时，必须通过后续受控工具、超时限制和人工确认流程，而不是通过上传技能包绕过安全边界。
+
 ## 生产启动
 
 生产模式不会创建默认管理员。服务会在打开或修改数据库前校验管理员凭据：
@@ -139,7 +183,9 @@ python3 -m unittest \
   server.test_agent_loop \
   server.test_extensions \
   server.test_operations \
-  server.test_app -v
+  server.test_app \
+  server.test_model_registry \
+  server.test_provider_config -v
 
 python3 server/evaluate.py
 python3 server/evaluate.py \
@@ -153,6 +199,7 @@ python3 server/evaluate.py \
 
 - 当前是单进程、单 Agent 运行模型，适合交互式与分钟内完成的任务；不适合长时间后台工作、跨进程等待或高并发 Worker。
 - 当前工具仅包含平台状态和工作区文件名检索等只读能力。文件产物采用独立的受控审批流程；通用 `write_local`、`external_write`、`privileged` 工具审批将在真实工具接入时统一实现。
+- 工作区会在刷新完成认证、数据加载和原页面恢复后再显示，以避免页面闪烁；加载失败时会显示明确的错误状态。
 - 首个 MCP 服务尚未接入。接入时将先选择只读服务，并验证白名单、超时、审计与故障隔离。
 - SQLite 适合当前单机部署；当需要多实例写入、高并发或分布式 Worker 时，再评估迁移到服务化数据库和持久化执行框架。
 

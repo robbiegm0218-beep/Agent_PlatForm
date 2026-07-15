@@ -7,6 +7,7 @@ const state = {
   currentThreadId: "",
   messages: [],
   runs: [],
+  threadContext: { sources: [], outputs: [] },
   skills: [],
   models: [],
   artifacts: [],
@@ -15,6 +16,9 @@ const state = {
   activeView: "chat",
   streaming: false,
 };
+
+const UI_STATE_KEY = "agent_platform_workspace_state";
+const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "artifacts"]);
 
 const els = {
   loginView: document.querySelector("#loginView"),
@@ -48,8 +52,8 @@ const els = {
   sendButton: document.querySelector("#sendButton"),
   skillsGrid: document.querySelector("#skillsGrid"),
   appsGrid: document.querySelector("#appsGrid"),
-  uploadSkillButton: document.querySelector("#uploadSkillButton"),
   skillFileInput: document.querySelector("#skillFileInput"),
+  skillDropZone: document.querySelector("#skillDropZone"),
   nameInput: document.querySelector("#nameInput"),
   settingsEmail: document.querySelector("#settingsEmail"),
   settingsForm: document.querySelector("#settingsForm"),
@@ -63,6 +67,12 @@ const els = {
   knowledgeResults: document.querySelector("#knowledgeResults"),
   artifactsPage: document.querySelector("#artifactsPage"),
   artifactsGrid: document.querySelector("#artifactsGrid"),
+  threadContextPanel: document.querySelector("#threadContextPanel"),
+  threadContextCount: document.querySelector("#threadContextCount"),
+  threadSources: document.querySelector("#threadSources"),
+  threadOutputs: document.querySelector("#threadOutputs"),
+  viewKnowledgeButton: document.querySelector("#viewKnowledgeButton"),
+  viewArtifactsButton: document.querySelector("#viewArtifactsButton"),
 };
 
 function api(path, options = {}) {
@@ -96,9 +106,11 @@ async function boot() {
     const [{ user }, health] = await Promise.all([api("/api/me"), api("/api/health")]);
     state.user = user;
     els.modelStatus.textContent = health.deepseek_configured ? `DeepSeek / ${health.model}` : "DeepSeek / 本地模拟";
-    showWorkspace();
+    showWorkspace(false);
     try {
       await refreshAll();
+      await restoreWorkspaceState();
+      revealWorkspace();
     } catch (error) {
       showWorkspaceLoadError(error);
     }
@@ -115,6 +127,7 @@ async function boot() {
 }
 
 function showWorkspaceLoadError(error) {
+  revealWorkspace();
   els.messages.innerHTML = "";
   const notice = document.createElement("div");
   notice.className = "empty-state";
@@ -126,11 +139,13 @@ function showWorkspaceLoadError(error) {
 }
 
 function showLogin() {
+  document.body.classList.remove("booting");
   els.loginView.classList.remove("hidden");
   els.workspaceView.classList.add("hidden");
 }
 
 function showDirectOpenNotice() {
+  document.body.classList.remove("booting");
   document.body.innerHTML = `
     <main class="direct-open-notice">
       <section>
@@ -143,17 +158,51 @@ function showDirectOpenNotice() {
   `;
 }
 
-function showWorkspace() {
+function revealWorkspace() {
+  document.body.classList.remove("booting");
+}
+
+function showWorkspace(reveal = true) {
+  if (reveal) revealWorkspace();
   els.loginView.classList.add("hidden");
   els.workspaceView.classList.remove("hidden");
   els.nameInput.value = state.user?.name || "";
   els.settingsEmail.value = state.user?.email || "";
+  renderThreadContext();
 }
 
 async function refreshAll() {
   await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadArtifacts()]);
   renderThreads();
   renderMessages();
+}
+
+function persistWorkspaceState() {
+  localStorage.setItem(UI_STATE_KEY, JSON.stringify({
+    view: state.activeView,
+    threadId: state.currentThreadId,
+  }));
+}
+
+async function restoreWorkspaceState() {
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}");
+  } catch (_error) {
+    localStorage.removeItem(UI_STATE_KEY);
+  }
+  const view = VALID_VIEWS.has(saved.view) ? saved.view : "chat";
+  const thread = state.threads.find((item) => item.id === saved.threadId);
+  if (thread) {
+    await loadThread(thread.id);
+  } else {
+    state.currentThreadId = "";
+    state.messages = [];
+    els.threadTitle.textContent = "新对话";
+    renderThreads();
+    renderMessages();
+  }
+  switchView(view);
 }
 
 async function loadThreads() {
@@ -169,6 +218,7 @@ async function loadFolders() {
 async function loadThread(threadId) {
   const data = await api(`/api/threads/${threadId}`);
   state.currentThreadId = data.thread.id;
+  persistWorkspaceState();
   state.messages = data.messages;
   els.threadTitle.textContent = data.thread.title || "新对话";
   renderThreads();
@@ -310,6 +360,7 @@ async function loadArtifacts() {
 
 function renderArtifacts() {
   els.artifactsGrid.innerHTML = "";
+  els.artifactsGrid.classList.add("artifacts-grid");
   if (!state.artifacts.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -319,16 +370,31 @@ function renderArtifacts() {
   }
   state.artifacts.forEach((artifact) => {
     const card = document.createElement("article");
-    card.className = "capability-card";
-    const kindLabel = artifact.kind === "xlsx" ? "Excel (.xlsx)" : "Markdown (.md)";
+    card.className = "capability-card artifact-card";
+    const isExcel = artifact.kind === "xlsx";
+    const kindLabel = isExcel ? "Excel 文件" : "Markdown 文件";
+    const extension = isExcel ? ".xlsx" : ".md";
+    const icon = isExcel ? "▦" : "≡";
     const date = new Date(artifact.created_at / 1e6).toLocaleString("zh-CN");
+    const generatedName = artifact.filename.startsWith("artifact_");
+    const title = generatedName ? `${kindLabel} · ${date}` : artifact.filename;
+    const summary = artifact.summary || "由对话确认后生成，可随时下载或删除。";
     card.innerHTML = `
-      <h3>${escapeHtml(artifact.filename)}</h3>
-      <p>${escapeHtml(kindLabel)} · ${date} · ${escapeHtml(artifact.summary)}</p>
-      <div class="card-footer">
-        <span class="status-pill">${escapeHtml(kindLabel)}</span>
-        <button class="skill-action" type="button">下载</button>
-        <button class="skill-action danger" type="button">删除</button>
+      <div class="artifact-card-header">
+        <span class="artifact-type-icon ${isExcel ? "excel" : "markdown"}" aria-hidden="true">${icon}</span>
+        <div class="artifact-heading">
+          <h3 title="${escapeHtml(artifact.filename)}">${escapeHtml(title)}</h3>
+          <p class="artifact-file-name" title="${escapeHtml(artifact.filename)}">${escapeHtml(artifact.filename)}</p>
+        </div>
+      </div>
+      <p class="artifact-summary">${escapeHtml(summary)}</p>
+      <div class="artifact-meta"><span>创建于 ${date}</span><span>已确认生成</span></div>
+      <div class="card-footer artifact-footer">
+        <span class="artifact-kind-tag">${escapeHtml(extension.toUpperCase().slice(1))}</span>
+        <div class="artifact-actions">
+          <button class="skill-action" type="button">下载</button>
+          <button class="skill-action danger" type="button">删除</button>
+        </div>
       </div>
     `;
     const [downloadButton, deleteButton] = card.querySelectorAll(".skill-action");
@@ -519,6 +585,7 @@ async function manageThread(thread) {
     if (thread.id === state.currentThreadId) {
       state.currentThreadId = "";
       state.messages = [];
+      persistWorkspaceState();
       renderMessages();
     }
     await refreshThreadList();
@@ -553,10 +620,95 @@ async function manageFolder(folder) {
 async function loadRuns() {
   state.runs = [];
   els.runDetailsButton.disabled = !state.currentThreadId;
-  if (!state.currentThreadId) return;
+  if (!state.currentThreadId) {
+    state.threadContext = { sources: [], outputs: [] };
+    renderThreadContext();
+    return;
+  }
   const data = await api(`/api/threads/${state.currentThreadId}/runs`);
   state.runs = data.runs;
   renderRuns();
+  await loadThreadContext();
+}
+
+async function loadThreadContext() {
+  if (!state.currentThreadId) return;
+  const data = await api(`/api/threads/${state.currentThreadId}/context`);
+  state.threadContext = {
+    sources: Array.isArray(data.sources) ? data.sources : [],
+    outputs: Array.isArray(data.outputs) ? data.outputs : [],
+  };
+  renderThreadContext();
+}
+
+function renderThreadContext() {
+  const { sources = [], outputs = [] } = state.threadContext;
+  const hasThread = Boolean(state.currentThreadId);
+  els.threadContextCount.textContent = hasThread ? `${sources.length + outputs.length} 项` : "新对话";
+  renderContextList(els.threadOutputs, outputs, "暂无文件输出", (artifact) => {
+    const kind = artifact.kind === "xlsx" ? "Excel 文件" : "Markdown 文件";
+    return {
+      icon: "↧",
+      title: artifact.filename,
+      detail: `${kind}${artifact.summary ? ` · ${artifact.summary}` : ""}`,
+      onClick: () => downloadArtifact(artifact),
+      titleAttr: "下载此对话生成的文件",
+    };
+  });
+  renderContextList(els.threadSources, sources, "本次对话尚未命中资料或网页来源", (source) => {
+    if (source.kind === "web") {
+      return {
+        icon: "◌",
+        title: source.title || "网页来源",
+        detail: source.excerpt || source.url,
+        onClick: () => window.open(source.url, "_blank", "noopener,noreferrer"),
+        titleAttr: "打开网页来源",
+      };
+    }
+    return {
+      icon: "⌕",
+      title: source.filename,
+      detail: `片段 ${source.position + 1}${source.excerpt ? ` · ${source.excerpt}` : ""}`,
+      onClick: async () => {
+        switchView("knowledge");
+        els.knowledgeSearch.value = source.filename;
+        await searchKnowledge();
+      },
+      titleAttr: "在知识库中查看此来源",
+    };
+  });
+}
+
+function renderContextList(container, items, emptyText, createItem) {
+  container.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "context-empty";
+    empty.textContent = emptyText;
+    container.appendChild(empty);
+    return;
+  }
+  items.slice(0, 4).forEach((item) => {
+    const definition = createItem(item);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "context-item";
+    button.title = definition.titleAttr;
+    const icon = document.createElement("span");
+    icon.className = "context-item-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = definition.icon;
+    const text = document.createElement("span");
+    text.className = "context-item-text";
+    const title = document.createElement("strong");
+    title.textContent = definition.title;
+    const detail = document.createElement("small");
+    detail.textContent = definition.detail;
+    text.append(title, detail);
+    button.append(icon, text);
+    button.addEventListener("click", definition.onClick);
+    container.appendChild(button);
+  });
 }
 
 async function restorePendingConfirmation() {
@@ -907,6 +1059,7 @@ function renderSkills(skills) {
           <span></span>
         </label>
         <button class="skill-action" type="button" title="编辑技能">编辑</button>
+        <button class="skill-action" type="button" title="查看或回滚历史版本">版本</button>
         <button class="skill-action danger" type="button" title="删除技能">删除</button>
       </div>
     `;
@@ -926,8 +1079,9 @@ function renderSkills(skills) {
         window.alert(error.message);
       }
     });
-    const [editButton, deleteButton] = card.querySelectorAll(".skill-action");
+    const [editButton, versionButton, deleteButton] = card.querySelectorAll(".skill-action");
     editButton.addEventListener("click", () => editSkill(skill));
+    versionButton.addEventListener("click", () => restoreSkillVersion(skill));
     deleteButton.addEventListener("click", () => deleteSkill(skill));
     els.skillsGrid.appendChild(card);
   });
@@ -950,6 +1104,23 @@ async function deleteSkill(skill) {
   await loadSkills();
 }
 
+async function restoreSkillVersion(skill) {
+  const { versions } = await api(`/api/skills/${skill.id}/versions`);
+  if (!versions.length) {
+    window.alert("当前技能还没有可回滚的历史版本。");
+    return;
+  }
+  const choices = versions.map((version, index) => `${index + 1}. ${version.version}`).join("\n");
+  const selected = Number(window.prompt(`选择要恢复的版本：\n${choices}`, "1"));
+  if (!Number.isInteger(selected) || selected < 1 || selected > versions.length) return;
+  if (!window.confirm(`恢复“${skill.name}”到 ${versions[selected - 1].version}？`)) return;
+  await api(`/api/skills/${skill.id}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ archive: versions[selected - 1].archive }),
+  });
+  await loadSkills();
+}
+
 function renderApps(apps) {
   els.appsGrid.innerHTML = "";
   apps.forEach((app) => {
@@ -968,11 +1139,13 @@ function renderApps(apps) {
 
 function switchView(view) {
   state.activeView = view;
+  persistWorkspaceState();
   els.chatPage.classList.toggle("hidden", view !== "chat");
   els.skillsPage.classList.toggle("hidden", view !== "skills");
   els.settingsPage.classList.toggle("hidden", view !== "settings");
   els.knowledgePage.classList.toggle("hidden", view !== "knowledge");
   els.artifactsPage.classList.toggle("hidden", view !== "artifacts");
+  els.threadContextPanel.classList.toggle("hidden", view !== "chat");
   if (view === "artifacts") loadArtifacts();
   document.querySelectorAll(".nav-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
@@ -1034,6 +1207,7 @@ async function sendMessage(content, { retry = false } = {}) {
         const event = parseSse(eventText);
         if (event.event === "meta") {
           state.currentThreadId = event.data.thread_id;
+          persistWorkspaceState();
           assistant.status.textContent = `处理状态 · 正在调用 ${event.data.model}`;
         }
         if (event.event === "status") {
@@ -1233,9 +1407,11 @@ els.loginForm.addEventListener("submit", async (event) => {
     state.token = data.token;
     state.user = data.user;
     localStorage.setItem("agent_platform_token", state.token);
-    showWorkspace();
+    showWorkspace(false);
     try {
       await refreshAll();
+      await restoreWorkspaceState();
+      revealWorkspace();
     } catch (error) {
       showWorkspaceLoadError(error);
     }
@@ -1296,6 +1472,7 @@ function removeSkillBeforeCaret() {
 
 els.newThreadButton.addEventListener("click", () => {
   state.currentThreadId = "";
+  persistWorkspaceState();
   state.messages = [];
   state.selectedSkillIds = [];
   renderComposerSkills();
@@ -1305,6 +1482,8 @@ els.newThreadButton.addEventListener("click", () => {
   renderThreads();
   renderMessages();
   state.runs = [];
+  state.threadContext = { sources: [], outputs: [] };
+  renderThreadContext();
   els.runDetailsButton.disabled = true;
   els.runDrawer.classList.add("hidden");
 });
@@ -1320,6 +1499,9 @@ els.runDetailsButton.addEventListener("click", () => {
 
 els.closeRunDrawer.addEventListener("click", () => els.runDrawer.classList.add("hidden"));
 
+els.viewKnowledgeButton.addEventListener("click", () => switchView("knowledge"));
+els.viewArtifactsButton.addEventListener("click", () => switchView("artifacts"));
+
 els.skillPickerButton.addEventListener("click", () => {
   const isHidden = els.skillPickerMenu.classList.toggle("hidden");
   els.skillPickerButton.setAttribute("aria-expanded", String(!isHidden));
@@ -1332,22 +1514,57 @@ document.addEventListener("click", (event) => {
   }
 });
 
-els.uploadSkillButton.addEventListener("click", () => els.skillFileInput.click());
-els.skillFileInput.addEventListener("change", async () => {
-  const [file] = els.skillFileInput.files;
-  if (!file) return;
+async function uploadSkillFile(file) {
   try {
-    const content = await file.text();
-    const payload = file.name.toLowerCase().endsWith(".md")
-      ? { markdown: content, filename: file.name }
-      : { skill: JSON.parse(content) };
+    const lowerName = file.name.toLowerCase();
+    let payload;
+    const isZip = lowerName.endsWith(".zip") || /zip|compressed/i.test(file.type || "");
+    const isMarkdown = lowerName.endsWith(".md") || /markdown/i.test(file.type || "");
+    const isJson = lowerName.endsWith(".json") || /json/i.test(file.type || "");
+    if (!isZip && !isMarkdown && !isJson) {
+      throw new Error("请选择 JSON、Markdown 或 ZIP 格式的技能包");
+    }
+    if (isZip) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+      payload = { bundle_base64: btoa(binary) };
+    } else {
+      const content = await file.text();
+      payload = isMarkdown
+        ? { markdown: content, filename: file.name }
+        : { skill: JSON.parse(content) };
+    }
     await api("/api/skills", { method: "POST", body: JSON.stringify(payload) });
     await loadSkills();
   } catch (error) {
     window.alert(error.message);
-  } finally {
-    els.skillFileInput.value = "";
   }
+}
+
+els.skillFileInput.addEventListener("change", async () => {
+  const [file] = els.skillFileInput.files;
+  if (file) await uploadSkillFile(file);
+  els.skillFileInput.value = "";
+});
+
+["dragenter", "dragover"].forEach((eventName) => {
+  els.skillDropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    els.skillDropZone.classList.add("drag-active");
+  });
+});
+
+["dragleave", "drop"].forEach((eventName) => {
+  els.skillDropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    els.skillDropZone.classList.remove("drag-active");
+  });
+});
+
+els.skillDropZone.addEventListener("drop", async (event) => {
+  const [file] = event.dataTransfer?.files || [];
+  if (file) await uploadSkillFile(file);
 });
 
 els.uploadKnowledgeButton.addEventListener("click", () => els.knowledgeFileInput.click());

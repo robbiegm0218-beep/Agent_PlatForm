@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import uuid
+import zipfile
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
@@ -31,12 +32,18 @@ try:
     from server.agent_runtime import AgentRuntimeStore, RuntimeDependencies
     from server.agent_loop import AgentLoopDependencies, SingleAgentLoop
     from server.model_provider import DeepSeekConfig, DeepSeekProvider
+    from server.model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
+    from server.provider_config import ProviderConfig, parse_provider_configs
+    from server.web_search import WebSearchClient, WebSearchConfig
     from server.tool_policy import ToolPolicy
 except ModuleNotFoundError:
     from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
     from agent_runtime import AgentRuntimeStore, RuntimeDependencies
     from agent_loop import AgentLoopDependencies, SingleAgentLoop
     from model_provider import DeepSeekConfig, DeepSeekProvider
+    from model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
+    from provider_config import ProviderConfig, parse_provider_configs
+    from web_search import WebSearchClient, WebSearchConfig
     from tool_policy import ToolPolicy
 
 try:
@@ -102,6 +109,7 @@ MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "65536"))
 MAX_KNOWLEDGE_UPLOAD_BYTES = int(os.environ.get("MAX_KNOWLEDGE_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 MAX_RESPONSE_TOKENS = int(os.environ.get("MAX_RESPONSE_TOKENS", "2048"))
 MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
 REQUEST_WINDOW_NS = 60 * 1_000_000_000
 REQUESTS_BY_USER: dict[str, list[int]] = {}
@@ -134,6 +142,11 @@ configure_logging()
 LOGGER = logging.getLogger("agent_platform")
 
 SKILLS_DIR = ROOT_DIR / "server" / "skills"
+SKILL_HISTORY_DIR = ROOT_DIR / "data" / "skill_history"
+SKILL_PACKAGE_DIR = ROOT_DIR / "data" / "skill_packages"
+MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(256 * 1024)))
+WEB_SEARCH_CONFIG = WebSearchConfig.from_environment()
+WEB_SEARCH_CLIENT = WebSearchClient(WEB_SEARCH_CONFIG)
 
 MODEL_CATALOG = {
     "deepseek-v4-flash": {
@@ -149,6 +162,79 @@ MODEL_CATALOG = {
         "max_output_tokens": {"quick": 4096, "standard": 6144, "deep": 8192},
     },
 }
+
+EXTERNAL_PROVIDER_CONFIGS = parse_provider_configs(os.environ.get("AGENT_MODEL_PROVIDERS", ""))
+EXTERNAL_MODEL_CONFIGS: dict[str, ProviderConfig] = {}
+for provider_config in EXTERNAL_PROVIDER_CONFIGS:
+    if provider_config.provider_id == "deepseek":
+        raise RuntimeError("AGENT_MODEL_PROVIDERS 不可覆盖内置 deepseek 供应商")
+    for model_id in provider_config.models:
+        if model_id in MODEL_CATALOG:
+            raise RuntimeError(f"模型 ID 与内置目录冲突：{model_id}")
+        if model_id in EXTERNAL_MODEL_CONFIGS:
+            raise RuntimeError(f"模型 ID 在多个供应商中重复：{model_id}")
+        EXTERNAL_MODEL_CONFIGS[model_id] = provider_config
+        MODEL_CATALOG[model_id] = {
+            "name": f"{provider_config.display_name} · {model_id}",
+            "tier": "standard",
+            "supports_tools": False,
+            "max_output_tokens": {"quick": 2048, "standard": 4096, "deep": 4096},
+            "provider_id": provider_config.provider_id,
+        }
+
+
+def build_model_registry() -> ModelRegistry:
+    """Expose the active catalog through a provider-neutral, secret-free registry."""
+    registry = ModelRegistry()
+    registry.register_provider(
+        ProviderInfo(
+            provider_id="deepseek",
+            display_name="DeepSeek",
+            env_var="DEEPSEEK_API_KEY",
+            base_url=DEEPSEEK_BASE_URL,
+        )
+    )
+    for provider_config in EXTERNAL_PROVIDER_CONFIGS:
+        registry.register_provider(
+            ProviderInfo(
+                provider_id=provider_config.provider_id,
+                display_name=provider_config.display_name,
+                env_var=provider_config.api_key_env,
+                base_url=provider_config.base_url,
+            )
+        )
+    for model_id, profile in MODEL_CATALOG.items():
+        provider_id = profile.get("provider_id", "deepseek")
+        registry.register_model(
+            ModelInfo(
+                provider_id=provider_id,
+                model_id=model_id,
+                display_name=profile["name"],
+                capabilities=ModelCapabilities(streaming=True, tool_calling=profile["supports_tools"]),
+                task_tier=profile["tier"],
+                max_output_tokens=max(profile["max_output_tokens"].values()),
+            )
+        )
+    return registry
+
+
+MODEL_REGISTRY = build_model_registry()
+
+
+def model_connection(model_id: str) -> tuple[str, str, str]:
+    """Return runtime connection settings without persisting or exposing a secret."""
+    provider_config = EXTERNAL_MODEL_CONFIGS.get(model_id)
+    if provider_config:
+        return (
+            os.environ.get(provider_config.api_key_env, ""),
+            provider_config.base_url,
+            provider_config.display_name,
+        )
+    return DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, "DeepSeek"
+
+
+def model_is_configured(model_id: str) -> bool:
+    return bool(model_connection(model_id)[0])
 if DEEPSEEK_MODEL not in MODEL_CATALOG:
     LOGGER.warning("unsupported_configured_model model=%s; using deepseek-v4-flash", DEEPSEEK_MODEL)
     DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -180,16 +266,32 @@ def validate_skill(skill: dict) -> dict:
     return skill
 
 
-def save_skill(skill: dict) -> dict:
+def save_skill(skill: dict, resources: list[tuple[str, bytes]] | None = None) -> dict:
     skill = validate_skill(skill)
+    resources = resources or []
+    if resources:
+        skill["resources"] = [path for path, _content in resources]
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    (SKILLS_DIR / f"{skill['id']}.json").write_text(json.dumps(skill, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path = SKILLS_DIR / f"{skill['id']}.json"
+    if path.exists():
+        history_dir = SKILL_HISTORY_DIR / skill["id"]
+        history_dir.mkdir(parents=True, exist_ok=True)
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        history_name = f"{now()}_{str(previous.get('version', 'unknown'))[:48]}.json"
+        (history_dir / history_name).write_text(json.dumps(previous, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(skill, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if resources:
+        package_dir = SKILL_PACKAGE_DIR / skill["id"] / str(skill["version"])
+        for relative_path, content in resources:
+            destination = package_dir / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
     global SKILLS
     SKILLS = load_skills()
     return skill
 
 
-def parse_markdown_skill(markdown: str, filename: str = "") -> dict:
+def parse_markdown_skill(markdown: str, filename: str = "", require_standard_metadata: bool = False) -> dict:
     text = markdown.strip()
     if not text:
         raise ValueError("Markdown 技能文件不能为空")
@@ -203,6 +305,8 @@ def parse_markdown_skill(markdown: str, filename: str = "") -> dict:
                 metadata[key.strip()] = value.strip().strip('"').strip("'")
     lines = [line.strip() for line in body.splitlines()]
     heading = next((line[2:].strip() for line in lines if line.startswith("# ")), "")
+    if require_standard_metadata and (not metadata.get("name") or not metadata.get("description")):
+        raise ValueError("标准 SKILL.md 必须在 YAML frontmatter 中包含 name 和 description")
     name = metadata.get("name") or heading or Path(filename).stem or "未命名技能"
     prompt = "\n".join(line for line in lines if not line.startswith("# ")).strip()
     if not prompt:
@@ -220,6 +324,60 @@ def parse_markdown_skill(markdown: str, filename: str = "") -> dict:
         "kind": metadata.get("kind", "prompt_skill"),
         "tool_ids": [tool_id.strip() for tool_id in metadata.get("tool_ids", "").split(",") if tool_id.strip()],
     }
+
+
+def parse_skill_bundle(encoded: str) -> tuple[dict, list[tuple[str, bytes]]]:
+    """Parse a small, non-executable ZIP skill package entirely in memory."""
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError, binascii.Error) as exc:
+        raise ValueError("技能包编码无效") from exc
+    if not raw or len(raw) > MAX_SKILL_PACKAGE_BYTES:
+        raise ValueError("技能包为空或超过大小限制")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
+            entries = [entry for entry in bundle.infolist() if not entry.is_dir()]
+            if not entries or len(entries) > 32:
+                raise ValueError("技能包文件数量无效")
+            names = [entry.filename.replace("\\", "/") for entry in entries]
+            prefix = ""
+            first_parts = {name.split("/", 1)[0] for name in names if "/" in name}
+            if len(first_parts) == 1 and all("/" in name for name in names):
+                prefix = next(iter(first_parts)) + "/"
+            normalized = []
+            for entry in entries:
+                name = entry.filename.replace("\\", "/")
+                if prefix and name.startswith(prefix):
+                    name = name[len(prefix):]
+                path = Path(name)
+                allowed = (
+                    name in {"skill.json", "SKILL.md", "README.md", "agents/openai.yaml"}
+                    or name.startswith("scripts/") or name.startswith("references/") or name.startswith("assets/")
+                )
+                if not allowed or path.is_absolute() or ".." in path.parts or name.startswith("/"):
+                    raise ValueError("技能包包含不允许的文件")
+                if entry.file_size > MAX_SKILL_PACKAGE_BYTES or entry.compress_size > MAX_SKILL_PACKAGE_BYTES:
+                    raise ValueError("技能包文件超过大小限制")
+                normalized.append((name, entry))
+            if sum(entry.file_size for _name, entry in normalized) > MAX_SKILL_PACKAGE_BYTES:
+                raise ValueError("技能包解压后超过大小限制")
+            normalized_names = {name for name, _entry in normalized}
+            if ("skill.json" in normalized_names) == ("SKILL.md" in normalized_names):
+                raise ValueError("技能包必须且只能包含 skill.json 或 SKILL.md")
+            resources = [(name, bundle.read(entry)) for name, entry in normalized if name not in {"skill.json", "SKILL.md"}]
+            if "skill.json" in normalized_names:
+                try:
+                    entry = next(entry for name, entry in normalized if name == "skill.json")
+                    skill = json.loads(bundle.read(entry).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("技能包 JSON 无效") from exc
+                if not isinstance(skill, dict):
+                    raise ValueError("技能包 JSON 必须是对象")
+                return skill, resources
+            entry = next(entry for name, entry in normalized if name == "SKILL.md")
+            return parse_markdown_skill(bundle.read(entry).decode("utf-8"), "SKILL.md", require_standard_metadata=True), resources
+    except zipfile.BadZipFile as exc:
+        raise ValueError("技能包不是有效 ZIP 文件") from exc
 
 
 SKILLS = load_skills()
@@ -310,6 +468,10 @@ def search_workspace_files(arguments: dict) -> dict:
     return {"query": arguments["query"], "matches": matches, "count": len(matches)}
 
 
+def web_search_tool(arguments: dict) -> dict:
+    return WEB_SEARCH_CLIENT.search(arguments["query"], arguments.get("limit"))
+
+
 LOCAL_TOOLS = LocalToolRegistry([
     LocalTool(
         "platform_status",
@@ -334,6 +496,24 @@ LOCAL_TOOLS = LocalToolRegistry([
         },
         output_schema={"type": "object"},
         execute_fn=search_workspace_files,
+    ),
+    LocalTool(
+        "web_search",
+        "网页检索",
+        "在已配置的网页检索服务中查找公开网页；只返回标题、链接和摘要。",
+        enabled=WEB_SEARCH_CLIENT.available,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "要检索的公开网页关键词"},
+                "limit": {"type": "integer", "description": "最多返回数量，1 到 10"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        output_schema={"type": "object"},
+        timeout_seconds=WEB_SEARCH_CONFIG.timeout_seconds,
+        execute_fn=web_search_tool,
     ),
 ])
 TOOL_POLICY = ToolPolicy(LOCAL_TOOLS)
@@ -521,6 +701,8 @@ def init_db() -> None:
             """
         )
         ensure_column(conn, "threads", "context_summary", "TEXT DEFAULT ''")
+        ensure_column(conn, "threads", "parent_thread_id", "TEXT DEFAULT ''")
+        ensure_column(conn, "threads", "handoff_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
         ensure_column(conn, "runs", "skill_snapshot", "TEXT DEFAULT '[]'")
         ensure_column(conn, "runs", "execution_context", "TEXT DEFAULT '{}'")
@@ -561,6 +743,14 @@ def init_db() -> None:
 
 def row_to_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}
+
+
+def safe_json_object(value: object) -> dict:
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def estimate_tokens(text: str) -> int:
@@ -887,6 +1077,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "ok": True,
                     "environment": deployment_environment(),
                     "model": DEEPSEEK_MODEL,
+                    "model_configured": model_is_configured(DEEPSEEK_MODEL),
                     "deepseek_configured": bool(DEEPSEEK_API_KEY),
                     "deepseek_ssl_verify": DEEPSEEK_SSL_VERIFY,
                     "database": "sqlite",
@@ -902,14 +1093,23 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_json({"user": public_user(user)})
             return
         if self.path == "/api/models":
-            models = [{"id": "auto", "name": "自动选择", "configured": bool(DEEPSEEK_API_KEY)}]
+            models = [{"id": "auto", "name": "自动选择", "configured": model_is_configured(DEEPSEEK_MODEL)}]
             for model_id, profile in MODEL_CATALOG.items():
+                provider_id = profile.get("provider_id", "deepseek")
+                registered = MODEL_REGISTRY.lookup(provider_id, model_id)
                 models.append({
                     "id": model_id,
                     "name": profile["name"],
-                    "configured": bool(DEEPSEEK_API_KEY),
+                    "configured": model_is_configured(model_id),
                     "supports_tools": profile["supports_tools"],
                     "tier": profile["tier"],
+                    "provider_id": registered.provider_id if registered else provider_id,
+                    "capabilities": {
+                        "streaming": registered.capabilities.streaming if registered else True,
+                        "tool_calling": registered.capabilities.tool_calling if registered else profile["supports_tools"],
+                        "vision": registered.capabilities.vision if registered else False,
+                        "structured_output": registered.capabilities.structured_output if registered else False,
+                    },
                 })
             self.send_json({"models": models, "default_model": DEEPSEEK_MODEL, "deep_model": DEEPSEEK_DEEP_MODEL})
             return
@@ -940,6 +1140,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/threads/") and self.path.endswith("/runs"):
             self.list_runs(user)
             return
+        if self.path.startswith("/api/threads/") and self.path.endswith("/context"):
+            self.get_thread_context(user)
+            return
         if self.path.startswith("/api/threads/") and self.path.endswith("/skills"):
             self.list_thread_skills(user)
             return
@@ -947,6 +1150,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.get_thread(user)
             return
         if self.path.startswith("/api/skills/"):
+            if self.path.endswith("/versions"):
+                self.list_skill_versions(user)
+                return
             self.get_skill(user)
             return
         if self.path == "/api/skills":
@@ -979,6 +1185,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/skills":
             self.create_skill(user)
+            return
+        if self.path.startswith("/api/skills/") and self.path.endswith("/restore"):
+            self.restore_skill(user)
             return
         if self.path == "/api/knowledge":
             self.create_knowledge(user)
@@ -1121,6 +1330,85 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (thread_id,),
             ).fetchall()
         self.send_json({"thread": row_to_dict(thread), "messages": [row_to_dict(row) for row in messages]})
+
+    def get_thread_context(self, user: dict) -> None:
+        """Return only the sources and file outputs actually associated with one conversation."""
+        thread_id = self.path.split("/")[-2]
+        with db() as conn:
+            thread = conn.execute(
+                "SELECT id FROM threads WHERE id = ? AND user_id = ?", (thread_id, user["id"])
+            ).fetchone()
+            if not thread:
+                self.send_error_json("对话不存在", HTTPStatus.NOT_FOUND)
+                return
+            runs = conn.execute(
+                "SELECT id, started_at, execution_context FROM runs WHERE thread_id = ? ORDER BY started_at DESC, id DESC",
+                (thread_id,),
+            ).fetchall()
+            artifacts = conn.execute(
+                """
+                SELECT artifacts.id, artifacts.run_id, artifacts.filename, artifacts.kind, artifacts.summary, artifacts.created_at
+                FROM artifacts JOIN runs ON runs.id = artifacts.run_id
+                WHERE runs.thread_id = ? AND artifacts.user_id = ?
+                ORDER BY artifacts.created_at DESC, artifacts.id DESC
+                """,
+                (thread_id, user["id"]),
+            ).fetchall()
+            web_events = conn.execute(
+                """
+                SELECT run_events.run_id, run_events.payload, runs.started_at
+                FROM run_events JOIN runs ON runs.id = run_events.run_id
+                WHERE runs.thread_id = ? AND run_events.type = 'tool_result'
+                ORDER BY runs.started_at DESC, run_events.sequence DESC
+                """,
+                (thread_id,),
+            ).fetchall()
+
+        sources: list[dict] = []
+        seen_sources: set[tuple[str, int]] = set()
+        seen_web_urls: set[str] = set()
+        for run in runs:
+            context = safe_json_object(run["execution_context"])
+            for reference in context.get("knowledge_refs", []):
+                if not isinstance(reference, dict):
+                    continue
+                document_id = str(reference.get("document_id", ""))
+                position = reference.get("position")
+                if not document_id or not isinstance(position, int) or (document_id, position) in seen_sources:
+                    continue
+                seen_sources.add((document_id, position))
+                sources.append({
+                    "kind": "knowledge",
+                    "document_id": document_id,
+                    "filename": str(reference.get("filename", "未命名资料"))[:255],
+                    "position": position,
+                    "excerpt": str(reference.get("excerpt", ""))[:700],
+                    "score": reference.get("score", 0),
+                    "run_id": run["id"],
+                    "used_at": run["started_at"],
+                })
+        for event in web_events:
+            payload = safe_json_object(event["payload"])
+            for source in payload.get("sources", []):
+                if not isinstance(source, dict) or source.get("kind") != "web":
+                    continue
+                url = str(source.get("url", ""))
+                if not url or url in seen_web_urls:
+                    continue
+                seen_web_urls.add(url)
+                sources.append({
+                    "kind": "web",
+                    "title": str(source.get("title", "网页来源"))[:240],
+                    "url": url[:2048],
+                    "excerpt": str(source.get("excerpt", ""))[:700],
+                    "run_id": event["run_id"],
+                    "used_at": event["started_at"],
+                })
+
+        self.send_json({
+            "sources": sources,
+            "outputs": [row_to_dict(row) for row in artifacts],
+        })
 
     def create_thread(self, user: dict) -> None:
         payload = self.read_json()
@@ -1563,8 +1851,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def create_skill(self, user: dict) -> None:
         try:
             payload = self.read_json()
-            source_skill = payload.get("skill") or parse_markdown_skill(payload.get("markdown", ""), payload.get("filename", ""))
-            skill = save_skill(source_skill)
+            resources: list[tuple[str, bytes]] = []
+            if payload.get("bundle_base64"):
+                source_skill, resources = parse_skill_bundle(payload["bundle_base64"])
+            else:
+                source_skill = payload.get("skill") or parse_markdown_skill(payload.get("markdown", ""), payload.get("filename", ""))
+            skill = save_skill(source_skill, resources)
         except (ValueError, TypeError) as exc:
             self.send_error_json(str(exc))
             return
@@ -1574,6 +1866,41 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (user["id"], skill["id"], 1 if skill["default_enabled"] else 0, now()),
             )
         self.send_json({"skill": {key: value for key, value in skill.items() if key != "prompt"}}, HTTPStatus.CREATED)
+
+    def list_skill_versions(self, user: dict) -> None:
+        skill_id = self.path.split("/")[-2]
+        if not re.fullmatch(r"[a-z][a-z0-9_]{2,63}", skill_id):
+            self.send_error_json("技能不存在", HTTPStatus.NOT_FOUND)
+            return
+        history_dir = SKILL_HISTORY_DIR / skill_id
+        versions = []
+        for path in sorted(history_dir.glob("*.json"), reverse=True) if history_dir.exists() else []:
+            try:
+                skill = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            versions.append({"archive": path.name, "version": skill.get("version", "unknown"), "name": skill.get("name", skill_id)})
+        self.send_json({"versions": versions})
+
+    def restore_skill(self, user: dict) -> None:
+        skill_id = self.path.split("/")[-2]
+        archive = str(self.read_json().get("archive", ""))
+        if not re.fullmatch(r"[0-9]+_[A-Za-z0-9._-]{1,48}\.json", archive):
+            self.send_error_json("技能版本无效")
+            return
+        path = SKILL_HISTORY_DIR / skill_id / archive
+        if not path.exists():
+            self.send_error_json("技能版本不存在", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            skill = json.loads(path.read_text(encoding="utf-8"))
+            if skill.get("id") != skill_id:
+                raise ValueError("技能版本与目标不匹配")
+            restored = save_skill(skill)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            self.send_error_json(str(exc))
+            return
+        self.send_json({"skill": {key: value for key, value in restored.items() if key != "prompt"}})
 
     def delete_skill(self, user: dict) -> None:
         skill_id = self.path.split("/")[-1]
@@ -1637,7 +1964,29 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "INSERT INTO threads (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     (thread_id, user["id"], title, now(), now()),
                 )
-            elif thread["title"] == "新对话" and not retry:
+            handoff_from = ""
+            handoff_summary = ""
+            if thread and not retry:
+                requires_handoff, handoff_summary = context_requires_handoff(conn, thread_id, content)
+                if requires_handoff:
+                    handoff_from = thread_id
+                    thread_id = new_id("thread")
+                    title = f"{thread['title'][:18]}（续）"
+                    conn.execute(
+                        """
+                        INSERT INTO threads (id, user_id, title, created_at, updated_at, context_summary, parent_thread_id, handoff_summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (thread_id, user["id"], title, now(), now(), handoff_summary, handoff_from, handoff_summary),
+                    )
+                    selected_rows = conn.execute(
+                        "SELECT skill_id, selected FROM thread_selected_skills WHERE thread_id = ?", (handoff_from,)
+                    ).fetchall()
+                    conn.executemany(
+                        "INSERT INTO thread_selected_skills (thread_id, skill_id, selected) VALUES (?, ?, ?)",
+                        [(thread_id, row["skill_id"], row["selected"]) for row in selected_rows],
+                    )
+            elif thread and thread["title"] == "新对话" and not retry:
                 conn.execute(
                     "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
                     (content[:24], now(), thread_id),
@@ -1664,6 +2013,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             active_skills = requested_active_skills if requested_active_skills is not None else enabled_skills(user["id"], thread_id)
             knowledge_refs = search_knowledge(user["id"], content) if task_profile["needs_knowledge"] else []
             execution_context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs)
+            if handoff_from:
+                execution_context["handoff"] = {"from_thread_id": handoff_from, "summary": handoff_summary[:1800]}
             artifact_enabled = any(skill["id"] == "file_artifact" for skill in active_skills)
             if artifact_kind and not artifact_enabled:
                 self.send_error_json("本地文件产物技能未启用，请先在“技能和应用”中启用后再生成文件。", HTTPStatus.BAD_REQUEST)
@@ -1879,12 +2230,26 @@ def recent_messages(thread_id: str) -> list[dict]:
         ).fetchall()
         summary = conn.execute("SELECT context_summary FROM threads WHERE id = ?", (thread_id,)).fetchone()
         old_rows, recent_rows = rows[:-12], rows[-12:]
+        compact = summary["context_summary"] if summary else ""
         if old_rows:
             compact = structured_conversation_summary(old_rows)
             if not summary or summary["context_summary"] != compact:
                 conn.execute("UPDATE threads SET context_summary = ? WHERE id = ?", (compact, thread_id))
-            return [{"role": "system", "content": f"早期对话结构化摘要：\n{compact}"}] + [row_to_dict(row) for row in recent_rows]
-    return [row_to_dict(row) for row in rows]
+        messages = [row_to_dict(row) for row in recent_rows]
+        if compact:
+            return [{"role": "system", "content": f"早期对话结构化摘要：\n{compact}"}] + messages
+    return messages
+
+
+def context_requires_handoff(conn: sqlite3.Connection, thread_id: str, incoming_content: str) -> tuple[bool, str]:
+    rows = conn.execute(
+        "SELECT role, content FROM messages WHERE thread_id = ? ORDER BY created_at ASC, id ASC", (thread_id,)
+    ).fetchall()
+    summary = conn.execute("SELECT context_summary FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    recent = rows[-12:]
+    compact = summary["context_summary"] if summary else ""
+    projected = estimate_tokens(compact) + sum(estimate_tokens(row["content"]) for row in recent) + estimate_tokens(incoming_content)
+    return projected > MAX_CONTEXT_TOKENS, structured_conversation_summary(rows)
 
 
 def structured_conversation_summary(rows: list[sqlite3.Row]) -> str:
@@ -2092,7 +2457,7 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
         yield from chunk_text(answer, 10)
         return
 
-    if DEEPSEEK_API_KEY:
+    if model_is_configured(execution_context["model"]):
         yield from run_deepseek_agent(thread_id, system_prompt, execution_context, on_event)
         return
 
@@ -2128,7 +2493,7 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
         return draft_answer, {"applied": False, "passed": True, "issues": [], "summary": "普通任务，未触发质量检查", "revision_count": 0}
 
     on_event("reflection_started", {})
-    if not DEEPSEEK_API_KEY:
+    if not model_is_configured(execution_context["model"]):
         snapshot = {
             "applied": True,
             "passed": bool(draft_answer.strip()),
@@ -2220,11 +2585,13 @@ def summarize_tool_result(result: dict) -> str:
 
 
 def deepseek_chat(messages: list[dict], tools: list[dict], model: str = DEEPSEEK_MODEL, max_output_tokens: int = MAX_RESPONSE_TOKENS, stream: bool = False):
+    api_key, base_url, provider_name = model_connection(model)
     provider = DeepSeekProvider(DeepSeekConfig(
-        api_key=DEEPSEEK_API_KEY,
-        base_url=DEEPSEEK_BASE_URL,
+        api_key=api_key,
+        base_url=base_url,
         ssl_verify=DEEPSEEK_SSL_VERIFY,
         ca_file=DEEPSEEK_CA_FILE,
+        provider_name=provider_name,
     ), certifi_module=certifi)
     if stream:
         return provider.stream(messages, tools, model, max_output_tokens)

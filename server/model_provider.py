@@ -15,6 +15,7 @@ class DeepSeekConfig:
     ssl_verify: bool = True
     ca_file: str = ""
     timeout_seconds: int = 300
+    provider_name: str = "DeepSeek"
 
 
 class DeepSeekProvider:
@@ -91,16 +92,16 @@ class DeepSeekProvider:
             )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"DeepSeek 请求失败：{exc.code} {detail}") from exc
+            raise RuntimeError(f"{self._config.provider_name} 请求失败：{exc.code} {detail}") from exc
         except urllib.error.URLError as exc:
             reason = str(exc.reason)
             if "CERTIFICATE_VERIFY_FAILED" in reason:
                 raise RuntimeError(
-                    "DeepSeek 请求失败：本机 HTTPS 证书校验失败。"
+                    f"{self._config.provider_name} 请求失败：本机 HTTPS 证书校验失败。"
                     "本地开发可在 .env 中设置 DEEPSEEK_SSL_VERIFY=false；"
                     "生产环境建议安装正确 CA 证书后保持校验开启。"
                 ) from exc
-            raise RuntimeError(f"DeepSeek 请求失败：{reason}") from exc
+            raise RuntimeError(f"{self._config.provider_name} 请求失败：{reason}") from exc
 
     def _ssl_context(self):
         if not self._config.ssl_verify:

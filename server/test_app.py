@@ -1,5 +1,6 @@
 import json
 import base64
+import io
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from server import app
+from server.provider_config import ProviderConfig
 
 
 class AgentPlatformApiTests(unittest.TestCase):
@@ -87,6 +89,140 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertTrue(health["database_ready"])
         self.assertEqual(health["database"], "sqlite")
         self.assertEqual(health["environment"], "development")
+
+    def test_models_expose_provider_neutral_capabilities(self):
+        result = self.request_json("/api/models", token=self.token)
+        model = next(item for item in result["models"] if item["id"] == "deepseek-v4-flash")
+        self.assertEqual(model["provider_id"], "deepseek")
+        self.assertTrue(model["capabilities"]["streaming"])
+        self.assertTrue(model["capabilities"]["tool_calling"])
+        self.assertFalse(model["capabilities"]["vision"])
+
+    def test_openai_compatible_model_uses_its_own_environment_key(self):
+        provider_config = ProviderConfig(
+            provider_id="custom",
+            display_name="Custom",
+            api_key_env="CUSTOM_API_KEY",
+            base_url="https://models.example.test/v1",
+            models=("custom-chat",),
+        )
+        with patch.dict(app.EXTERNAL_MODEL_CONFIGS, {"custom-chat": provider_config}), patch.dict(
+            app.os.environ, {"CUSTOM_API_KEY": "test-key"}, clear=False
+        ), patch.object(app, "DeepSeekProvider") as provider_class:
+            provider_class.return_value.complete.return_value = {"content": "ok"}
+            result = app.deepseek_chat([], [], "custom-chat", 128)
+            config = provider_class.call_args.args[0]
+
+        self.assertEqual(result, {"content": "ok"})
+        self.assertEqual(config.api_key, "test-key")
+        self.assertEqual(config.base_url, "https://models.example.test/v1")
+        self.assertEqual(config.provider_name, "Custom")
+
+    def test_unconfigured_external_model_does_not_claim_connection_and_tool_route_falls_back(self):
+        provider_config = ProviderConfig("custom", "Custom", "CUSTOM_API_KEY", "https://models.example.test/v1", ("custom-chat",))
+        custom_profile = {
+            "name": "Custom · custom-chat",
+            "tier": "standard",
+            "supports_tools": False,
+            "max_output_tokens": {"quick": 128, "standard": 256, "deep": 512},
+            "provider_id": "custom",
+        }
+        with patch.dict(app.EXTERNAL_MODEL_CONFIGS, {"custom-chat": provider_config}), patch.dict(
+            app.MODEL_CATALOG, {"custom-chat": custom_profile}
+        ), patch.dict(app.os.environ, {"CUSTOM_API_KEY": ""}, clear=False):
+            self.assertFalse(app.model_is_configured("custom-chat"))
+            route = app.infer_task_profile("请搜索本地文件", requested_model="custom-chat")
+
+        self.assertEqual(route["model"], app.DEEPSEEK_MODEL)
+        self.assertEqual(route["route"], "fallback")
+
+    def test_thread_context_includes_audited_web_sources(self):
+        events = self.chat({"thread_id": "", "content": "你好"})
+        meta = next(event["data"] for event in events if event["event"] == "meta")
+        with app.db() as conn:
+            app.append_run_event(conn, meta["run_id"], "tool_result", {
+                "tool_id": "web_search",
+                "tool_name": "网页检索",
+                "sources": [{
+                    "kind": "web",
+                    "title": "Agent 平台文档",
+                    "url": "https://example.test/agent",
+                    "excerpt": "受控检索结果",
+                }],
+            })
+        context = self.request_json(f"/api/threads/{meta['thread_id']}/context", token=self.token)
+        source = next(item for item in context["sources"] if item["kind"] == "web")
+        self.assertEqual(source["title"], "Agent 平台文档")
+        self.assertEqual(source["url"], "https://example.test/agent")
+
+    def test_skill_zip_upload_versions_and_restore(self):
+        original_skills_dir = app.SKILLS_DIR
+        original_history_dir = app.SKILL_HISTORY_DIR
+        original_package_dir = app.SKILL_PACKAGE_DIR
+        original_skills = app.SKILLS
+        app.SKILLS_DIR = Path(self.temp_dir.name) / "skills"
+        app.SKILL_HISTORY_DIR = Path(self.temp_dir.name) / "history"
+        app.SKILL_PACKAGE_DIR = Path(self.temp_dir.name) / "packages"
+        try:
+            bundle = io.BytesIO()
+            skill = {
+                "id": "bundle_skill", "name": "Bundle", "description": "测试", "version": "1.0.0",
+                "prompt": "只输出测试", "input_limit": 1200, "default_enabled": False, "status": "enabled",
+            }
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("skill.json", json.dumps(skill))
+            created = self.request_json("/api/skills", {"bundle_base64": base64.b64encode(bundle.getvalue()).decode()}, self.token)
+            self.assertEqual(created["skill"]["id"], "bundle_skill")
+
+            skill["version"] = "2.0.0"
+            skill["prompt"] = "新版本"
+            self.request_json("/api/skills/bundle_skill", {"skill": skill}, self.token, method="PATCH")
+            versions = self.request_json("/api/skills/bundle_skill/versions", token=self.token)["versions"]
+            self.assertEqual(versions[0]["version"], "1.0.0")
+            restored = self.request_json("/api/skills/bundle_skill/restore", {"archive": versions[0]["archive"]}, self.token)
+            self.assertEqual(restored["skill"]["version"], "1.0.0")
+        finally:
+            app.SKILLS_DIR = original_skills_dir
+            app.SKILL_HISTORY_DIR = original_history_dir
+            app.SKILL_PACKAGE_DIR = original_package_dir
+            app.SKILLS = original_skills
+
+    def test_standard_skill_package_accepts_wrapped_resources_without_executing_scripts(self):
+        original_skills_dir = app.SKILLS_DIR
+        original_package_dir = app.SKILL_PACKAGE_DIR
+        original_skills = app.SKILLS
+        app.SKILLS_DIR = Path(self.temp_dir.name) / "skills"
+        app.SKILL_PACKAGE_DIR = Path(self.temp_dir.name) / "packages"
+        try:
+            bundle = io.BytesIO()
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("research-skill/SKILL.md", """---\nid: research_skill\nname: research-skill\ndescription: Research a topic with supplied references.\n---\n\n# Research\nUse the reference material before answering.""")
+                archive.writestr("research-skill/references/guide.md", "Reference text")
+                archive.writestr("research-skill/scripts/collect.py", "raise RuntimeError('must not run')")
+            result = self.request_json("/api/skills", {"bundle_base64": base64.b64encode(bundle.getvalue()).decode()}, self.token)
+            self.assertEqual(result["skill"]["id"], "research_skill")
+            stored = app.SKILL_PACKAGE_DIR / result["skill"]["id"] / "1.0.0"
+            self.assertTrue((stored / "scripts" / "collect.py").exists())
+            self.assertEqual((stored / "references" / "guide.md").read_text(), "Reference text")
+        finally:
+            app.SKILLS_DIR = original_skills_dir
+            app.SKILL_PACKAGE_DIR = original_package_dir
+            app.SKILLS = original_skills
+
+    def test_context_budget_creates_linked_continuation_thread(self):
+        initial = self.chat({"thread_id": "", "content": "这是第一轮需要被交接的内容"})
+        original_thread_id = next(event["data"]["thread_id"] for event in initial if event["event"] == "meta")
+        original_budget = app.MAX_CONTEXT_TOKENS
+        app.MAX_CONTEXT_TOKENS = 1
+        try:
+            continued = self.chat({"thread_id": original_thread_id, "content": "这是自动续聊后的新问题"})
+        finally:
+            app.MAX_CONTEXT_TOKENS = original_budget
+        continuation_id = next(event["data"]["thread_id"] for event in continued if event["event"] == "meta")
+        self.assertNotEqual(continuation_id, original_thread_id)
+        detail = self.request_json(f"/api/threads/{continuation_id}", token=self.token)["thread"]
+        self.assertEqual(detail["parent_thread_id"], original_thread_id)
+        self.assertIn("用户目标", detail["handoff_summary"])
 
     def test_production_bootstrap_requires_explicit_admin_credentials(self):
         with patch.dict(
@@ -188,6 +324,9 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertEqual(artifacts[0]["id"], result["artifact"]["id"])
             self.assertTrue(Path(artifacts[0]["storage_path"]).is_file())
             detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            thread_context = self.request_json(f"/api/threads/{detail['run']['thread_id']}/context", token=self.token)
+            self.assertEqual(thread_context["outputs"][0]["id"], result["artifact"]["id"])
+            self.assertNotIn("storage_path", thread_context["outputs"][0])
             self.assertEqual(detail["run"]["status"], "completed")
             self.assertIn("artifact_created", [event["type"] for event in detail["events"]])
         finally:
@@ -370,6 +509,9 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(context["knowledge_route"], "retrieved")
         self.assertEqual(context["knowledge_match_count"], 1)
         self.assertIn("knowledge_retrieved", [event["type"] for event in self.request_json(f"/api/runs/{run['id']}", token=self.token)["events"]])
+        thread_context = self.request_json(f"/api/threads/{thread_id}/context", token=self.token)
+        self.assertEqual(thread_context["sources"][0]["filename"], "product.md")
+        self.assertEqual(thread_context["sources"][0]["position"], 0)
 
         generic_events = self.chat({"thread_id": thread_id, "content": "请分析一下这个平台的界面布局"})
         generic_answer = "".join(event["data"].get("content", "") for event in generic_events)

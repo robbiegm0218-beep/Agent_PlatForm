@@ -29,6 +29,9 @@ class ToolPolicy:
         mentions_file_scope = any(marker in content for marker in ("文件", "工作区", "目录"))
         if has_search_verb and mentions_file_scope:
             return self._by_id(read_only_tools, "search_workspace_files")
+        mentions_web_scope = any(marker in content.lower() for marker in ("网页", "互联网", "网上", "在线", "web"))
+        if has_search_verb and mentions_web_scope:
+            return self._by_id(read_only_tools, "web_search")
         return []
 
     @staticmethod

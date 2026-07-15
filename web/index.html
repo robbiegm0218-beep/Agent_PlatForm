@@ -6,7 +6,7 @@
     <title>Agent_Platform</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
-  <body>
+  <body class="booting">
     <main id="app">
       <section id="loginView" class="login-shell">
         <div class="login-panel">
@@ -82,6 +82,27 @@
           </form>
         </section>
 
+        <aside id="threadContextPanel" class="thread-context-panel" aria-label="对话来源与输出">
+          <div class="thread-context-heading">
+            <h2>对话上下文</h2>
+            <span id="threadContextCount" class="thread-context-count">—</span>
+          </div>
+          <section class="context-section" aria-labelledby="outputsHeading">
+            <div class="context-section-heading">
+              <h3 id="outputsHeading">输出</h3>
+              <button id="viewArtifactsButton" class="context-all-button" type="button">查看全部</button>
+            </div>
+            <div id="threadOutputs" class="context-list"></div>
+          </section>
+          <section class="context-section" aria-labelledby="sourcesHeading">
+            <div class="context-section-heading">
+              <h3 id="sourcesHeading">来源</h3>
+              <button id="viewKnowledgeButton" class="context-all-button" type="button">查看全部</button>
+            </div>
+            <div id="threadSources" class="context-list"></div>
+          </section>
+        </aside>
+
         <aside id="runDrawer" class="run-drawer hidden" aria-label="运行详情">
           <div class="drawer-header"><h2>运行详情</h2><button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button></div>
           <div id="runList" class="run-list"></div>
@@ -94,9 +115,14 @@
               <h2>技能和应用</h2>
               <span>管理当前 Agent 可使用的本地能力</span>
             </div>
-            <button id="uploadSkillButton" class="icon-text-button" type="button">上传技能</button>
-            <input id="skillFileInput" type="file" accept="application/json,.json,text/markdown,.md" class="hidden" />
           </header>
+          <div id="skillDropZone" class="skill-drop-zone">
+            <div>
+              <strong>导入技能包</strong>
+              <span>支持 JSON、Markdown、ZIP Skill 包；可直接选择或拖入文件</span>
+            </div>
+            <input id="skillFileInput" class="skill-file-input" type="file" aria-label="选择本地技能包" />
+          </div>
           <div class="tabs">
             <button class="tab active" data-tab="skills">技能</button>
             <button class="tab" data-tab="apps">应用</button>

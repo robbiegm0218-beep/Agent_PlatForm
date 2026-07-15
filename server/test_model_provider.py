@@ -1,4 +1,7 @@
 import unittest
+import io
+import urllib.error
+from unittest.mock import patch
 
 from server.model_provider import DeepSeekConfig, DeepSeekProvider
 
@@ -57,6 +60,19 @@ class DeepSeekProviderTests(unittest.TestCase):
 
         self.assertEqual(events[:2], [{"type": "content", "text": "A"}, {"type": "content", "text": "B"}])
         self.assertEqual(events[-1]["message"], {"role": "assistant", "content": "AB", "tool_calls": None})
+
+    def test_http_error_uses_configured_provider_name(self):
+        provider = DeepSeekProvider(DeepSeekConfig(
+            api_key="test",
+            base_url="https://example.test",
+            provider_name="Custom Provider",
+        ))
+        error = urllib.error.HTTPError(
+            "https://example.test/chat/completions", 401, "Unauthorized", {}, io.BytesIO(b'{"error":"bad key"}')
+        )
+        with patch("server.model_provider.urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "Custom Provider 请求失败：401"):
+                provider.complete([], [], "test", 100)
 
 
 if __name__ == "__main__":
