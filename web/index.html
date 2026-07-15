@@ -32,18 +32,19 @@
         <aside class="sidebar">
           <div class="sidebar-top">
             <div class="logo">Agent_Platform</div>
-            <button id="newThreadButton" class="nav-button active" data-view="chat">新建对话</button>
-            <button class="nav-button" data-view="skills">技能和应用</button>
-            <button class="nav-button" data-view="knowledge">知识库</button>
-            <button class="nav-button" data-view="artifacts">产物</button>
+            <nav class="primary-nav" aria-label="平台功能">
+              <button id="newThreadButton" class="nav-button active" data-view="chat"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>新建对话</span></button>
+              <button class="nav-button" data-view="skills"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 14.2 9l5.3 2.2-5.3 2.2L12 19l-2.2-5.6-5.3-2.2L9.8 9 12 3.5Z" /></svg><span>技能和应用</span></button>
+              <button class="nav-button" data-view="knowledge"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="5.5" /><path d="m15.2 15.2 4.3 4.3" /></svg><span>知识库</span></button>
+              <button class="nav-button" data-view="artifacts"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3.5h10l4 4v13H5z" /><path d="M15 3.5v4h4M8.5 12h7M8.5 15.5h7" /></svg><span>产物</span></button>
+            </nav>
           </div>
           <div class="thread-tools">
             <input id="threadSearch" type="search" placeholder="搜索对话" />
-            <button id="newFolderButton" class="icon-button" type="button" title="新建文件夹" aria-label="新建文件夹">+</button>
           </div>
           <div class="thread-list" id="threadList"></div>
           <div class="sidebar-bottom">
-            <button class="nav-button" data-view="settings">个人设置</button>
+            <button class="nav-button" data-view="settings"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.2" /><path d="M5.5 20c.8-3.3 3.1-5 6.5-5s5.7 1.7 6.5 5" /></svg><span>个人设置</span></button>
           </div>
         </aside>
 
@@ -117,11 +118,15 @@
             </div>
           </header>
           <div id="skillDropZone" class="skill-drop-zone">
-            <div>
+            <div class="skill-drop-copy">
               <strong>导入技能包</strong>
               <span>支持 JSON、Markdown、ZIP Skill 包；可直接选择或拖入文件</span>
             </div>
-            <input id="skillFileInput" class="skill-file-input" type="file" aria-label="选择本地技能包" />
+            <div class="skill-file-control">
+              <input id="skillFileInput" class="skill-file-input" type="file" aria-label="选择本地技能包" />
+              <label class="skill-file-action" for="skillFileInput">选择技能包</label>
+              <span id="skillFileName" class="skill-file-name" aria-live="polite">未选择文件</span>
+            </div>
           </div>
           <div class="tabs">
             <button class="tab active" data-tab="skills">技能</button>

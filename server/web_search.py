@@ -5,10 +5,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -68,7 +74,11 @@ class WebSearchClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._config.timeout_seconds) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=self._config.timeout_seconds,
+                context=self._ssl_context(),
+            ) as response:
                 raw = response.read(512 * 1024)
         except urllib.error.HTTPError as exc:
             raise ValueError(f"网页检索服务返回 {exc.code}") from exc
@@ -83,6 +93,12 @@ class WebSearchClient:
             raise ValueError("网页检索服务返回了无效结果")
         sources = [source for item in results[:result_limit] if (source := _public_source(item))]
         return {"query": query, "sources": sources, "count": len(sources)}
+
+    @staticmethod
+    def _ssl_context() -> ssl.SSLContext:
+        if certifi:
+            return ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context()
 
 
 def _public_source(item: object) -> dict | None:

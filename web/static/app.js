@@ -5,6 +5,7 @@ const state = {
   folders: [],
   collapsedFolderIds: new Set(),
   currentThreadId: "",
+  pendingFolderId: "",
   messages: [],
   runs: [],
   threadContext: { sources: [], outputs: [] },
@@ -29,7 +30,6 @@ const els = {
   passwordInput: document.querySelector("#passwordInput"),
   threadList: document.querySelector("#threadList"),
   threadSearch: document.querySelector("#threadSearch"),
-  newFolderButton: document.querySelector("#newFolderButton"),
   newThreadButton: document.querySelector("#newThreadButton"),
   chatPage: document.querySelector("#chatPage"),
   skillsPage: document.querySelector("#skillsPage"),
@@ -53,6 +53,7 @@ const els = {
   skillsGrid: document.querySelector("#skillsGrid"),
   appsGrid: document.querySelector("#appsGrid"),
   skillFileInput: document.querySelector("#skillFileInput"),
+  skillFileName: document.querySelector("#skillFileName"),
   skillDropZone: document.querySelector("#skillDropZone"),
   nameInput: document.querySelector("#nameInput"),
   settingsEmail: document.querySelector("#settingsEmail"),
@@ -218,6 +219,7 @@ async function loadFolders() {
 async function loadThread(threadId) {
   const data = await api(`/api/threads/${threadId}`);
   state.currentThreadId = data.thread.id;
+  state.pendingFolderId = "";
   persistWorkspaceState();
   state.messages = data.messages;
   els.threadTitle.textContent = data.thread.title || "新对话";
@@ -487,11 +489,42 @@ function renderThreads() {
     else ungrouped.push(thread);
   });
 
-  if (ungrouped.length || !state.folders.length) renderThreadGroup("未归类", ungrouped);
-  state.folders.forEach((folder) => renderThreadGroup(folder.name, grouped.get(folder.id) || [], folder));
+  const projectFolders = state.folders.filter((folder) => folder.section === "project");
+  const conversationFolders = state.folders.filter((folder) => folder.section !== "project");
+  renderThreadSection("项目", "project", projectFolders, grouped, []);
+  renderThreadSection("对话", "conversation", conversationFolders, grouped, ungrouped);
 }
 
-function renderThreadGroup(title, threads, folder = null) {
+function renderThreadSection(title, section, folders, grouped, ungrouped) {
+  const container = document.createElement("section");
+  container.className = `thread-section thread-section-${section}`;
+  const header = document.createElement("div");
+  header.className = "thread-section-header";
+  const label = document.createElement("h2");
+  label.textContent = title;
+  const createButton = document.createElement("button");
+  createButton.className = "section-add-folder";
+  createButton.type = "button";
+  createButton.textContent = "+";
+  createButton.title = `在${title}下新建文件夹`;
+  createButton.setAttribute("aria-label", `在${title}下新建文件夹`);
+  createButton.addEventListener("click", () => createFolder(section));
+  header.append(label, createButton);
+  container.appendChild(header);
+  folders.forEach((folder) => container.appendChild(createThreadGroup(folder.name, grouped.get(folder.id) || [], folder)));
+  if (section === "conversation" && (ungrouped.length || !folders.length)) {
+    container.appendChild(createThreadGroup("未归类", ungrouped));
+  }
+  if (section === "project" && !folders.length) {
+    const empty = document.createElement("p");
+    empty.className = "section-empty";
+    empty.textContent = "创建项目文件夹以归纳相关对话";
+    container.appendChild(empty);
+  }
+  els.threadList.appendChild(container);
+}
+
+function createThreadGroup(title, threads, folder = null) {
   const group = document.createElement("section");
   group.className = `thread-group ${folder ? "thread-folder-group" : "thread-ungrouped-group"}`;
   const collapsed = folder && state.collapsedFolderIds.has(folder.id);
@@ -525,6 +558,31 @@ function renderThreadGroup(title, threads, folder = null) {
   heading.appendChild(label);
   header.appendChild(heading);
   if (folder) {
+    const controls = document.createElement("div");
+    controls.className = "folder-controls";
+    const newThread = document.createElement("button");
+    newThread.className = "folder-new-thread";
+    newThread.type = "button";
+    newThread.textContent = "+";
+    newThread.title = `在“${folder.name}”中新建对话`;
+    newThread.setAttribute("aria-label", `在“${folder.name}”中新建对话`);
+    newThread.addEventListener("click", () => startThreadInFolder(folder));
+    const sectionFolders = state.folders.filter((item) => item.section === folder.section);
+    const currentIndex = sectionFolders.findIndex((item) => item.id === folder.id);
+    const up = document.createElement("button");
+    up.className = "folder-order";
+    up.type = "button";
+    up.textContent = "↑";
+    up.title = "上移文件夹";
+    up.disabled = currentIndex <= 0;
+    up.addEventListener("click", () => moveFolder(folder, currentIndex - 1));
+    const down = document.createElement("button");
+    down.className = "folder-order";
+    down.type = "button";
+    down.textContent = "↓";
+    down.title = "下移文件夹";
+    down.disabled = currentIndex < 0 || currentIndex >= sectionFolders.length - 1;
+    down.addEventListener("click", () => moveFolder(folder, currentIndex + 1));
     const menu = document.createElement("button");
     menu.className = "folder-menu";
     menu.type = "button";
@@ -532,7 +590,8 @@ function renderThreadGroup(title, threads, folder = null) {
     menu.title = `管理文件夹：${folder.name}`;
     menu.setAttribute("aria-label", `管理文件夹：${folder.name}`);
     menu.addEventListener("click", () => manageFolder(folder));
-    header.appendChild(menu);
+    controls.append(newThread, up, down, menu);
+    header.appendChild(controls);
   }
   group.appendChild(header);
   threads.forEach((thread) => {
@@ -555,7 +614,7 @@ function renderThreadGroup(title, threads, folder = null) {
     row.append(button, menu);
     group.appendChild(row);
   });
-  els.threadList.appendChild(group);
+  return group;
 }
 
 async function manageThread(thread) {
@@ -568,7 +627,7 @@ async function manageThread(thread) {
     if (thread.id === state.currentThreadId) els.threadTitle.textContent = title.trim();
   }
   if (action === "m") {
-    const choices = ["0. 未归类", ...state.folders.map((folder, index) => `${index + 1}. ${folder.name}`)];
+    const choices = ["0. 对话 / 未归类", ...state.folders.map((folder, index) => `${index + 1}. [${folder.section === "project" ? "项目" : "对话"}] ${folder.name}`)];
     const selected = window.prompt(`输入目标序号：\n${choices.join("\n")}`, "0");
     if (selected === null) return;
     const index = Number.parseInt(selected, 10);
@@ -592,15 +651,35 @@ async function manageThread(thread) {
   }
 }
 
-async function createFolder() {
-  const name = window.prompt("输入文件夹名称");
+async function createFolder(section) {
+  const label = section === "project" ? "项目" : "对话";
+  const name = window.prompt(`输入${label}文件夹名称`);
   if (!name?.trim()) return;
   try {
-    await api("/api/folders", { method: "POST", body: JSON.stringify({ name }) });
+    await api("/api/folders", { method: "POST", body: JSON.stringify({ name, section }) });
     await refreshThreadList();
   } catch (error) {
     window.alert(`创建文件夹失败：${error.message}`);
   }
+}
+
+async function startThreadInFolder(folder) {
+  state.pendingFolderId = folder.id;
+  state.currentThreadId = "";
+  state.messages = [];
+  state.runs = [];
+  state.threadContext = { sources: [], outputs: [] };
+  state.selectedSkillIds = [];
+  renderComposerSkills();
+  renderSkillPicker();
+  els.threadTitle.textContent = `新对话 · ${folder.name}`;
+  switchView("chat");
+  renderThreads();
+  renderMessages();
+  renderThreadContext();
+  els.runDetailsButton.disabled = true;
+  els.runDrawer.classList.add("hidden");
+  focusChatInput();
 }
 
 async function manageFolder(folder) {
@@ -614,6 +693,15 @@ async function manageFolder(folder) {
   if (action === "d" && window.confirm(`删除文件夹“${folder.name}”？其中的对话会保留在“未归类”。`)) {
     await api(`/api/folders/${folder.id}`, { method: "DELETE" });
     await refreshThreadList();
+  }
+}
+
+async function moveFolder(folder, position) {
+  try {
+    await api(`/api/folders/${folder.id}`, { method: "PATCH", body: JSON.stringify({ position }) });
+    await refreshThreadList();
+  } catch (error) {
+    window.alert(`调整文件夹位置失败：${error.message}`);
   }
 }
 
@@ -755,13 +843,14 @@ async function loadRunDetail(runId) {
   const toolEvents = events.filter((event) => ["tool_call", "tool_result", "tool_error"].includes(event.type));
   const planText = plan.length ? plan.map((step) => `${step.title}（${step.status}）`).join(" → ") : "无";
   const tools = context.tools?.map((tool) => tool.name).join("、") || "无";
+  const toolRoute = context.tool_route_reason || "未记录";
   const route = context.model_route_reason || "未记录";
   const tier = context.task_tier || "standard";
   const toolTrace = toolEvents.length ? toolEvents.map((event) => event.type).join(" → ") : "未调用工具";
   const reflectionText = reflection.applied
     ? `${reflection.summary || "已完成"}${reflection.revision_count ? `，已修订 ${reflection.revision_count} 次` : ""}`
     : "未触发";
-  els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${run.error ? `\n错误：${run.error}` : ""}`;
+  els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具判断：${toolRoute}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${run.error ? `\n错误：${run.error}` : ""}`;
 
   if (artifact) {
     const artifactBlock = document.createElement("div");
@@ -1051,16 +1140,20 @@ function renderSkills(skills) {
     card.className = "capability-card";
     card.innerHTML = `
       <h3>${escapeHtml(skill.name)}</h3>
-      <p>${escapeHtml(skill.prompt || skill.description)}</p>
+      <p class="skill-description" title="${escapeHtml(skill.description || skill.prompt || "")}">${escapeHtml(skillSummary(skill))}</p>
       <div class="card-footer">
-        <span class="status-pill">${skill.enabled ? "已启用" : "未启用"}</span>
-        <label class="switch" title="启用或禁用技能">
-          <input type="checkbox" ${skill.enabled ? "checked" : ""} />
-          <span></span>
-        </label>
-        <button class="skill-action" type="button" title="编辑技能">编辑</button>
-        <button class="skill-action" type="button" title="查看或回滚历史版本">版本</button>
-        <button class="skill-action danger" type="button" title="删除技能">删除</button>
+        <div class="skill-state">
+          <span class="status-pill">${skill.enabled ? "已启用" : "未启用"}</span>
+          <label class="switch" title="启用或禁用技能">
+            <input type="checkbox" ${skill.enabled ? "checked" : ""} />
+            <span></span>
+          </label>
+        </div>
+        <div class="skill-actions">
+          <button class="skill-action" type="button" title="编辑技能">编辑</button>
+          <button class="skill-action" type="button" title="查看或回滚历史版本">版本</button>
+          <button class="skill-action danger" type="button" title="删除技能">删除</button>
+        </div>
       </div>
     `;
     const input = card.querySelector("input");
@@ -1085,6 +1178,16 @@ function renderSkills(skills) {
     deleteButton.addEventListener("click", () => deleteSkill(skill));
     els.skillsGrid.appendChild(card);
   });
+}
+
+function skillSummary(skill) {
+  const source = String(skill.description || skill.prompt || "暂无技能说明");
+  const normalized = source
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/[`*_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized.length > 150 ? `${normalized.slice(0, 147).trimEnd()}…` : normalized;
 }
 
 async function editSkill(skill) {
@@ -1179,6 +1282,7 @@ async function sendMessage(content, { retry = false } = {}) {
       model: els.modelSelect.value,
       task_mode: els.taskModeSelect.value,
     };
+    if (!state.currentThreadId && state.pendingFolderId) chatPayload.folder_id = state.pendingFolderId;
     if (state.selectedSkillIds.length) chatPayload.skill_ids = state.selectedSkillIds;
     const response = await fetch("/api/chat", {
       method: "POST",
@@ -1207,6 +1311,7 @@ async function sendMessage(content, { retry = false } = {}) {
         const event = parseSse(eventText);
         if (event.event === "meta") {
           state.currentThreadId = event.data.thread_id;
+          state.pendingFolderId = "";
           persistWorkspaceState();
           assistant.status.textContent = `处理状态 · 正在调用 ${event.data.model}`;
         }
@@ -1441,7 +1546,7 @@ els.chatInput.addEventListener("keydown", (event) => {
     event.preventDefault();
     return;
   }
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && event.shiftKey) {
     event.preventDefault();
     els.chatForm.requestSubmit();
   }
@@ -1472,6 +1577,7 @@ function removeSkillBeforeCaret() {
 
 els.newThreadButton.addEventListener("click", () => {
   state.currentThreadId = "";
+  state.pendingFolderId = "";
   persistWorkspaceState();
   state.messages = [];
   state.selectedSkillIds = [];
@@ -1489,7 +1595,6 @@ els.newThreadButton.addEventListener("click", () => {
 });
 
 els.threadSearch.addEventListener("input", renderThreads);
-els.newFolderButton.addEventListener("click", createFolder);
 
 els.runDetailsButton.addEventListener("click", () => {
   els.runDrawer.classList.remove("hidden");
@@ -1537,14 +1642,25 @@ async function uploadSkillFile(file) {
     }
     await api("/api/skills", { method: "POST", body: JSON.stringify(payload) });
     await loadSkills();
+    return true;
   } catch (error) {
     window.alert(error.message);
+    return false;
   }
+}
+
+function setSkillFileStatus(message, ready = false) {
+  els.skillFileName.textContent = message;
+  els.skillFileName.classList.toggle("ready", ready);
 }
 
 els.skillFileInput.addEventListener("change", async () => {
   const [file] = els.skillFileInput.files;
-  if (file) await uploadSkillFile(file);
+  if (file) {
+    setSkillFileStatus(`正在导入：${file.name}`);
+    const imported = await uploadSkillFile(file);
+    setSkillFileStatus(imported ? `已导入：${file.name}` : `导入失败：${file.name}`, imported);
+  }
   els.skillFileInput.value = "";
 });
 
@@ -1564,7 +1680,11 @@ els.skillFileInput.addEventListener("change", async () => {
 
 els.skillDropZone.addEventListener("drop", async (event) => {
   const [file] = event.dataTransfer?.files || [];
-  if (file) await uploadSkillFile(file);
+  if (file) {
+    setSkillFileStatus(`正在导入：${file.name}`);
+    const imported = await uploadSkillFile(file);
+    setSkillFileStatus(imported ? `已导入：${file.name}` : `导入失败：${file.name}`, imported);
+  }
 });
 
 els.uploadKnowledgeButton.addEventListener("click", () => els.knowledgeFileInput.click());

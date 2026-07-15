@@ -35,6 +35,7 @@ try:
     from server.model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
     from server.provider_config import ProviderConfig, parse_provider_configs
     from server.web_search import WebSearchClient, WebSearchConfig
+    from server.mcp_client import McpServerConfig, McpToolManager
     from server.tool_policy import ToolPolicy
 except ModuleNotFoundError:
     from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
@@ -44,6 +45,7 @@ except ModuleNotFoundError:
     from model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
     from provider_config import ProviderConfig, parse_provider_configs
     from web_search import WebSearchClient, WebSearchConfig
+    from mcp_client import McpServerConfig, McpToolManager
     from tool_policy import ToolPolicy
 
 try:
@@ -147,6 +149,7 @@ SKILL_PACKAGE_DIR = ROOT_DIR / "data" / "skill_packages"
 MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(256 * 1024)))
 WEB_SEARCH_CONFIG = WebSearchConfig.from_environment()
 WEB_SEARCH_CLIENT = WebSearchClient(WEB_SEARCH_CONFIG)
+MCP_TOOL_MANAGER = McpToolManager(McpServerConfig.from_environment())
 
 MODEL_CATALOG = {
     "deepseek-v4-flash": {
@@ -469,7 +472,14 @@ def search_workspace_files(arguments: dict) -> dict:
 
 
 def web_search_tool(arguments: dict) -> dict:
-    return WEB_SEARCH_CLIENT.search(arguments["query"], arguments.get("limit"))
+    if MCP_TOOL_MANAGER.available:
+        try:
+            return MCP_TOOL_MANAGER.search(arguments["query"])
+        except ValueError:
+            if not WEB_SEARCH_CLIENT.available:
+                raise
+    result = WEB_SEARCH_CLIENT.search(arguments["query"], arguments.get("limit"))
+    return {**result, "provider": "rest:tavily"}
 
 
 LOCAL_TOOLS = LocalToolRegistry([
@@ -501,7 +511,7 @@ LOCAL_TOOLS = LocalToolRegistry([
         "web_search",
         "网页检索",
         "在已配置的网页检索服务中查找公开网页；只返回标题、链接和摘要。",
-        enabled=WEB_SEARCH_CLIENT.available,
+        enabled=WEB_SEARCH_CLIENT.available or MCP_TOOL_MANAGER.available,
         input_schema={
             "type": "object",
             "properties": {
@@ -608,6 +618,8 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
+                section TEXT NOT NULL DEFAULT 'conversation',
+                sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -704,6 +716,9 @@ def init_db() -> None:
         ensure_column(conn, "threads", "parent_thread_id", "TEXT DEFAULT ''")
         ensure_column(conn, "threads", "handoff_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
+        ensure_column(conn, "thread_folders", "section", "TEXT NOT NULL DEFAULT 'conversation'")
+        ensure_column(conn, "thread_folders", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE thread_folders SET section = 'conversation' WHERE section NOT IN ('project', 'conversation')")
         ensure_column(conn, "runs", "skill_snapshot", "TEXT DEFAULT '[]'")
         ensure_column(conn, "runs", "execution_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "runs", "plan_snapshot", "TEXT DEFAULT '[]'")
@@ -777,8 +792,7 @@ def allow_request(user_id: str) -> bool:
 def infer_task_profile(content: str, requested_model: str = "auto", requested_task_mode: str = "auto") -> dict:
     deep_markers = ("调研", "方案", "报告", "深度", "全面", "竞品", "商业计划", "架构设计", "复盘")
     standard_markers = ("改写", "撰写", "写一", "代码", "分析", "待办", "负责人", "设计")
-    tool_markers = ("平台状态", "系统状态", "文件", "检索", "查找", "搜索")
-    needs_tools = any(marker in content for marker in tool_markers)
+    needs_tools = bool(TOOL_POLICY.resolve(content))
     knowledge_intent = classify_knowledge_intent(content)
     needs_knowledge = knowledge_intent["needed"]
     complexity = "deep" if len(content) >= 80 or any(marker in content for marker in deep_markers) else "standard"
@@ -937,7 +951,8 @@ def build_execution_plan(content: str, active_skills: list[dict], allowed_tools:
 
 
 def build_execution_context(user_id: str, task_profile: dict, active_skills: list[dict], requested_skill_ids: list[str] | None, content: str, knowledge_refs: list[dict]) -> dict:
-    tool_definitions = allowed_tools_for_task(content) if task_profile["needs_tools"] else []
+    tool_decision = TOOL_POLICY.decide(content)
+    tool_definitions = tool_decision.tools if task_profile["needs_tools"] else []
     return {
         "version": 1,
         "user_id": user_id,
@@ -951,6 +966,8 @@ def build_execution_context(user_id: str, task_profile: dict, active_skills: lis
         "skill_route": "explicit" if requested_skill_ids is not None else "default",
         "allowed_tool_ids": [tool["id"] for tool in tool_definitions],
         "tools": tool_definitions,
+        "tool_route_confidence": tool_decision.confidence,
+        "tool_route_reason": tool_decision.reason,
         "max_tool_steps": MAX_TOOL_STEPS,
         "input_limit": min([skill["input_limit"] for skill in active_skills] or [MAX_REQUEST_BYTES]),
         "task_preview": content[:160],
@@ -1310,7 +1327,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def list_folders(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
-                "SELECT * FROM thread_folders WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+                """SELECT * FROM thread_folders WHERE user_id = ?
+                   ORDER BY CASE section WHEN 'project' THEN 0 ELSE 1 END, sort_order ASC, created_at ASC, id ASC""",
                 (user["id"],),
             ).fetchall()
         self.send_json({"folders": [row_to_dict(row) for row in rows]})
@@ -1436,36 +1454,75 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         return folder_id
 
     def create_folder(self, user: dict) -> None:
-        name = self.read_json().get("name", "").strip()
+        payload = self.read_json()
+        name = payload.get("name", "").strip()
         if not name:
             self.send_error_json("文件夹名称不能为空")
             return
+        section = self.validate_folder_section(payload.get("section", "conversation"))
         folder_id = new_id("folder")
         with db() as conn:
+            next_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM thread_folders WHERE user_id = ? AND section = ?",
+                (user["id"], section),
+            ).fetchone()[0]
             conn.execute(
-                "INSERT INTO thread_folders (id, user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (folder_id, user["id"], name[:80], now(), now()),
+                """INSERT INTO thread_folders (id, user_id, name, section, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (folder_id, user["id"], name[:80], section, next_order, now(), now()),
             )
             folder = conn.execute("SELECT * FROM thread_folders WHERE id = ?", (folder_id,)).fetchone()
         self.send_json({"folder": row_to_dict(folder)})
 
+    def validate_folder_section(self, value: object) -> str:
+        section = str(value or "conversation")
+        if section not in {"project", "conversation"}:
+            raise ValueError("文件夹分类无效")
+        return section
+
     def update_folder(self, user: dict) -> None:
         folder_id = self.path.split("/")[-1]
-        name = self.read_json().get("name", "").strip()
-        if not name:
-            self.send_error_json("文件夹名称不能为空")
-            return
+        payload = self.read_json()
         with db() as conn:
-            conn.execute(
-                "UPDATE thread_folders SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-                (name[:80], now(), folder_id, user["id"]),
-            )
             folder = conn.execute(
                 "SELECT * FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
             ).fetchone()
-        if not folder:
-            self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
-            return
+            if not folder:
+                self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
+                return
+            if "name" in payload:
+                name = str(payload.get("name", "")).strip()
+                if not name:
+                    self.send_error_json("文件夹名称不能为空")
+                    return
+                conn.execute(
+                    "UPDATE thread_folders SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                    (name[:80], now(), folder_id, user["id"]),
+                )
+            elif "position" in payload:
+                try:
+                    position = int(payload["position"])
+                except (TypeError, ValueError):
+                    self.send_error_json("文件夹位置无效")
+                    return
+                siblings = conn.execute(
+                    """SELECT id FROM thread_folders WHERE user_id = ? AND section = ?
+                       ORDER BY sort_order ASC, created_at ASC, id ASC""",
+                    (user["id"], folder["section"]),
+                ).fetchall()
+                ordered_ids = [row["id"] for row in siblings if row["id"] != folder_id]
+                ordered_ids.insert(max(0, min(position, len(ordered_ids))), folder_id)
+                for sort_order, sibling_id in enumerate(ordered_ids):
+                    conn.execute(
+                        "UPDATE thread_folders SET sort_order = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                        (sort_order, now(), sibling_id, user["id"]),
+                    )
+            else:
+                self.send_error_json("没有可更新的文件夹信息")
+                return
+            folder = conn.execute(
+                "SELECT * FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
+            ).fetchone()
         self.send_json({"folder": row_to_dict(folder)})
 
     def delete_folder(self, user: dict) -> None:
@@ -1922,6 +1979,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         payload = self.read_json()
         thread_id = payload.get("thread_id", "")
+        requested_folder_id = payload.get("folder_id", "")
         content = payload.get("content", "").strip()
         retry = bool(payload.get("retry"))
         requested_model = payload.get("model", "auto")
@@ -1960,9 +2018,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     return
                 thread_id = new_id("thread")
                 title = content[:24] if content else "新对话"
+                folder_id = self.validate_folder_id(user["id"], requested_folder_id)
                 conn.execute(
-                    "INSERT INTO threads (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (thread_id, user["id"], title, now(), now()),
+                    "INSERT INTO threads (id, user_id, folder_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (thread_id, user["id"], folder_id, title, now(), now()),
                 )
             handoff_from = ""
             handoff_summary = ""
@@ -2045,6 +2104,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "model": actual_model,
                 "task_tier": execution_context["task_tier"],
                 "tool_ids": execution_context["allowed_tool_ids"],
+                "tool_route_confidence": execution_context["tool_route_confidence"],
+                "tool_route_reason": execution_context["tool_route_reason"],
             })
             append_run_event(conn, run_id, "skill_routed", {
                 "route": execution_context["skill_route"],
@@ -2285,7 +2346,9 @@ def build_system_prompt(execution_context: dict) -> str:
         "deep": "先明确范围、假设和结论结构；对不确定内容说明边界；输出完整、分层的结果。",
     }
     system_prompt += f"\n\n[任务规则]\n当前任务档位：{execution_context['task_tier']}。{tier_rules[execution_context['task_tier']]}"
-    if execution_context["allowed_tool_ids"]:
+    if execution_context.get("web_search_sources"):
+        system_prompt += "\n\n[工具状态]\n平台已经通过 Tavily MCP 实际执行网页检索并获得来源。不得声称工具未授权、MCP 未配置或无法实时查询；必须基于下方网页结果回答，并对未覆盖的信息说明边界。"
+    elif execution_context["allowed_tool_ids"]:
         system_prompt += "\n\n[工具规则]\n仅在必要时调用当前提供的只读工具。工具结果仅作为事实依据，不能泄露敏感配置。"
     else:
         system_prompt += "\n\n[工具规则]\n本次任务未授权工具调用，请直接基于已提供上下文回答。"
@@ -2302,6 +2365,15 @@ def build_system_prompt(execution_context: dict) -> str:
         system_prompt += "\n\n[本地资料]\n以下为本次检索到的资料片段。引用资料中的事实时，请在对应表述后标注资料名称；资料未覆盖的内容需说明是建议或推断。\n" + source_text
     elif execution_context.get("knowledge_route") == "required_no_match":
         system_prompt += "\n\n[资料边界]\n本次任务需要资料依据，但本地知识库没有命中内容。不得把模型常识说成已验证事实；请将结论表述为建议、假设或待验证项。"
+    web_sources = execution_context.get("web_search_sources", [])
+    if web_sources:
+        source_text = "\n\n".join(
+            f"网页：{item['title']}\n链接：{item['url']}\n摘要：{item['excerpt']}"
+            for item in web_sources
+        )
+        system_prompt += "\n\n[已执行网页检索]\n以下是本次已实际获取的公开网页结果。仅可基于这些结果陈述网页事实；回答中应给出对应链接，不得编造未返回的来源。\n" + source_text
+    elif execution_context.get("web_search_error"):
+        system_prompt += "\n\n[网页检索边界]\n本次明确请求的网页检索未成功。请说明检索不可用，不得编造网页结果或链接。"
     return system_prompt
 
 
@@ -2445,8 +2517,52 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         raise
 
 
+def execute_authorized_web_search(user_content: str, execution_context: dict, on_event) -> None:
+    """Run an explicitly authorized web search before model generation.
+
+    This keeps search deterministic for an explicit user request rather than
+    relying on a model to decide whether to emit an otherwise optional call.
+    """
+    if "web_search" not in execution_context["allowed_tool_ids"]:
+        return
+    tool = LOCAL_TOOLS.get("web_search")
+    if not tool:
+        return
+    tool_call_id = new_id("toolcall")
+    arguments = {"query": user_content[:300]}
+    on_event("tool_call", {
+        "tool_call_id": tool_call_id,
+        "tool_id": "web_search",
+        "tool_name": tool.name,
+        "arguments": arguments,
+    })
+    try:
+        result = LOCAL_TOOLS.execute("web_search", arguments, {"web_search"})
+        sources = result.get("sources", []) if isinstance(result, dict) else []
+        execution_context["web_search_sources"] = sources[:10]
+        execution_context["web_search_provider"] = result.get("provider", "unknown") if isinstance(result, dict) else "unknown"
+        execution_context["allowed_tool_ids"] = [tool_id for tool_id in execution_context["allowed_tool_ids"] if tool_id != "web_search"]
+        execution_context["tools"] = [tool for tool in execution_context["tools"] if tool["id"] != "web_search"]
+        on_event("tool_result", {
+            "tool_call_id": tool_call_id,
+            "tool_id": "web_search",
+            "tool_name": tool.name,
+            "summary": f"已通过 {execution_context['web_search_provider']} 获取 {len(sources)} 条网页结果",
+            "sources": sources[:10],
+        })
+    except (ValueError, TypeError) as exc:
+        execution_context["web_search_error"] = str(exc)
+        execution_context["allowed_tool_ids"] = [tool_id for tool_id in execution_context["allowed_tool_ids"] if tool_id != "web_search"]
+        execution_context["tools"] = [tool for tool in execution_context["tools"] if tool["id"] != "web_search"]
+        on_event("tool_error", {
+            "tool_call_id": tool_call_id,
+            "tool_id": "web_search",
+            "tool_name": tool.name,
+            "error": str(exc),
+        })
+
+
 def stream_answer(thread_id: str, user_content: str, execution_context: dict, on_event) -> object:
-    system_prompt = build_system_prompt(execution_context)
 
     if is_skill_inventory_question(user_content):
         names = "、".join(skill["name"] for skill in execution_context["skills"]) or "当前没有启用技能"
@@ -2458,8 +2574,12 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
         return
 
     if model_is_configured(execution_context["model"]):
+        execute_authorized_web_search(user_content, execution_context, on_event)
+        system_prompt = build_system_prompt(execution_context)
         yield from run_deepseek_agent(thread_id, system_prompt, execution_context, on_event)
         return
+
+    system_prompt = build_system_prompt(execution_context)
 
     if "平台状态" in user_content or "系统状态" in user_content:
         tool_id = "platform_status"

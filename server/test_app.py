@@ -482,6 +482,71 @@ class AgentPlatformApiTests(unittest.TestCase):
         retained = self.request_json(f"/api/threads/{thread['id']}", token=self.token)["thread"]
         self.assertEqual(retained["folder_id"], "")
 
+    def test_first_message_creates_a_thread_inside_requested_folder(self):
+        folder = self.request_json("/api/folders", {"name": "产品项目", "section": "project"}, self.token)["folder"]
+        events = self.chat({"thread_id": "", "folder_id": folder["id"], "content": "整理产品发布计划"})
+        thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
+        thread = self.request_json(f"/api/threads/{thread_id}", token=self.token)["thread"]
+        self.assertEqual(thread["folder_id"], folder["id"])
+        self.assertEqual(thread["title"], "整理产品发布计划")
+
+    def test_project_and_conversation_folders_keep_independent_order(self):
+        project_a = self.request_json(
+            "/api/folders", {"name": "项目 A", "section": "project"}, self.token
+        )["folder"]
+        project_b = self.request_json(
+            "/api/folders", {"name": "项目 B", "section": "project"}, self.token
+        )["folder"]
+        conversation = self.request_json(
+            "/api/folders", {"name": "日常对话", "section": "conversation"}, self.token
+        )["folder"]
+        self.assertEqual(project_a["section"], "project")
+        self.assertEqual(conversation["section"], "conversation")
+
+        self.request_json(
+            f"/api/folders/{project_b['id']}", {"position": 0}, self.token, method="PATCH"
+        )
+        folders = self.request_json("/api/folders", token=self.token)["folders"]
+        self.assertEqual([(folder["section"], folder["name"]) for folder in folders], [
+            ("project", "项目 B"),
+            ("project", "项目 A"),
+            ("conversation", "日常对话"),
+        ])
+
+        thread = self.request_json(
+            "/api/threads", {"title": "项目会议纪要", "folder_id": project_a["id"]}, self.token
+        )["thread"]
+        self.assertEqual(thread["folder_id"], project_a["id"])
+
+    def test_explicit_web_search_executes_before_model_and_records_sources(self):
+        context = {
+            "allowed_tool_ids": ["web_search"],
+            "tools": [{"id": "web_search", "name": "网页检索"}],
+        }
+        events = []
+        sources = [{"kind": "web", "title": "Agent news", "url": "https://example.com/news", "excerpt": "Latest news"}]
+        with patch.object(app.LOCAL_TOOLS, "execute", return_value={"sources": sources, "count": 1, "provider": "mcp:tavily"}) as execute:
+            app.execute_authorized_web_search("请联网搜索 Agent 新闻", context, lambda event_type, payload: events.append((event_type, payload)))
+        execute.assert_called_once_with("web_search", {"query": "请联网搜索 Agent 新闻"}, {"web_search"})
+        self.assertEqual(context["web_search_sources"], sources)
+        self.assertEqual(context["web_search_provider"], "mcp:tavily")
+        self.assertEqual(context["allowed_tool_ids"], [])
+        self.assertEqual(context["tools"], [])
+        self.assertEqual([event_type for event_type, _ in events], ["tool_call", "tool_result"])
+
+    def test_preexecuted_mcp_search_never_claims_tools_are_unavailable(self):
+        context = {
+            "skills": [], "task_tier": "standard", "allowed_tool_ids": [],
+            "web_search_sources": [{"title": "天气", "url": "https://example.com/weather", "excerpt": "晴"}],
+        }
+        prompt = app.build_system_prompt(context)
+        self.assertIn("已经通过 Tavily MCP 实际执行网页检索", prompt)
+        self.assertNotIn("本次任务未授权工具调用", prompt)
+
+    def test_realtime_and_url_lookup_requests_are_tool_tasks(self):
+        self.assertTrue(app.infer_task_profile("帮我查一下，今天上海的天气")["needs_tools"])
+        self.assertTrue(app.infer_task_profile("帮我查一下：https://openai.com/zh-Hant-HK/index/harness-engineering/")["needs_tools"])
+
     def test_local_knowledge_upload_retrieval_citation_and_delete(self):
         source = "# 产品资料\n\n北极星指标是每周完成首次核心任务的活跃用户数。"
         uploaded = self.request_json(
