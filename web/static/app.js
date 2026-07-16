@@ -4,6 +4,8 @@ const state = {
   threads: [],
   folders: [],
   collapsedFolderIds: new Set(),
+  spacesCollapsed: false,
+  tasksCollapsed: false,
   currentThreadId: "",
   pendingFolderId: "",
   messages: [],
@@ -20,7 +22,7 @@ const state = {
 };
 
 const UI_STATE_KEY = "agent_platform_workspace_state";
-const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "memories", "artifacts"]);
+const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "memories", "artifacts", "space"]);
 
 const els = {
   loginView: document.querySelector("#loginView"),
@@ -33,6 +35,9 @@ const els = {
   threadSearch: document.querySelector("#threadSearch"),
   newThreadButton: document.querySelector("#newThreadButton"),
   chatPage: document.querySelector("#chatPage"),
+  spacePage: document.querySelector("#spacePage"),
+  spaceTitle: document.querySelector("#spaceTitle"),
+  spaceDetail: document.querySelector("#spaceDetail"),
   skillsPage: document.querySelector("#skillsPage"),
   settingsPage: document.querySelector("#settingsPage"),
   knowledgePage: document.querySelector("#knowledgePage"),
@@ -568,38 +573,69 @@ function renderThreads() {
     else ungrouped.push(thread);
   });
 
-  const projectFolders = state.folders.filter((folder) => folder.section === "project");
-  const conversationFolders = state.folders.filter((folder) => folder.section !== "project");
-  renderThreadSection("项目", "project", projectFolders, grouped, []);
-  renderThreadSection("对话", "conversation", conversationFolders, grouped, ungrouped);
+  const spaceFolders = state.folders.filter((folder) => folder.section === "project");
+  renderThreadSection("空间", "space", spaceFolders, grouped);
+  renderTaskSection(ungrouped);
 }
 
-function renderThreadSection(title, section, folders, grouped, ungrouped) {
+function renderThreadSection(title, section, folders, grouped) {
   const container = document.createElement("section");
   container.className = `thread-section thread-section-${section}`;
   const header = document.createElement("div");
   header.className = "thread-section-header";
   const label = document.createElement("h2");
   label.textContent = title;
+  const toggle = document.createElement("button");
+  toggle.className = "section-toggle";
+  const isCollapsed = state.spacesCollapsed;
+  toggle.textContent = isCollapsed ? "›" : "⌄";
+  toggle.title = isCollapsed ? "展开空间" : "收起空间";
+  toggle.setAttribute("aria-expanded", String(!isCollapsed));
+  toggle.addEventListener("click", () => {
+    state.spacesCollapsed = !state.spacesCollapsed;
+    renderThreads();
+  });
   const createButton = document.createElement("button");
   createButton.className = "section-add-folder";
   createButton.type = "button";
   createButton.textContent = "+";
-  createButton.title = `在${title}下新建文件夹`;
-  createButton.setAttribute("aria-label", `在${title}下新建文件夹`);
-  createButton.addEventListener("click", () => createFolder(section));
-  header.append(label, createButton);
+  createButton.title = "新建空间";
+  createButton.setAttribute("aria-label", "新建空间");
+  createButton.addEventListener("click", () => createFolder("project"));
+  const titleGroup = document.createElement("div");
+  titleGroup.className = "section-title-group";
+  titleGroup.append(label, toggle);
+  header.append(titleGroup, createButton);
   container.appendChild(header);
-  folders.forEach((folder) => container.appendChild(createThreadGroup(folder.name, grouped.get(folder.id) || [], folder)));
-  if (section === "conversation" && (ungrouped.length || !folders.length)) {
-    container.appendChild(createThreadGroup("未归类", ungrouped));
-  }
-  if (section === "project" && !folders.length) {
+  if (!isCollapsed) folders.forEach((folder) => container.appendChild(createThreadGroup(folder.name, grouped.get(folder.id) || [], folder)));
+  if (!isCollapsed && section === "space" && !folders.length) {
     const empty = document.createElement("p");
     empty.className = "section-empty";
-    empty.textContent = "创建项目文件夹以归纳相关对话";
+    empty.textContent = "创建空间以归纳相关任务";
     container.appendChild(empty);
   }
+  els.threadList.appendChild(container);
+}
+
+function renderTaskSection(tasks) {
+  const container = document.createElement("section");
+  container.className = "thread-section thread-section-task";
+  const header = document.createElement("div");
+  header.className = "thread-section-header";
+  const label = document.createElement("h2");
+  label.textContent = "任务";
+  const toggle = document.createElement("button");
+  toggle.className = "section-toggle";
+  toggle.textContent = state.tasksCollapsed ? "›" : "⌄";
+  toggle.title = state.tasksCollapsed ? "展开任务" : "收起任务";
+  toggle.setAttribute("aria-expanded", String(!state.tasksCollapsed));
+  toggle.addEventListener("click", () => { state.tasksCollapsed = !state.tasksCollapsed; renderThreads(); });
+  const titleGroup = document.createElement("div");
+  titleGroup.className = "section-title-group";
+  titleGroup.append(label, toggle);
+  header.appendChild(titleGroup);
+  container.appendChild(header);
+  if (!state.tasksCollapsed) tasks.forEach((task) => container.appendChild(createThreadRow(task)));
   els.threadList.appendChild(container);
 }
 
@@ -610,31 +646,33 @@ function createThreadGroup(title, threads, folder = null) {
   group.classList.toggle("collapsed", Boolean(collapsed));
   const header = document.createElement("div");
   header.className = "thread-group-header";
-  const heading = document.createElement(folder ? "button" : "div");
+  const heading = document.createElement("div");
   heading.className = "thread-group-title";
   if (folder) {
-    heading.type = "button";
     heading.classList.add("folder-toggle");
-    heading.setAttribute("aria-expanded", String(!collapsed));
-    heading.title = collapsed ? `展开文件夹：${folder.name}` : `收起文件夹：${folder.name}`;
-    heading.addEventListener("click", () => {
-      if (state.collapsedFolderIds.has(folder.id)) state.collapsedFolderIds.delete(folder.id);
-      else state.collapsedFolderIds.add(folder.id);
-      renderThreads();
-    });
-    const disclosure = document.createElement("span");
-    disclosure.className = "folder-disclosure";
-    disclosure.textContent = "›";
-    heading.appendChild(disclosure);
     const icon = document.createElement("span");
-    icon.className = "folder-icon";
+    icon.className = "space-icon";
     icon.setAttribute("aria-hidden", "true");
-    heading.appendChild(icon);
+    icon.innerHTML = '<svg viewBox="0 0 24 24" focusable="false"><path d="m12 3.8 7 4v8.1l-7 4.3-7-4.3V7.8z"></path><path d="m5 7.8 7 4.2 7-4.2M12 12v8.2"></path></svg>';
+    const openButton = document.createElement("button");
+    openButton.className = "space-open-button";
+    openButton.type = "button";
+    openButton.title = `打开空间：${folder.name}`;
+    openButton.addEventListener("click", () => openSpace(folder.id));
+    openButton.appendChild(icon);
+    heading.appendChild(openButton);
   }
   const label = document.createElement("span");
   label.className = folder ? "folder-name" : "ungrouped-label";
   label.textContent = title;
-  heading.appendChild(label);
+  if (folder) {
+    const openName = document.createElement("button");
+    openName.className = "space-open-button folder-name";
+    openName.type = "button";
+    openName.textContent = title;
+    openName.addEventListener("click", () => openSpace(folder.id));
+    heading.appendChild(openName);
+  } else heading.appendChild(label);
   header.appendChild(heading);
   if (folder) {
     const controls = document.createElement("div");
@@ -643,8 +681,8 @@ function createThreadGroup(title, threads, folder = null) {
     newThread.className = "folder-new-thread";
     newThread.type = "button";
     newThread.textContent = "+";
-    newThread.title = `在“${folder.name}”中新建对话`;
-    newThread.setAttribute("aria-label", `在“${folder.name}”中新建对话`);
+    newThread.title = `在“${folder.name}”中新建任务`;
+    newThread.setAttribute("aria-label", `在“${folder.name}”中新建任务`);
     newThread.addEventListener("click", () => startThreadInFolder(folder));
     const sectionFolders = state.folders.filter((item) => item.section === folder.section);
     const currentIndex = sectionFolders.findIndex((item) => item.id === folder.id);
@@ -666,14 +704,30 @@ function createThreadGroup(title, threads, folder = null) {
     menu.className = "folder-menu";
     menu.type = "button";
     menu.textContent = "⋯";
-    menu.title = `管理文件夹：${folder.name}`;
-    menu.setAttribute("aria-label", `管理文件夹：${folder.name}`);
+    menu.title = `管理空间：${folder.name}`;
+    menu.setAttribute("aria-label", `管理空间：${folder.name}`);
     menu.addEventListener("click", () => manageFolder(folder));
-    controls.append(newThread, up, down, menu);
+    const disclosure = document.createElement("button");
+    disclosure.className = "folder-disclosure";
+    disclosure.type = "button";
+    disclosure.textContent = "›";
+    disclosure.title = collapsed ? `展开空间：${folder.name}` : `收起空间：${folder.name}`;
+    disclosure.setAttribute("aria-expanded", String(!collapsed));
+    disclosure.addEventListener("click", () => {
+      if (state.collapsedFolderIds.has(folder.id)) state.collapsedFolderIds.delete(folder.id);
+      else state.collapsedFolderIds.add(folder.id);
+      renderThreads();
+    });
+    heading.appendChild(disclosure);
+    controls.append(newThread, menu);
     header.appendChild(controls);
   }
   group.appendChild(header);
-  threads.forEach((thread) => {
+  threads.forEach((thread) => group.appendChild(createThreadRow(thread)));
+  return group;
+}
+
+function createThreadRow(thread) {
     const row = document.createElement("div");
     row.className = "thread-row";
     const button = document.createElement("button");
@@ -691,13 +745,27 @@ function createThreadGroup(title, threads, folder = null) {
     menu.setAttribute("aria-label", `管理对话：${thread.title}`);
     menu.addEventListener("click", () => manageThread(thread));
     row.append(button, menu);
-    group.appendChild(row);
+    return row;
+}
+
+async function openSpace(spaceId) {
+  const data = await api(`/api/folders/${spaceId}`);
+  els.spaceTitle.textContent = data.space.name;
+  const tasks = data.tasks.map((item) => `<li>${escapeHtml(item.title)}</li>`).join("") || "<li>暂无任务</li>";
+  const artifacts = data.artifacts.map((item) => `<li>${escapeHtml(item.filename)}</li>`).join("") || "<li>暂无产物</li>";
+  const members = data.members.map((item) => `<li>${escapeHtml(item.name || item.email)} · ${escapeHtml(item.role)}</li>`).join("") || "<li>暂无成员</li>";
+  els.spaceDetail.innerHTML = `<section><h3>任务</h3><ul>${tasks}</ul></section><section><h3>产物</h3><ul>${artifacts}</ul></section><section><h3>成员</h3><ul>${members}</ul><button id="inviteSpaceMember" type="button">邀请成员</button></section>`;
+  document.querySelector("#inviteSpaceMember").addEventListener("click", async () => {
+    const email = window.prompt("输入成员邮箱");
+    if (!email?.trim()) return;
+    await api(`/api/folders/${spaceId}/invitations`, { method: "POST", body: JSON.stringify({ email }) });
+    await openSpace(spaceId);
   });
-  return group;
+  switchView("space");
 }
 
 async function manageThread(thread) {
-  const action = window.prompt("输入 r 重命名，输入 m 移动到文件夹，输入 d 删除", "r");
+  const action = window.prompt("输入 r 重命名，输入 m 移动到空间，输入 d 删除", "r");
   if (action === "r") {
     const title = window.prompt("输入新的对话名称", thread.title);
     if (!title?.trim()) return;
@@ -706,15 +774,16 @@ async function manageThread(thread) {
     if (thread.id === state.currentThreadId) els.threadTitle.textContent = title.trim();
   }
   if (action === "m") {
-    const choices = ["0. 对话 / 未归类", ...state.folders.map((folder, index) => `${index + 1}. [${folder.section === "project" ? "项目" : "对话"}] ${folder.name}`)];
+    const spaces = state.folders.filter((folder) => folder.section === "project");
+    const choices = ["0. 任务", ...spaces.map((folder, index) => `${index + 1}. [空间] ${folder.name}`)];
     const selected = window.prompt(`输入目标序号：\n${choices.join("\n")}`, "0");
     if (selected === null) return;
     const index = Number.parseInt(selected, 10);
-    if (!Number.isInteger(index) || index < 0 || index > state.folders.length) {
-      window.alert("请输入有效的文件夹序号。");
+    if (!Number.isInteger(index) || index < 0 || index > spaces.length) {
+      window.alert("请输入有效的空间序号。");
       return;
     }
-    const folderId = index === 0 ? "" : state.folders[index - 1].id;
+    const folderId = index === 0 ? "" : spaces[index - 1].id;
     await api(`/api/threads/${thread.id}`, { method: "PATCH", body: JSON.stringify({ folder_id: folderId }) });
     await refreshThreadList();
   }
@@ -731,14 +800,13 @@ async function manageThread(thread) {
 }
 
 async function createFolder(section) {
-  const label = section === "project" ? "项目" : "对话";
-  const name = window.prompt(`输入${label}文件夹名称`);
+  const name = window.prompt("输入空间名称");
   if (!name?.trim()) return;
   try {
     await api("/api/folders", { method: "POST", body: JSON.stringify({ name, section }) });
     await refreshThreadList();
   } catch (error) {
-    window.alert(`创建文件夹失败：${error.message}`);
+    window.alert(`创建空间失败：${error.message}`);
   }
 }
 
@@ -751,7 +819,7 @@ async function startThreadInFolder(folder) {
   state.selectedSkillIds = [];
   renderComposerSkills();
   renderSkillPicker();
-  els.threadTitle.textContent = `新对话 · ${folder.name}`;
+  els.threadTitle.textContent = `新建任务 · ${folder.name}`;
   switchView("chat");
   renderThreads();
   renderMessages();
@@ -762,16 +830,21 @@ async function startThreadInFolder(folder) {
 }
 
 async function manageFolder(folder) {
-  const action = window.prompt("输入 r 重命名，输入 d 删除文件夹", "r");
+  const action = window.prompt("输入 r 重命名，输入 u 上移，输入 n 下移，输入 d 删除空间", "r");
   if (action === "r") {
-    const name = window.prompt("输入新的文件夹名称", folder.name);
+    const name = window.prompt("输入新的空间名称", folder.name);
     if (!name?.trim()) return;
     await api(`/api/folders/${folder.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
     await refreshThreadList();
   }
-  if (action === "d" && window.confirm(`删除文件夹“${folder.name}”？其中的对话会保留在“未归类”。`)) {
+  if (action === "d" && window.confirm(`删除空间“${folder.name}”？其中的任务会移入“任务”。`)) {
     await api(`/api/folders/${folder.id}`, { method: "DELETE" });
     await refreshThreadList();
+  }
+  if (action === "u" || action === "n") {
+    const spaces = state.folders.filter((item) => item.section === "project");
+    const index = spaces.findIndex((item) => item.id === folder.id);
+    await moveFolder(folder, action === "u" ? index - 1 : index + 1);
   }
 }
 
@@ -1327,6 +1400,7 @@ function switchView(view) {
   state.activeView = view;
   persistWorkspaceState();
   els.chatPage.classList.toggle("hidden", view !== "chat");
+  els.spacePage.classList.toggle("hidden", view !== "space");
   els.skillsPage.classList.toggle("hidden", view !== "skills");
   els.settingsPage.classList.toggle("hidden", view !== "settings");
   els.knowledgePage.classList.toggle("hidden", view !== "knowledge");
@@ -1610,7 +1684,7 @@ function renderExecutionModeHint() {
   syncEvidenceModeControls();
   const labels = { off: "关闭", auto: "自动", required: "必须" };
   const sourceLabels = { general: "通用", local_only: "仅本地资料", web_only: "仅联网资料", mixed: "混合资料" };
-  els.executionModeHint.textContent = `本轮策略：${sourceLabels[els.sourceModeSelect.value]}｜知识库${labels[els.knowledgeModeSelect.value]}｜网络${labels[els.webModeSelect.value]}｜文件${labels[els.fileModeSelect.value]}`;
+  els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · 知识库${labels[els.knowledgeModeSelect.value]} · 网络${labels[els.webModeSelect.value]}`;
 }
 
 function scheduleRoutePreview() {
@@ -1641,7 +1715,7 @@ function scheduleRoutePreview() {
       if (sequence !== routePreviewSequence || !preview.ready) return;
       const tools = preview.allowed_tools?.map((tool) => tool.name).join("、") || "无工具";
       const errors = preview.required_errors?.length ? `；${preview.required_errors.join("；")}` : "";
-      els.executionModeHint.textContent = `自动判断：${preview.task_tier} · 本地资料 ${preview.knowledge_matches} 条 · ${tools}${errors}`;
+      els.executionModeHint.textContent = `${preview.task_tier} · 资料 ${preview.knowledge_matches} 条 · ${tools}${errors}`;
     } catch (_error) {
       if (sequence === routePreviewSequence) renderExecutionModeHint();
     }

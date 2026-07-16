@@ -617,7 +617,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(app.infer_task_profile("分析这段代码")["task_tier"], "standard")
         self.assertEqual(app.infer_task_profile("补充下一步待办")["task_tier"], "standard")
 
-    def test_thread_folders_group_and_preserve_threads_on_delete(self):
+    def test_spaces_group_and_preserve_tasks_on_delete(self):
         folder = self.request_json("/api/folders", {"name": "改动范围"}, self.token)["folder"]
         thread = self.request_json(
             "/api/threads", {"title": "接口改造", "folder_id": folder["id"]}, self.token
@@ -645,18 +645,17 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(thread["folder_id"], folder["id"])
         self.assertEqual(thread["title"], "整理产品发布计划")
 
-    def test_project_and_conversation_folders_keep_independent_order(self):
+    def test_spaces_keep_independent_order_and_reject_task_folders(self):
         project_a = self.request_json(
             "/api/folders", {"name": "项目 A", "section": "project"}, self.token
         )["folder"]
         project_b = self.request_json(
             "/api/folders", {"name": "项目 B", "section": "project"}, self.token
         )["folder"]
-        conversation = self.request_json(
-            "/api/folders", {"name": "日常对话", "section": "conversation"}, self.token
-        )["folder"]
         self.assertEqual(project_a["section"], "project")
-        self.assertEqual(conversation["section"], "conversation")
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            self.request_json("/api/folders", {"name": "日常任务", "section": "conversation"}, self.token)
+        self.assertEqual(rejected.exception.code, 400)
 
         self.request_json(
             f"/api/folders/{project_b['id']}", {"position": 0}, self.token, method="PATCH"
@@ -665,7 +664,6 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual([(folder["section"], folder["name"]) for folder in folders], [
             ("project", "项目 B"),
             ("project", "项目 A"),
-            ("conversation", "日常对话"),
         ])
 
         thread = self.request_json(

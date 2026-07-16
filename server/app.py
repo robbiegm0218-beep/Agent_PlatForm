@@ -734,6 +734,22 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS space_members (
+                space_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (space_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS space_invitations (
+                id TEXT PRIMARY KEY,
+                space_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'pending',
+                invited_by TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
@@ -866,9 +882,13 @@ def init_db() -> None:
         ensure_column(conn, "threads", "handoff_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "threads", "structured_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
-        ensure_column(conn, "thread_folders", "section", "TEXT NOT NULL DEFAULT 'conversation'")
+        ensure_column(conn, "thread_folders", "section", "TEXT NOT NULL DEFAULT 'project'")
         ensure_column(conn, "thread_folders", "sort_order", "INTEGER NOT NULL DEFAULT 0")
-        conn.execute("UPDATE thread_folders SET section = 'conversation' WHERE section NOT IN ('project', 'conversation')")
+        # Task folders are no longer part of the product model. Preserve their
+        # tasks by moving them to the root task list before deleting the folders.
+        conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id IN (SELECT id FROM thread_folders WHERE section = 'conversation')")
+        conn.execute("DELETE FROM thread_folders WHERE section = 'conversation'")
+        conn.execute("UPDATE thread_folders SET section = 'project' WHERE section != 'project'")
         ensure_column(conn, "runs", "skill_snapshot", "TEXT DEFAULT '[]'")
         ensure_column(conn, "runs", "execution_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "runs", "plan_snapshot", "TEXT DEFAULT '[]'")
@@ -1318,6 +1338,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/folders":
             self.list_folders(user)
             return
+        if self.path.startswith("/api/folders/"):
+            self.get_space(user)
+            return
         if self.path.startswith("/api/runs/"):
             self.get_run(user)
             return
@@ -1393,6 +1416,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/folders":
             self.create_folder(user)
+            return
+        if self.path.startswith("/api/folders/") and self.path.endswith("/invitations"):
+            self.invite_space_member(user)
             return
         if self.path.startswith("/api/runs/") and self.path.endswith("/confirmation"):
             self.resolve_confirmation(user)
@@ -1526,6 +1552,41 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (user["id"],),
             ).fetchall()
         self.send_json({"folders": [row_to_dict(row) for row in rows]})
+
+    def get_space(self, user: dict) -> None:
+        space_id = self.path.split("?")[0].split("/")[-1]
+        with db() as conn:
+            space = conn.execute("SELECT * FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
+            if not space:
+                self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
+                return
+            tasks = conn.execute("SELECT * FROM threads WHERE user_id = ? AND folder_id = ? ORDER BY updated_at DESC, id DESC", (user["id"], space_id)).fetchall()
+            artifacts = conn.execute("""SELECT artifacts.* FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
+                WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY artifacts.created_at DESC, artifacts.id DESC""", (user["id"], space_id)).fetchall()
+            members = conn.execute("""SELECT users.id, users.name, users.email, space_members.role, space_members.created_at FROM space_members JOIN users ON users.id = space_members.user_id
+                WHERE space_members.space_id = ? ORDER BY space_members.created_at ASC""", (space_id,)).fetchall()
+            invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
+        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations]})
+
+    def invite_space_member(self, user: dict) -> None:
+        space_id = self.path.split("/")[-2]
+        payload = self.read_json()
+        email = str(payload.get("email", "")).strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            self.send_error_json("邀请邮箱无效")
+            return
+        with db() as conn:
+            space = conn.execute("SELECT id FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
+            if not space:
+                self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
+                return
+            existing = conn.execute("SELECT id FROM space_invitations WHERE space_id = ? AND email = ? AND status = 'pending'", (space_id, email)).fetchone()
+            if existing:
+                self.send_error_json("该邮箱已有待处理邀请", HTTPStatus.CONFLICT)
+                return
+            invitation_id = new_id("invite")
+            conn.execute("INSERT INTO space_invitations (id, space_id, email, role, status, invited_by, created_at) VALUES (?, ?, ?, 'member', 'pending', ?, ?)", (invitation_id, space_id, email, user["id"], now()))
+        self.send_json({"invitation": {"id": invitation_id, "email": email, "status": "pending", "role": "member"}}, HTTPStatus.CREATED)
 
     def get_thread(self, user: dict) -> None:
         thread_id = self.path.split("/")[-1]
@@ -1784,7 +1845,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not name:
             self.send_error_json("文件夹名称不能为空")
             return
-        section = self.validate_folder_section(payload.get("section", "conversation"))
+        try:
+            section = self.validate_folder_section(payload.get("section", "project"))
+        except ValueError as exc:
+            self.send_error_json(str(exc))
+            return
         folder_id = new_id("folder")
         with db() as conn:
             next_order = conn.execute(
@@ -1796,14 +1861,15 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (folder_id, user["id"], name[:80], section, next_order, now(), now()),
             )
+            conn.execute("INSERT INTO space_members (space_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)", (folder_id, user["id"], now()))
             folder = conn.execute("SELECT * FROM thread_folders WHERE id = ?", (folder_id,)).fetchone()
         self.send_json({"folder": row_to_dict(folder)})
 
     def validate_folder_section(self, value: object) -> str:
-        section = str(value or "conversation")
-        if section not in {"project", "conversation"}:
-            raise ValueError("文件夹分类无效")
-        return section
+        section = str(value or "project")
+        if section != "project":
+            raise ValueError("任务不支持文件夹；仅可创建空间")
+        return "project"
 
     def update_folder(self, user: dict) -> None:
         folder_id = self.path.split("/")[-1]

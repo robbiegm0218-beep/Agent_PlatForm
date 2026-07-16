@@ -33,7 +33,7 @@
           <div class="sidebar-top">
             <div class="logo">Agent_Platform</div>
             <nav class="primary-nav" aria-label="平台功能">
-              <button id="newThreadButton" class="nav-button active" data-view="chat"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>新建对话</span></button>
+              <button id="newThreadButton" class="nav-button active" data-view="chat"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>新建任务</span></button>
               <button class="nav-button" data-view="skills"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 14.2 9l5.3 2.2-5.3 2.2L12 19l-2.2-5.6-5.3-2.2L9.8 9 12 3.5Z" /></svg><span>技能和应用</span></button>
               <button class="nav-button" data-view="knowledge"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="5.5" /><path d="m15.2 15.2 4.3 4.3" /></svg><span>知识库</span></button>
               <button class="nav-button" data-view="memories"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5.5h10v13H7z" /><path d="M9.5 9h5M9.5 12h5M9.5 15h3" /></svg><span>长期记忆</span></button>
@@ -41,7 +41,7 @@
             </nav>
           </div>
           <div class="thread-tools">
-            <input id="threadSearch" type="search" placeholder="搜索对话" />
+            <input id="threadSearch" type="search" placeholder="搜索任务" />
           </div>
           <div class="thread-list" id="threadList"></div>
           <div class="sidebar-bottom">
@@ -71,15 +71,18 @@
                   <button id="skillPickerButton" class="skill-picker-button" type="button" aria-expanded="false">选择技能</button>
                   <div id="skillPickerMenu" class="skill-picker-menu hidden" role="menu"></div>
                 </div>
-                <select id="taskModeSelect" aria-label="选择任务档位">
-                  <option value="auto">自动档位</option>
-                  <option value="quick">快速</option>
-                  <option value="standard">标准</option>
-                  <option value="deep">深度</option>
-                </select>
-                <select id="modelSelect" aria-label="选择模型"></select>
+                <div class="runtime-config" aria-label="模型与任务档位">
+                  <select id="taskModeSelect" aria-label="选择任务档位">
+                    <option value="auto">自动档位</option>
+                    <option value="quick">快速</option>
+                    <option value="standard">标准</option>
+                    <option value="deep">深度</option>
+                  </select>
+                  <span class="runtime-config-divider" aria-hidden="true"></span>
+                  <select id="modelSelect" aria-label="选择模型"></select>
+                </div>
                 <details class="execution-mode-picker">
-                  <summary>执行方式</summary>
+                  <summary><span>执行方式</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">自动</span></summary>
                   <div class="execution-mode-menu">
                     <label>资料
                       <select id="sourceModeSelect" aria-label="选择回答依据">
@@ -112,11 +115,14 @@
                     </label>
                   </div>
                 </details>
-                <span id="executionModeHint" class="execution-mode-hint" aria-live="polite">本轮策略：自动判断资料与工具</span>
               </div>
               <button id="sendButton" type="submit">发送</button>
             </div>
           </form>
+        </section>
+        <section id="spacePage" class="page hidden">
+          <header class="page-header"><div><h2 id="spaceTitle">空间</h2><span id="spaceMeta">独立项目空间</span></div></header>
+          <div id="spaceDetail" class="space-detail"></div>
         </section>
 
         <aside id="threadContextPanel" class="thread-context-panel" aria-label="对话来源与输出">
