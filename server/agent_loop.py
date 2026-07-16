@@ -42,11 +42,19 @@ class SingleAgentLoop:
         messages = [{"role": "system", "content": system_prompt}] + self._dependencies.load_messages(thread_id)
         allowed_tool_ids = set(execution_context["allowed_tool_ids"])
         tool_definitions = self._dependencies.tools.callable_definitions(allowed_tool_ids)
+        called_tool_ids: set[str] = set()
 
         for _step in range(execution_context["max_tool_steps"]):
             message = yield from self._run_model(messages, tool_definitions, execution_context)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
+                for tool_id in sorted(allowed_tool_ids - called_tool_ids):
+                    tool = self._dependencies.tools.get(tool_id)
+                    on_event("tool_not_called", {
+                        "tool_id": tool_id,
+                        "tool_name": tool.name if tool else tool_id,
+                        "reason": "自动模式下模型判断当前上下文无需调用",
+                    })
                 content = (message.get("content") or "").strip()
                 if not content:
                     raise RuntimeError("模型返回为空")
@@ -55,6 +63,7 @@ class SingleAgentLoop:
             messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
             for call in tool_calls:
                 result = self._execute_tool_call(call, allowed_tool_ids, on_event)
+                called_tool_ids.add(result["tool_id"])
                 messages.append({
                     "role": "tool",
                     "tool_call_id": result["tool_call_id"],
@@ -115,4 +124,4 @@ class SingleAgentLoop:
                 "error": str(exc),
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
             })
-        return {"tool_call_id": tool_call_id, "content": content}
+        return {"tool_call_id": tool_call_id, "tool_id": tool_id, "content": content}

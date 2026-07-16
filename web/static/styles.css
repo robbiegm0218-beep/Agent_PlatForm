@@ -386,6 +386,30 @@ form button:hover,
 .icon-button { width: 32px; height: 32px; font-size: 20px; line-height: 1; }
 .icon-text-button:disabled { cursor: default; color: var(--muted); background: var(--panel-soft); }
 
+.execution-mode-picker { position: relative; }
+.execution-mode-picker summary { list-style: none; cursor: pointer; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.execution-mode-picker summary::-webkit-details-marker { display: none; }
+.execution-mode-picker summary::after { content: "⌄"; margin-left: 4px; }
+.execution-mode-picker[open] summary::after { content: "⌃"; }
+.execution-mode-menu {
+  position: absolute;
+  z-index: 4;
+  right: 0;
+  bottom: calc(100% + 10px);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(118px, 1fr));
+  gap: 10px;
+  width: 280px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.execution-mode-menu label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+.execution-mode-menu select { min-width: 0; }
+.execution-mode-hint { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
 .run-drawer {
   position: fixed;
   z-index: 3;

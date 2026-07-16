@@ -19,6 +19,18 @@ RUN_TRANSITIONS = {
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
+RUN_PHASE_TRANSITIONS = {
+    "planning": {"retrieving", "generating", "awaiting_confirmation", "failed", "cancelled"},
+    "retrieving": {"generating", "executing_tool", "failed", "cancelled"},
+    "generating": {"executing_tool", "reflecting", "completed", "failed", "cancelled"},
+    "executing_tool": {"generating", "reflecting", "completed", "failed", "cancelled"},
+    "awaiting_confirmation": {"generating", "executing_tool", "cancelled", "failed"},
+    "reflecting": {"completed", "failed", "cancelled"},
+    "completed": set(),
+    "failed": set(),
+    "cancelled": set(),
+}
+
 
 class RunStateError(ValueError):
     """Raised when a run attempts an invalid lifecycle transition."""
@@ -97,3 +109,31 @@ class AgentRuntimeStore:
             (target_status, completed_at, error, run_id),
         )
         return current_status
+
+    def transition_phase(
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        target_phase: str,
+        *,
+        detail: dict | None = None,
+    ) -> str:
+        """Advance the durable execution phase without changing public Run status."""
+        row = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not row:
+            raise RunStateError("运行记录不存在")
+        current_phase = row["run_phase"] or "planning"
+        if target_phase == current_phase:
+            return current_phase
+        if target_phase not in RUN_PHASE_TRANSITIONS.get(current_phase, set()):
+            raise RunStateError(f"运行阶段不能从 {current_phase} 变为 {target_phase}")
+        conn.execute(
+            "UPDATE runs SET run_phase = ?, phase_updated_at = ? WHERE id = ?",
+            (target_phase, self._dependencies.now(), run_id),
+        )
+        self.append_event(conn, run_id, "phase_changed", {
+            "from": current_phase,
+            "to": target_phase,
+            **(detail or {}),
+        })
+        return current_phase

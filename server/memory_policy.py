@@ -64,6 +64,7 @@ def select_memories(
     now_value: int = 0,
 ) -> list[dict]:
     query_terms = _terms(query)
+    memory_inquiry = "记忆" in query.lower() or "memory" in query.lower()
     ranked = []
     for record in records:
         row = dict(record)
@@ -75,10 +76,14 @@ def select_memories(
             continue
         content_terms = _terms(str(row.get("content", "")))
         overlap = len(query_terms & content_terms)
-        preference_prior = 1 if row.get("kind") == "preference" and row.get("scope_type") == "global" else 0
-        if overlap == 0 and not preference_prior:
+        # Preferences and confirmed decisions are durable behavioural context within
+        # their scope. Facts remain relevance-gated to avoid filling each prompt
+        # with unrelated project details. A direct memory inquiry exposes the full
+        # applicable set so the answer can truthfully describe this run.
+        durable_priority = {"decision": 2, "preference": 1}.get(str(row.get("kind", "")), 0)
+        if overlap == 0 and not durable_priority and not memory_inquiry:
             continue
-        ranked.append((overlap, preference_prior, int(row.get("updated_at") or 0), str(row.get("id", "")), row))
+        ranked.append((overlap, durable_priority, int(row.get("updated_at") or 0), str(row.get("id", "")), row))
     ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
     selected = []
     used = 0

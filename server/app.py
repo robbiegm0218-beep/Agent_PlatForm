@@ -166,6 +166,8 @@ SKILL_HISTORY_DIR = ROOT_DIR / "data" / "skill_history"
 SKILL_PACKAGE_DIR = ROOT_DIR / "data" / "skill_packages"
 MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(256 * 1024)))
 MAX_SKILL_RESOURCE_CHARS = int(os.environ.get("MAX_SKILL_RESOURCE_CHARS", "12000"))
+EXECUTION_MODE_VALUES = {"off", "auto", "required"}
+SOURCE_MODE_VALUES = {"general", "local_only", "web_only", "mixed"}
 WEB_SEARCH_CONFIG = WebSearchConfig.from_environment()
 WEB_SEARCH_CLIENT = WebSearchClient(WEB_SEARCH_CONFIG)
 MCP_TOOL_MANAGER = McpToolManager(McpServerConfig.from_environment())
@@ -819,6 +821,24 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL,
                 resolved_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS run_approval_requests (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                step_id TEXT DEFAULT '',
+                request TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision TEXT DEFAULT '',
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                operation_id TEXT DEFAULT '',
+                risk_level TEXT DEFAULT 'local_write',
+                tool_id TEXT DEFAULT '',
+                arguments_json TEXT DEFAULT '{}',
+                effect_summary TEXT DEFAULT '',
+                rollback_summary TEXT DEFAULT '',
+                idempotency_key TEXT DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
@@ -856,6 +876,9 @@ def init_db() -> None:
         ensure_column(conn, "runs", "input_tokens_estimate", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "output_tokens_estimate", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "tool_call_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "runs", "run_phase", "TEXT NOT NULL DEFAULT 'planning'")
+        ensure_column(conn, "runs", "phase_updated_at", "INTEGER DEFAULT 0")
+        ensure_column(conn, "runs", "resume_policy", "TEXT DEFAULT '{}'")
         ensure_column(conn, "run_events", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(conn, "run_events", "sequence", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "sessions", "expires_at", "INTEGER DEFAULT 0")
@@ -866,17 +889,33 @@ def init_db() -> None:
         ensure_column(conn, "run_confirmations", "effect_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "run_confirmations", "rollback_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "run_confirmations", "idempotency_key", "TEXT DEFAULT ''")
+        ensure_column(conn, "run_steps", "input_json", "TEXT DEFAULT '{}'")
+        ensure_column(conn, "run_steps", "output_json", "TEXT DEFAULT '{}'")
+        ensure_column(conn, "run_steps", "idempotency_key", "TEXT DEFAULT ''")
+        ensure_column(conn, "run_steps", "timeout_seconds", "INTEGER DEFAULT 30")
+        ensure_column(conn, "run_steps", "max_retries", "INTEGER DEFAULT 0")
+        ensure_column(conn, "run_steps", "retry_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "run_steps", "resume_policy", "TEXT DEFAULT 'resume_from_contract'")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_sequence ON run_events(run_id, sequence) WHERE sequence > 0"
         )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_confirmation_idempotency ON run_confirmations(idempotency_key) WHERE idempotency_key != ''"
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_request_idempotency ON run_approval_requests(idempotency_key) WHERE idempotency_key != ''"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_request_position ON run_approval_requests(run_id, position)"
+        )
         interrupted_runs = conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()
         for interrupted_run in interrupted_runs:
             run_id = interrupted_run["id"]
             recovery_error = "服务重启前运行未完成，请重试"
             RUNTIME_STORE.transition_run(conn, run_id, "failed", error=recovery_error)
+            phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if phase and phase["run_phase"] not in {"failed", "completed", "cancelled"}:
+                RUNTIME_STORE.transition_phase(conn, run_id, "failed", detail={"reason": "service_restart"})
             conn.execute(
                 "UPDATE run_steps SET status = 'failed', error = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
                 (recovery_error, now(), run_id),
@@ -931,6 +970,27 @@ def allow_request(user_id: str) -> bool:
 
 def infer_task_profile(content: str, requested_model: str = "auto", requested_task_mode: str = "auto") -> dict:
     return TASK_ROUTER.route(content, requested_model, requested_task_mode).as_profile()
+
+
+def resolve_execution_modes(payload: dict) -> dict:
+    """Normalize user-controlled evidence and tool execution boundaries."""
+    modes = {
+        "knowledge": str(payload.get("knowledge_mode", "auto")),
+        "web": str(payload.get("web_mode", "auto")),
+        "file": str(payload.get("file_mode", "auto")),
+        "source": str(payload.get("source_mode", "general")),
+    }
+    if any(modes[key] not in EXECUTION_MODE_VALUES for key in ("knowledge", "web", "file")):
+        raise ValueError("知识库、网络和文件模式必须是 off、auto 或 required")
+    if modes["source"] not in SOURCE_MODE_VALUES:
+        raise ValueError("回答依据模式无效")
+    if modes["source"] == "local_only":
+        modes["knowledge"], modes["web"] = "required", "off"
+    elif modes["source"] == "web_only":
+        modes["knowledge"], modes["web"] = "off", "required"
+    elif modes["source"] == "mixed":
+        modes["knowledge"], modes["web"] = "required", "required"
+    return modes
 
 
 def allowed_tools_for_task(content: str) -> list[dict]:
@@ -992,26 +1052,56 @@ def search_knowledge(user_id: str, query: str, limit: int = 4) -> list[dict]:
 
 
 def build_execution_plan(content: str, active_skills: list[dict], allowed_tools: list[dict]) -> list[dict]:
+    def step(step_id: str, title: str, phase: str, *, requires_confirmation: bool = False, timeout_seconds: int = 30, max_retries: int = 0) -> dict:
+        return {
+            "id": step_id,
+            "title": title,
+            "status": "pending",
+            "phase": phase,
+            "requires_confirmation": requires_confirmation,
+            "timeout_seconds": timeout_seconds,
+            "max_retries": max_retries,
+            "resume_policy": "resume_from_contract",
+        }
     complex_markers = ("计划", "方案", "调研", "分析", "步骤", "并且", "然后", "先")
     is_complex = len(content) >= 48 or any(marker in content for marker in complex_markers)
     if not is_complex:
-        return [{"id": "step_1", "title": "完成回答", "status": "pending"}]
-    steps = [{"id": "step_1", "title": "分析任务目标与约束", "status": "pending"}]
+        return [step("step_1", "完成回答", "generating", timeout_seconds=90, max_retries=1)]
+    steps = [step("step_1", "分析任务目标与约束", "planning")]
     if infer_task_profile(content)["needs_knowledge"]:
-        steps.append({"id": f"step_{len(steps) + 1}", "title": "检索本地资料依据", "status": "pending"})
+        steps.append(step(f"step_{len(steps) + 1}", "检索本地资料依据", "retrieving", timeout_seconds=20, max_retries=1))
     if active_skills:
-        steps.append({"id": "step_2", "title": "应用所选技能", "status": "pending"})
+        steps.append(step(f"step_{len(steps) + 1}", "应用所选技能", "generating", timeout_seconds=60, max_retries=1))
     if allowed_tools:
-        steps.append({"id": f"step_{len(steps) + 1}", "title": "按需检索本地工具信息", "status": "pending"})
-    steps.append({"id": f"step_{len(steps) + 1}", "title": "生成并检查最终回答", "status": "pending"})
+        steps.append(step(f"step_{len(steps) + 1}", "按需检索本地工具信息", "executing_tool", timeout_seconds=30, max_retries=1))
+    steps.append(step(f"step_{len(steps) + 1}", "生成并检查最终回答", "reflecting", timeout_seconds=90, max_retries=1))
     return steps
 
 
-def build_execution_context(user_id: str, task_profile: dict, active_skills: list[dict], requested_skill_ids: list[str] | None, content: str, knowledge_refs: list[dict]) -> dict:
+def build_execution_context(
+    user_id: str, task_profile: dict, active_skills: list[dict], requested_skill_ids: list[str] | None,
+    content: str, knowledge_refs: list[dict], execution_modes: dict | None = None,
+) -> dict:
+    execution_modes = execution_modes or {"knowledge": "auto", "web": "auto", "file": "auto", "source": "general"}
     tool_decision = TOOL_POLICY.decide(content)
     tool_definitions = tool_decision.tools if task_profile["needs_tools"] else []
+    tool_by_id = {tool["id"]: tool for tool in LOCAL_TOOLS.list() if tool["enabled"] and tool["risk"] == "read_only"}
+    if execution_modes["web"] == "off":
+        tool_definitions = [tool for tool in tool_definitions if tool["id"] not in {"web_search", "read_web_page"}]
+    elif execution_modes["web"] == "required" and "web_search" in tool_by_id:
+        tool_definitions = [*tool_definitions, tool_by_id["web_search"]]
+    if execution_modes["file"] == "off":
+        tool_definitions = [tool for tool in tool_definitions if tool["id"] not in {"search_workspace_files", "read_workspace_file"}]
+    elif execution_modes["file"] == "required" and "search_workspace_files" in tool_by_id:
+        tool_definitions = [*tool_definitions, tool_by_id["search_workspace_files"]]
+    tool_definitions = list({tool["id"]: tool for tool in tool_definitions}.values())
     permitted_tool_ids = restrict_tools(active_skills, {tool["id"] for tool in tool_definitions})
     tool_definitions = [tool for tool in tool_definitions if tool["id"] in permitted_tool_ids]
+    required_tool_errors = []
+    if execution_modes["web"] == "required" and "web_search" not in permitted_tool_ids:
+        required_tool_errors.append("网络资料被设为必须使用，但网页检索当前不可用或未被技能授权")
+    if execution_modes["file"] == "required" and "search_workspace_files" not in permitted_tool_ids:
+        required_tool_errors.append("工作区文件被设为必须使用，但文件检索当前不可用或未被技能授权")
     skill_resources = [resource for skill in active_skills for resource in load_skill_resources(skill, content)]
     return {
         "version": 1,
@@ -1036,9 +1126,19 @@ def build_execution_context(user_id: str, task_profile: dict, active_skills: lis
         "input_limit": min([skill["input_limit"] for skill in active_skills] or [MAX_REQUEST_BYTES]),
         "task_preview": content[:160],
         "knowledge_refs": knowledge_refs,
-        "knowledge_route": "retrieved" if knowledge_refs else ("required_no_match" if task_profile["needs_knowledge"] else "not_needed"),
+        "knowledge_route": "retrieved" if knowledge_refs else ("required_no_match" if execution_modes["knowledge"] == "required" or task_profile["needs_knowledge"] else "not_needed"),
         "knowledge_intent": task_profile["knowledge_intent"],
         "knowledge_match_count": len(knowledge_refs),
+        "execution_modes": execution_modes,
+        "required_tool_errors": required_tool_errors,
+        "route_summary": {
+            "knowledge": execution_modes["knowledge"],
+            "web": execution_modes["web"],
+            "file": execution_modes["file"],
+            "source": execution_modes["source"],
+            "knowledge_matches": len(knowledge_refs),
+            "memory_count": 0,
+        },
     }
 
 
@@ -1299,6 +1399,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/runs/") and self.path.endswith("/cancel"):
             self.cancel_run(user)
+            return
+        if self.path == "/api/route-preview":
+            try:
+                self.preview_route(user)
+            except (ValueError, TypeError) as exc:
+                self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
             return
         if self.path == "/api/chat":
             self.chat(user)
@@ -1819,13 +1925,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             steps = conn.execute(
                 "SELECT * FROM run_steps WHERE run_id = ? ORDER BY position ASC", (run_id,)
             ).fetchall()
-            confirmation = conn.execute(
-                "SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            approvals = conn.execute(
+                "SELECT * FROM run_approval_requests WHERE run_id = ? ORDER BY position ASC, created_at ASC", (run_id,)
+            ).fetchall()
+            confirmation = next((item for item in approvals if item["status"] == "pending"), None) or (approvals[-1] if approvals else None)
+            if not confirmation:
+                confirmation = conn.execute("SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)).fetchone()
             artifact = conn.execute(
                 "SELECT * FROM artifacts WHERE run_id = ?", (run_id,)
             ).fetchone()
-        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "artifact": row_to_dict(artifact) if artifact else None})
+        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "confirmations": [row_to_dict(item) for item in approvals], "artifact": row_to_dict(artifact) if artifact else None})
 
     def resolve_confirmation(self, user: dict) -> None:
         run_id = self.path.split("/")[-2]
@@ -1835,7 +1944,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         with db() as conn:
             run = conn.execute("SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
-            confirmation = conn.execute("SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)).fetchone()
+            approvals = conn.execute("SELECT * FROM run_approval_requests WHERE run_id = ? ORDER BY position ASC", (run_id,)).fetchall()
+            confirmation = next((item for item in approvals if item["status"] == "pending"), None) or (approvals[-1] if approvals else None)
+            legacy_confirmation = conn.execute("SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)).fetchone()
+            confirmation = confirmation or legacy_confirmation
             if not run or not confirmation:
                 self.send_error_json("待确认运行不存在", HTTPStatus.NOT_FOUND)
                 return
@@ -1843,9 +1955,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("该运行已处理", HTTPStatus.CONFLICT)
                 return
             status = "approved" if approved else "rejected"
-            conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ?", (status, "用户批准" if approved else "用户拒绝", now(), run_id))
+            if "id" in confirmation.keys():
+                conn.execute("UPDATE run_approval_requests SET status = ?, decision = ?, resolved_at = ? WHERE id = ?", (status, "用户批准" if approved else "用户拒绝", now(), confirmation["id"]))
+            else:
+                conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ?", (status, "用户批准" if approved else "用户拒绝", now(), run_id))
             if not approved:
                 RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
+                RUNTIME_STORE.transition_phase(conn, run_id, "cancelled", detail={"reason": "confirmation_rejected"})
                 conn.execute(
                     "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'",
                     ("cancelled", now(), run_id),
@@ -1855,6 +1971,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "approved": False, "run_id": run_id})
             return
 
+        with db() as conn:
+            next_approval = conn.execute("SELECT * FROM run_approval_requests WHERE run_id = ? AND status = 'pending' ORDER BY position ASC LIMIT 1", (run_id,)).fetchone()
+        if next_approval:
+            with db() as conn:
+                append_run_event(conn, run_id, "confirmation_requested", {"position": next_approval["position"], "tool_id": next_approval["tool_id"]})
+            self.send_json({"ok": True, "approved": True, "run_id": run_id, "next_confirmation": row_to_dict(next_approval)})
+            return
         try:
             result = complete_confirmed_artifact_run(run_id, user["id"])
         except Exception as exc:
@@ -1881,11 +2004,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("文件产物正在执行，无法安全中断", HTTPStatus.CONFLICT)
                 return
             if run["status"] == "awaiting_confirmation":
-                conn.execute(
-                    "UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'",
-                    ("cancelled", "用户取消", now(), run_id),
-                )
+                conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'", ("cancelled", "用户取消", now(), run_id))
+                conn.execute("UPDATE run_approval_requests SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'", ("cancelled", "用户取消", now(), run_id))
             RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
+            phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if phase and phase["run_phase"] not in {"cancelled", "completed", "failed"}:
+                RUNTIME_STORE.transition_phase(conn, run_id, "cancelled", detail={"reason": "user_cancelled"})
             conn.execute(
                 "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running', 'awaiting_confirmation')",
                 ("cancelled", now(), run_id),
@@ -1898,7 +2022,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             rows = conn.execute(
                 """
                 SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.user_id = ? AND runs.status = 'completed'
+                WHERE threads.user_id = ?
                 ORDER BY runs.started_at DESC LIMIT 200
                 """,
                 (user["id"],),
@@ -1912,23 +2036,31 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (user["id"],),
             ).fetchall()
             confirmations = conn.execute(
-                """SELECT run_confirmations.status FROM run_confirmations
-                   JOIN runs ON runs.id = run_confirmations.run_id
-                   JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ?""",
-                (user["id"],),
+                """SELECT run_confirmations.status AS status FROM run_confirmations JOIN runs ON runs.id = run_confirmations.run_id JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ?
+                   UNION ALL
+                   SELECT run_approval_requests.status AS status FROM run_approval_requests JOIN runs ON runs.id = run_approval_requests.run_id JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ?""",
+                (user["id"], user["id"]),
             ).fetchall()
         buckets: dict[str, dict] = {}
+        routes: dict[str, int] = {}
+        knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0}
         for row in rows:
             run = row_to_dict(row)
             context = json.loads(run["execution_context"] or "{}")
             tier = context.get("task_tier", "standard")
-            bucket = buckets.setdefault(tier, {"runs": 0, "input_tokens_estimate": 0, "output_tokens_estimate": 0, "tool_call_count": 0, "average_seconds": 0.0})
+            bucket = buckets.setdefault(tier, {"runs": 0, "completed": 0, "failed": 0, "cancelled": 0, "input_tokens_estimate": 0, "output_tokens_estimate": 0, "tool_call_count": 0, "average_seconds": 0.0})
             bucket["runs"] += 1
+            bucket[run["status"]] = bucket.get(run["status"], 0) + 1
             bucket["input_tokens_estimate"] += run.get("input_tokens_estimate", 0)
             bucket["output_tokens_estimate"] += run.get("output_tokens_estimate", 0)
             bucket["tool_call_count"] += run.get("tool_call_count", 0)
             if run["completed_at"]:
                 bucket["average_seconds"] += max(0, (run["completed_at"] - run["started_at"]) / 1_000_000_000)
+            route = context.get("model_route", "unknown")
+            routes[route] = routes.get(route, 0) + 1
+            knowledge["runs"] += 1
+            if context.get("knowledge_match_count", 0): knowledge["with_matches"] += 1
+            if context.get("knowledge_route") == "required_no_match": knowledge["required_no_match"] += 1
         for bucket in buckets.values():
             bucket["average_seconds"] = round(bucket["average_seconds"] / bucket["runs"], 2)
         successes = sum(event["type"] == "tool_result" for event in tool_events)
@@ -1948,7 +2080,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             "confirmations": len(confirmations),
             "confirmation_rejection_rate": round(rejected / len(resolved_confirmations), 4) if resolved_confirmations else 0.0,
         }
-        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics})
+        for bucket in buckets.values():
+            bucket["completion_rate"] = round(bucket["completed"] / bucket["runs"], 4) if bucket["runs"] else 0.0
+        knowledge["match_rate"] = round(knowledge["with_matches"] / knowledge["runs"], 4) if knowledge["runs"] else 0.0
+        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge})
 
     def list_knowledge(self, user: dict) -> None:
         with db() as conn:
@@ -2223,6 +2358,41 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             conn.execute("DELETE FROM thread_selected_skills WHERE skill_id = ?", (skill_id,))
         self.send_json({"ok": True})
 
+    def preview_route(self, user: dict) -> None:
+        """Return the bounded chat routing decision without creating a Run."""
+        payload = self.read_json()
+        content = str(payload.get("content", "")).strip()
+        if not content:
+            self.send_json({"summary": "输入任务后显示本轮自动判断", "ready": False})
+            return
+        requested_model = str(payload.get("model", "auto"))
+        requested_task_mode = str(payload.get("task_mode", "auto"))
+        if requested_model not in {"auto", *MODEL_CATALOG} or requested_task_mode not in {"auto", "quick", "standard", "deep"}:
+            raise ValueError("模型或任务档位无效")
+        modes = resolve_execution_modes(payload)
+        task_profile = infer_task_profile(content, requested_model, requested_task_mode)
+        thread_id = str(payload.get("thread_id", ""))
+        requested_skill_ids = payload.get("skill_ids")
+        if requested_skill_ids is not None and (
+            not isinstance(requested_skill_ids, list) or not all(isinstance(skill_id, str) for skill_id in requested_skill_ids)
+        ):
+            raise ValueError("技能参数无效")
+        active_skills = enabled_skills(user["id"], thread_id, requested_skill_ids=requested_skill_ids)
+        needs_knowledge = modes["knowledge"] == "required" or (modes["knowledge"] == "auto" and task_profile["needs_knowledge"])
+        knowledge_refs = search_knowledge(user["id"], content) if needs_knowledge else []
+        context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, modes)
+        self.send_json({
+            "ready": True,
+            "task_tier": context["task_tier"],
+            "model": context["model"],
+            "modes": modes,
+            "knowledge_matches": len(knowledge_refs),
+            "allowed_tools": [{"id": tool["id"], "name": tool["name"]} for tool in context["tools"]],
+            "tool_reason": context["tool_route_reason"],
+            "memory_count": 0,
+            "required_errors": context["required_tool_errors"],
+        })
+
     def chat(self, user: dict) -> None:
         if not allow_request(user["id"]):
             self.send_error_json("请求过于频繁，请稍后再试", HTTPStatus.TOO_MANY_REQUESTS)
@@ -2248,6 +2418,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             not isinstance(requested_skill_ids, list) or not all(isinstance(skill_id, str) for skill_id in requested_skill_ids)
         ):
             self.send_error_json("技能参数无效")
+            return
+        try:
+            execution_modes = resolve_execution_modes(payload)
+        except ValueError as exc:
+            self.send_error_json(str(exc))
             return
         task_profile = infer_task_profile(content, requested_model, requested_task_mode)
         requested_active_skills = None
@@ -2327,11 +2502,17 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
             structured_context = refresh_structured_context(conn, thread_id)
             active_skills = requested_active_skills if requested_active_skills is not None else enabled_skills(user["id"], thread_id)
-            knowledge_refs = search_knowledge(user["id"], content) if task_profile["needs_knowledge"] else []
+            needs_knowledge = execution_modes["knowledge"] == "required" or (
+                execution_modes["knowledge"] == "auto" and task_profile["needs_knowledge"]
+            )
+            knowledge_refs = search_knowledge(user["id"], content) if needs_knowledge else []
             memories = load_relevant_memories(conn, user["id"], thread_id, content)
-            execution_context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs)
+            execution_context = build_execution_context(
+                user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes,
+            )
             execution_context["structured_context"] = STRUCTURED_CONTEXT.select(structured_context, content)
             execution_context["memories"] = memories
+            execution_context["route_summary"]["memory_count"] = len(memories)
             if handoff_from:
                 execution_context["handoff"] = {
                     "from_thread_id": handoff_from,
@@ -2346,6 +2527,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 execution_context["artifact_request"] = {"kind": artifact_kind, "target": "本地受控产物目录"}
             actual_model = execution_context["model"]
             execution_plan = build_execution_plan(content, active_skills, execution_context["tools"])
+            if artifact_kind:
+                execution_plan[0]["requires_confirmation"] = True
+                execution_plan[0]["phase"] = "awaiting_confirmation"
             run_id = new_id("run")
             conn.execute(
                 """
@@ -2374,6 +2558,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "tool_ids": execution_context["allowed_tool_ids"],
                 "tool_route_confidence": execution_context["tool_route_confidence"],
                 "tool_route_reason": execution_context["tool_route_reason"],
+                "execution_modes": execution_context["execution_modes"],
+                "knowledge_matches": len(knowledge_refs),
+                "memory_count": len(memories),
             })
             append_run_event(conn, run_id, "skill_routed", {
                 "route": execution_context["skill_route"],
@@ -2389,23 +2576,37 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             append_run_event(conn, run_id, "plan_created", {"steps": execution_plan})
             conn.executemany(
                 """
-                INSERT INTO run_steps (id, run_id, position, title, status, requires_confirmation, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO run_steps
+                    (id, run_id, position, title, status, requires_confirmation, input_json, output_json,
+                     idempotency_key, timeout_seconds, max_retries, retry_count, resume_policy, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 [
-                    (new_id("step"), run_id, index, step["title"], "awaiting_confirmation" if artifact_kind and index == 1 else "pending", 1 if artifact_kind and index == 1 else 0, now())
+                    (
+                        new_id("step"), run_id, index, step["title"],
+                        "awaiting_confirmation" if artifact_kind and index == 1 else "pending",
+                        1 if step.get("requires_confirmation") else 0,
+                        json.dumps({"task_preview": content[:160], "phase": step.get("phase", "generating")}, ensure_ascii=False),
+                        "{}",
+                        f"{run_id}:{step['id']}",
+                        step.get("timeout_seconds", 30),
+                        step.get("max_retries", 0),
+                        step.get("resume_policy", "resume_from_contract"),
+                        now(),
+                    )
                     for index, step in enumerate(execution_plan, start=1)
                 ],
             )
             if artifact_kind:
                 RUNTIME_STORE.transition_run(conn, run_id, "awaiting_confirmation")
+                RUNTIME_STORE.transition_phase(conn, run_id, "awaiting_confirmation", detail={"step": "confirmation"})
                 request = artifact_confirmation_text(artifact_kind)
                 conn.execute(
-                    """INSERT INTO run_confirmations
-                       (run_id, request, status, created_at, operation_id, risk_level, tool_id, arguments_json, effect_summary, rollback_summary, idempotency_key)
-                       VALUES (?, ?, ?, ?, ?, 'local_write', 'create_artifact', ?, ?, ?, ?)""",
+                    """INSERT INTO run_approval_requests
+                       (id, run_id, position, step_id, request, status, created_at, operation_id, risk_level, tool_id, arguments_json, effect_summary, rollback_summary, idempotency_key)
+                       VALUES (?, ?, 1, 'step_1', ?, ?, ?, ?, 'local_write', 'create_artifact', ?, ?, ?, ?)""",
                     (
-                        run_id, request, "pending", now(), f"operation_{run_id}",
+                        new_id("approval"), run_id, request, "pending", now(), f"operation_{run_id}",
                         json.dumps({"kind": artifact_kind}, ensure_ascii=False),
                         f"在本机受控产物目录创建一个 {artifact_kind} 文件",
                         "可在产物列表中删除该文件；删除不会影响原始对话和运行记录",
@@ -2420,6 +2621,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "rollback_summary": "可在产物列表中删除该文件；删除不会影响原始对话和运行记录",
                     "idempotency_key": f"artifact:{run_id}:{artifact_kind}",
                 })
+            elif knowledge_refs or execution_context["knowledge_route"] == "required_no_match":
+                RUNTIME_STORE.transition_phase(conn, run_id, "retrieving", detail={"knowledge_matches": len(knowledge_refs)})
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2450,6 +2653,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "model": actual_model,
                     "task_tier": execution_context["task_tier"],
                 })
+                current = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if current and current["run_phase"] in {"planning", "retrieving"}:
+                    RUNTIME_STORE.transition_phase(conn, run_id, "generating", detail={"source": "model_request"})
                 conn.execute(
                     "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND position = 1",
                     ("running", now(), run_id),
@@ -2457,6 +2663,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             def emit_runtime_event(event_type: str, payload: dict) -> None:
                 ensure_run_active(run_id)
                 with db() as event_conn:
+                    phase = event_conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+                    current_phase = phase["run_phase"] if phase else ""
+                    if event_type == "tool_call" and current_phase in {"planning", "retrieving", "generating"}:
+                        RUNTIME_STORE.transition_phase(event_conn, run_id, "executing_tool", detail={"tool_id": payload.get("tool_id", "")})
+                    elif event_type == "reflection_started" and current_phase in {"generating", "executing_tool"}:
+                        RUNTIME_STORE.transition_phase(event_conn, run_id, "reflecting")
                     append_run_event(event_conn, run_id, event_type, payload)
                 self.write_event("status", {"summary": event_summary(event_type, payload)})
 
@@ -2480,13 +2692,17 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
                 refresh_structured_context(conn, thread_id)
                 RUNTIME_STORE.transition_run(conn, run_id, "completed")
+                phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
+                    RUNTIME_STORE.transition_phase(conn, run_id, "completed")
                 conn.execute(
                     """
                     UPDATE runs
-                    SET reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ?
+                    SET execution_context = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ?
                     WHERE id = ?
                     """,
                     (
+                        json.dumps(execution_context, ensure_ascii=False),
                         json.dumps(reflection, ensure_ascii=False),
                         estimate_tokens(content),
                         estimate_tokens(answer),
@@ -2496,8 +2712,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
                 conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now(), thread_id))
                 conn.execute(
-                    "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
-                    ("completed", now(), run_id),
+                    "UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
+                    ("completed", json.dumps({"answer_chars": len(answer), "status": "completed"}), now(), run_id),
                 )
                 append_run_event(conn, run_id, "completed", {"length": len(answer)})
             self.write_event("done", {"content": answer})
@@ -2512,10 +2728,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     self.write_event("cancelled", {"run_id": run_id})
                     return
                 RUNTIME_STORE.transition_run(conn, run_id, "failed", error=str(exc))
+                phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
+                    RUNTIME_STORE.transition_phase(conn, run_id, "failed", detail={"reason": "runtime_error"})
                 append_run_event(conn, run_id, "failed", {"error": str(exc)})
                 conn.execute(
-                    "UPDATE run_steps SET status = ?, error = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
-                    ("failed", str(exc), now(), run_id),
+                    "UPDATE run_steps SET status = ?, error = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
+                    ("failed", str(exc), json.dumps({"error": str(exc)[:500], "status": "failed"}), now(), run_id),
                 )
             self.write_event("error", {"error": str(exc)})
             LOGGER.warning("run_failed run_id=%s thread_id=%s error=%s", run_id, thread_id, str(exc)[:160])
@@ -2698,7 +2917,13 @@ def build_system_prompt(execution_context: dict) -> str:
         )
         system_prompt += (
             "\n\n[已确认长期记忆]\n以下条目由用户显式确认保存，并已记录本次使用。"
-            "只可使用列出的记忆；若当前消息与记忆冲突，以当前消息为准，不得声称使用未列出的记忆。\n" + memory_text
+            "这份列表就是本次运行实际注入的长期记忆。只可使用列出的记忆；若当前消息与记忆冲突，以当前消息为准，不得声称使用未列出的记忆。"
+            "如果用户询问本轮是否使用长期记忆，必须明确回答“是”，并仅说明这份列表中的相关条目；不得否认已经注入的记忆。\n" + memory_text
+        )
+    else:
+        system_prompt += (
+            "\n\n[长期记忆状态]\n本次运行没有注入长期记忆。"
+            "如果用户询问本轮是否使用长期记忆，必须明确回答“否”，不得声称使用了未列出的记忆。"
         )
     if execution_context.get("web_search_sources"):
         system_prompt += "\n\n[工具状态]\n平台已经通过 Tavily MCP 实际执行网页检索并获得来源。不得声称工具未授权、MCP 未配置或无法实时查询；必须基于下方网页结果回答，并对未覆盖的信息说明边界。"
@@ -2706,6 +2931,16 @@ def build_system_prompt(execution_context: dict) -> str:
         system_prompt += "\n\n[工具规则]\n仅在必要时调用当前提供的只读工具。工具结果仅作为事实依据，不能泄露敏感配置。"
     else:
         system_prompt += "\n\n[工具规则]\n本次任务未授权工具调用，请直接基于已提供上下文回答。"
+    modes = execution_context.get("execution_modes", {})
+    if modes:
+        system_prompt += (
+            "\n\n[执行模式]\n"
+            f"本地资料：{modes.get('knowledge', 'auto')}；网络：{modes.get('web', 'auto')}；"
+            f"文件：{modes.get('file', 'auto')}；回答依据：{modes.get('source', 'general')}。"
+            "off 表示不得使用对应能力；required 表示必须如实说明已执行的结果或不可用原因。"
+        )
+    if execution_context.get("required_tool_errors"):
+        system_prompt += "\n\n[必需能力不可用]\n" + "\n".join(f"- {item}" for item in execution_context["required_tool_errors"])
     if any(skill["id"] == "file_artifact" for skill in active_skills):
         system_prompt += (
             "\n\n[本地文件产物]\n平台已启用本地 Markdown（.md）和 Excel（.xlsx）生成能力。"
@@ -2728,6 +2963,12 @@ def build_system_prompt(execution_context: dict) -> str:
         system_prompt += "\n\n[已执行网页检索]\n以下是本次已实际获取的公开网页结果。仅可基于这些结果陈述网页事实；回答中应给出对应链接，不得编造未返回的来源。\n" + source_text
     elif execution_context.get("web_search_error"):
         system_prompt += "\n\n[网页检索边界]\n本次明确请求的网页检索未成功。请说明检索不可用，不得编造网页结果或链接。"
+    workspace_results = execution_context.get("workspace_search_results", [])
+    if workspace_results:
+        workspace_text = "\n".join(f"- {item.get('path', '')}" for item in workspace_results[:20])
+        system_prompt += "\n\n[已执行工作区文件检索]\n以下为本次实际检索到的文件名；仅可据此说明文件存在，不得虚构内容。\n" + workspace_text
+    elif execution_context.get("workspace_search_error"):
+        system_prompt += "\n\n[工作区文件检索边界]\n本次要求使用文件检索但执行失败。请说明不可用原因，不得编造文件结果。"
     return system_prompt
 
 
@@ -2854,11 +3095,18 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         if kind not in {"markdown", "xlsx"}:
             raise ValueError("该运行没有可执行的文件产物请求")
         RUNTIME_STORE.transition_run(conn, run_id, "running")
+        RUNTIME_STORE.transition_phase(conn, run_id, "generating", detail={"source": "confirmation_approved"})
         conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'", ("running", now(), run_id))
         append_run_event(conn, run_id, "model_request", {"model": run["model"]})
 
     def emit_runtime_event(event_type: str, payload: dict) -> None:
         with db() as event_conn:
+            phase = event_conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+            current_phase = phase["run_phase"] if phase else ""
+            if event_type == "tool_call" and current_phase == "generating":
+                RUNTIME_STORE.transition_phase(event_conn, run_id, "executing_tool", detail={"tool_id": payload.get("tool_id", "")})
+            elif event_type == "reflection_started" and current_phase in {"generating", "executing_tool"}:
+                RUNTIME_STORE.transition_phase(event_conn, run_id, "reflecting")
             append_run_event(event_conn, run_id, event_type, payload)
 
     try:
@@ -2871,15 +3119,27 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
             conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], "assistant", answer, now()))
             refresh_structured_context(conn, run["thread_id"])
             RUNTIME_STORE.transition_run(conn, run_id, "completed")
+            phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
+                RUNTIME_STORE.transition_phase(conn, run_id, "completed")
             conn.execute("UPDATE runs SET reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ? WHERE id = ?", (json.dumps(reflection, ensure_ascii=False), estimate_tokens(source_content), estimate_tokens(answer), conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"], run_id))
             conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now(), run["thread_id"]))
-            conn.execute("UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')", ("completed", now(), run_id))
+            conn.execute(
+                "UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
+                ("completed", json.dumps({"answer_chars": len(answer), "status": "completed"}), now(), run_id),
+            )
             append_run_event(conn, run_id, "completed", {"length": len(answer)})
         return {"content": answer, "artifact": artifact}
     except Exception as exc:
         with db() as conn:
             RUNTIME_STORE.transition_run(conn, run_id, "failed", error=str(exc))
-            conn.execute("UPDATE run_steps SET status = ?, error = ?, updated_at = ? WHERE run_id = ? AND status = 'running'", ("failed", str(exc), now(), run_id))
+            phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
+                RUNTIME_STORE.transition_phase(conn, run_id, "failed", detail={"reason": "confirmation_resume_error"})
+            conn.execute(
+                "UPDATE run_steps SET status = ?, error = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
+                ("failed", str(exc), json.dumps({"error": str(exc)[:500], "status": "failed"}), now(), run_id),
+            )
             append_run_event(conn, run_id, "failed", {"error": str(exc)})
         raise
 
@@ -2932,6 +3192,50 @@ def execute_authorized_web_search(user_content: str, execution_context: dict, on
         })
 
 
+def execute_required_workspace_search(user_content: str, execution_context: dict, on_event) -> None:
+    """Execute the bounded filename lookup when the user made file use mandatory."""
+    if execution_context.get("execution_modes", {}).get("file") != "required":
+        return
+    if "search_workspace_files" not in execution_context["allowed_tool_ids"]:
+        return
+    tool = LOCAL_TOOLS.get("search_workspace_files")
+    if not tool:
+        return
+    tool_call_id = new_id("toolcall")
+    started = time.monotonic()
+    arguments = {"query": user_content[:300], "limit": 8}
+    on_event("tool_call", {
+        "tool_call_id": tool_call_id,
+        "tool_id": "search_workspace_files",
+        "tool_name": tool.name,
+        "arguments": arguments,
+    })
+    try:
+        result = LOCAL_TOOLS.execute("search_workspace_files", arguments, {"search_workspace_files"})
+        execution_context["workspace_search_results"] = result.get("matches", []) if isinstance(result, dict) else []
+        on_event("tool_result", {
+            "tool_call_id": tool_call_id,
+            "tool_id": "search_workspace_files",
+            "tool_name": tool.name,
+            "summary": f"已检索到 {len(execution_context['workspace_search_results'])} 个工作区文件",
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        })
+    except (ValueError, TypeError) as exc:
+        execution_context["workspace_search_error"] = str(exc)
+        on_event("tool_error", {
+            "tool_call_id": tool_call_id,
+            "tool_id": "search_workspace_files",
+            "tool_name": tool.name,
+            "error": str(exc),
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        })
+    finally:
+        execution_context["allowed_tool_ids"] = [
+            tool_id for tool_id in execution_context["allowed_tool_ids"] if tool_id != "search_workspace_files"
+        ]
+        execution_context["tools"] = [tool for tool in execution_context["tools"] if tool["id"] != "search_workspace_files"]
+
+
 def stream_answer(thread_id: str, user_content: str, execution_context: dict, on_event) -> object:
 
     if is_skill_inventory_question(user_content):
@@ -2943,8 +3247,9 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
         yield from chunk_text(answer, 10)
         return
 
+    execute_authorized_web_search(user_content, execution_context, on_event)
+    execute_required_workspace_search(user_content, execution_context, on_event)
     if model_is_configured(execution_context["model"]):
-        execute_authorized_web_search(user_content, execution_context, on_event)
         system_prompt = build_system_prompt(execution_context)
         yield from run_deepseek_agent(thread_id, system_prompt, execution_context, on_event)
         return

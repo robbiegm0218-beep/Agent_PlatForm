@@ -21,9 +21,22 @@ class MemoryPolicyTests(unittest.TestCase):
             {"id": "b", "kind": "project_fact", "content": "星河项目使用SQLite", "scope_type": "project", "scope_id": "p1", "status": "active", "updated_at": 2},
             {"id": "c", "kind": "decision", "content": "星河项目使用Postgres", "scope_type": "project", "scope_id": "p2", "status": "active", "updated_at": 4},
             {"id": "d", "kind": "decision", "content": "星河项目停止开发", "scope_type": "global", "scope_id": "", "status": "disabled", "updated_at": 5},
+            {"id": "e", "kind": "decision", "content": "回答时适度使用二次元用语", "scope_type": "project", "scope_id": "p1", "status": "active", "updated_at": 6},
         ]
         selected = select_memories(rows, "星河项目数据库", "p1")
-        self.assertEqual([item["id"] for item in selected], ["b", "a"])
+        self.assertEqual([item["id"] for item in selected], ["b", "e", "a"])
+
+    def test_scoped_decision_persists_without_lexical_overlap_and_memory_inquiry_is_auditable(self):
+        rows = [
+            {"id": "decision", "kind": "decision", "content": "对话中适度使用二次元用语", "scope_type": "project", "scope_id": "p1", "status": "active", "updated_at": 2},
+            {"id": "fact", "kind": "project_fact", "content": "项目使用 SQLite", "scope_type": "project", "scope_id": "p1", "status": "active", "updated_at": 1},
+        ]
+        self.assertEqual(
+            [item["id"] for item in select_memories(rows, "吃饭了吗", "p1")], ["decision"],
+        )
+        self.assertEqual(
+            [item["id"] for item in select_memories(rows, "本轮使用长期记忆了吗", "p1")], ["decision", "fact"],
+        )
 
 
 if __name__ == "__main__":

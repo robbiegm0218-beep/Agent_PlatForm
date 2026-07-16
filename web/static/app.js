@@ -49,6 +49,11 @@ const els = {
   chatInput: document.querySelector("#chatInput"),
   taskModeSelect: document.querySelector("#taskModeSelect"),
   modelSelect: document.querySelector("#modelSelect"),
+  sourceModeSelect: document.querySelector("#sourceModeSelect"),
+  knowledgeModeSelect: document.querySelector("#knowledgeModeSelect"),
+  webModeSelect: document.querySelector("#webModeSelect"),
+  fileModeSelect: document.querySelector("#fileModeSelect"),
+  executionModeHint: document.querySelector("#executionModeHint"),
   skillPickerButton: document.querySelector("#skillPickerButton"),
   skillPickerMenu: document.querySelector("#skillPickerMenu"),
   sendButton: document.querySelector("#sendButton"),
@@ -924,7 +929,11 @@ async function loadRunDetail(runId) {
   const reflectionText = reflection.applied
     ? `${reflection.summary || "已完成"}${reflection.revision_count ? `，已修订 ${reflection.revision_count} 次` : ""}`
     : "未触发";
-  els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具判断：${toolRoute}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${run.error ? `\n错误：${run.error}` : ""}`;
+  const modes = context.execution_modes || {};
+  const routeSummary = context.route_summary || {};
+  const modesText = `资料：${modes.source || "general"}｜知识库：${modes.knowledge || "auto"}（${routeSummary.knowledge_matches ?? context.knowledge_match_count ?? 0} 条）｜网络：${modes.web || "auto"}｜文件：${modes.file || "auto"}｜记忆：${routeSummary.memory_count ?? context.memories?.length ?? 0} 条`;
+  const requiredErrors = context.required_tool_errors?.length ? `\n必需能力：${context.required_tool_errors.join("；")}` : "";
+  els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n执行方式：${modesText}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n执行阶段：${run.run_phase || "未记录"}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具判断：${toolRoute}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${requiredErrors}${run.error ? `\n错误：${run.error}` : ""}`;
 
   if (artifact) {
     const artifactBlock = document.createElement("div");
@@ -1357,6 +1366,10 @@ async function sendMessage(content, { retry = false } = {}) {
       retry,
       model: els.modelSelect.value,
       task_mode: els.taskModeSelect.value,
+      source_mode: els.sourceModeSelect.value,
+      knowledge_mode: els.knowledgeModeSelect.value,
+      web_mode: els.webModeSelect.value,
+      file_mode: els.fileModeSelect.value,
     };
     if (!state.currentThreadId && state.pendingFolderId) chatPayload.folder_id = state.pendingFolderId;
     if (state.selectedSkillIds.length) chatPayload.skill_ids = state.selectedSkillIds;
@@ -1574,6 +1587,67 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function syncEvidenceModeControls() {
+  const source = els.sourceModeSelect.value;
+  const overrides = {
+    local_only: { knowledge: "required", web: "off" },
+    web_only: { knowledge: "off", web: "required" },
+    mixed: { knowledge: "required", web: "required" },
+  };
+  const override = overrides[source];
+  if (override) {
+    els.knowledgeModeSelect.value = override.knowledge;
+    els.webModeSelect.value = override.web;
+  }
+  els.knowledgeModeSelect.disabled = Boolean(override);
+  els.webModeSelect.disabled = Boolean(override);
+}
+
+let routePreviewTimer;
+let routePreviewSequence = 0;
+
+function renderExecutionModeHint() {
+  syncEvidenceModeControls();
+  const labels = { off: "关闭", auto: "自动", required: "必须" };
+  const sourceLabels = { general: "通用", local_only: "仅本地资料", web_only: "仅联网资料", mixed: "混合资料" };
+  els.executionModeHint.textContent = `本轮策略：${sourceLabels[els.sourceModeSelect.value]}｜知识库${labels[els.knowledgeModeSelect.value]}｜网络${labels[els.webModeSelect.value]}｜文件${labels[els.fileModeSelect.value]}`;
+}
+
+function scheduleRoutePreview() {
+  window.clearTimeout(routePreviewTimer);
+  syncEvidenceModeControls();
+  const content = getChatContent();
+  if (!content || !state.token) {
+    renderExecutionModeHint();
+    return;
+  }
+  const sequence = ++routePreviewSequence;
+  routePreviewTimer = window.setTimeout(async () => {
+    try {
+      const preview = await api("/api/route-preview", {
+        method: "POST",
+        body: JSON.stringify({
+          content,
+          thread_id: state.currentThreadId,
+          model: els.modelSelect.value,
+          task_mode: els.taskModeSelect.value,
+          source_mode: els.sourceModeSelect.value,
+          knowledge_mode: els.knowledgeModeSelect.value,
+          web_mode: els.webModeSelect.value,
+          file_mode: els.fileModeSelect.value,
+          skill_ids: state.selectedSkillIds.length ? state.selectedSkillIds : undefined,
+        }),
+      });
+      if (sequence !== routePreviewSequence || !preview.ready) return;
+      const tools = preview.allowed_tools?.map((tool) => tool.name).join("、") || "无工具";
+      const errors = preview.required_errors?.length ? `；${preview.required_errors.join("；")}` : "";
+      els.executionModeHint.textContent = `自动判断：${preview.task_tier} · 本地资料 ${preview.knowledge_matches} 条 · ${tools}${errors}`;
+    } catch (_error) {
+      if (sequence === routePreviewSequence) renderExecutionModeHint();
+    }
+  }, 260);
+}
+
 els.loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.loginError.textContent = "";
@@ -1613,8 +1687,13 @@ els.chatForm.addEventListener("submit", async (event) => {
   }
 });
 
+[els.sourceModeSelect, els.knowledgeModeSelect, els.webModeSelect, els.fileModeSelect]
+  .forEach((select) => select.addEventListener("change", scheduleRoutePreview));
+
+renderExecutionModeHint();
+
 els.chatInput.addEventListener("input", () => {
-  // The contenteditable surface grows within its bounded height.
+  scheduleRoutePreview();
 });
 
 els.chatInput.addEventListener("keydown", (event) => {

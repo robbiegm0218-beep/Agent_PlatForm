@@ -365,9 +365,14 @@ class AgentPlatformApiTests(unittest.TestCase):
             list(range(1, len(run_detail["events"]) + 1)),
         )
         self.assertTrue(all(event["schema_version"] == 1 for event in run_detail["events"]))
+        event_types = [event["type"] for event in run_detail["events"]]
         self.assertEqual(
-            [event["type"] for event in run_detail["events"]],
+            [event_type for event_type in event_types if event_type != "phase_changed"],
             ["started", "execution_context", "skill_routed", "knowledge_not_needed", "plan_created", "model_request", "completed"],
+        )
+        self.assertEqual(
+            [json.loads(event["payload"])["to"] for event in run_detail["events"] if event["type"] == "phase_changed"],
+            ["generating", "completed"],
         )
         self.assertIn("general_assistant", [skill["id"] for skill in json.loads(run_detail["run"]["skill_snapshot"])])
         self.assertIn("file_artifact", [skill["id"] for skill in json.loads(run_detail["run"]["skill_snapshot"])])
@@ -406,15 +411,25 @@ class AgentPlatformApiTests(unittest.TestCase):
             run_id = meta["run_id"]
             detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
             self.assertEqual(detail["run"]["status"], "awaiting_confirmation")
+            self.assertEqual(detail["run"]["run_phase"], "awaiting_confirmation")
             self.assertTrue(detail["steps"][0]["requires_confirmation"])
             self.assertEqual(detail["steps"][0]["status"], "awaiting_confirmation")
+            self.assertTrue(detail["steps"][0]["idempotency_key"])
+            self.assertEqual(detail["steps"][0]["resume_policy"], "resume_from_contract")
+            self.assertIn("task_preview", json.loads(detail["steps"][0]["input_json"]))
             self.assertEqual(detail["confirmation"]["risk_level"], "local_write")
             self.assertEqual(detail["confirmation"]["tool_id"], "create_artifact")
+            self.assertEqual(len(detail["confirmations"]), 1)
+            self.assertEqual(detail["confirmations"][0]["position"], 1)
             self.assertIn("删除该文件", detail["confirmation"]["rollback_summary"])
             self.assertEqual(detail["confirmation"]["idempotency_key"], f"artifact:{run_id}:markdown")
 
             result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30)
             self.assertTrue(result["approved"])
+            resumed = self.request_json(f"/api/runs/{run_id}", token=self.token)
+            self.assertEqual(resumed["run"]["run_phase"], "completed")
+            self.assertTrue(any(event["type"] == "phase_changed" for event in resumed["events"]))
+            self.assertEqual(json.loads(resumed["steps"][0]["output_json"])["status"], "completed")
             self.assertEqual(result["artifact"]["kind"], "markdown")
             artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
             self.assertEqual(artifacts[0]["id"], result["artifact"]["id"])
@@ -558,6 +573,45 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("confirmation_rejection_rate", metrics["tools"])
         self.assertGreaterEqual(metrics["tools"]["average_duration_ms"], 0)
 
+    def test_execution_modes_are_frozen_and_constrain_knowledge_and_file_tools(self):
+        off_events = self.chat({
+            "thread_id": "", "content": "请根据本地资料说明产品指标", "knowledge_mode": "off", "file_mode": "off",
+        })
+        off_thread_id = next(event["data"]["thread_id"] for event in off_events if event["event"] == "meta")
+        off_run = self.request_json(f"/api/threads/{off_thread_id}/runs", token=self.token)["runs"][0]
+        off_context = json.loads(off_run["execution_context"])
+        self.assertEqual(off_context["execution_modes"], {"knowledge": "off", "web": "auto", "file": "off", "source": "general"})
+        self.assertEqual(off_context["knowledge_refs"], [])
+        self.assertNotIn("search_workspace_files", off_context["allowed_tool_ids"])
+
+        required_events = self.chat({
+            "thread_id": "", "content": "简述平台能力", "source_mode": "local_only",
+        })
+        required_thread_id = next(event["data"]["thread_id"] for event in required_events if event["event"] == "meta")
+        required_run = self.request_json(f"/api/threads/{required_thread_id}/runs", token=self.token)["runs"][0]
+        required_context = json.loads(required_run["execution_context"])
+        self.assertEqual(required_context["execution_modes"]["knowledge"], "required")
+        self.assertEqual(required_context["execution_modes"]["web"], "off")
+        self.assertIn(required_context["knowledge_route"], {"retrieved", "required_no_match"})
+
+    def test_invalid_execution_mode_is_rejected(self):
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.request_json("/api/chat", {"thread_id": "", "content": "测试", "web_mode": "always"}, self.token)
+        self.assertEqual(invalid.exception.code, 400)
+
+    def test_route_preview_matches_execution_mode_constraints_without_creating_a_run(self):
+        preview = self.request_json(
+            "/api/route-preview",
+            {"content": "请根据本地资料说明产品指标", "source_mode": "local_only", "file_mode": "off"},
+            self.token,
+        )
+        self.assertTrue(preview["ready"])
+        self.assertEqual(preview["modes"]["knowledge"], "required")
+        self.assertEqual(preview["modes"]["web"], "off")
+        self.assertEqual(preview["modes"]["file"], "off")
+        self.assertFalse(any(tool["id"] == "search_workspace_files" for tool in preview["allowed_tools"]))
+        self.assertEqual(self.request_json("/api/threads", token=self.token)["threads"], [])
+
     def test_task_router_keeps_structured_short_tasks_out_of_quick_mode(self):
         self.assertEqual(app.infer_task_profile("请改写这段通知")["task_tier"], "standard")
         self.assertEqual(app.infer_task_profile("分析这段代码")["task_tier"], "standard")
@@ -643,6 +697,19 @@ class AgentPlatformApiTests(unittest.TestCase):
         prompt = app.build_system_prompt(context)
         self.assertIn("已经通过 Tavily MCP 实际执行网页检索", prompt)
         self.assertNotIn("本次任务未授权工具调用", prompt)
+
+    def test_memory_prompt_truthfully_discloses_the_current_run_injection(self):
+        base_context = {"skills": [], "task_tier": "standard", "allowed_tool_ids": []}
+        injected = app.build_system_prompt({
+            **base_context,
+            "memories": [{"id": "memory_1", "kind": "decision", "content": "适度使用二次元用语"}],
+        })
+        self.assertIn("本次运行实际注入", injected)
+        self.assertIn("必须明确回答“是”", injected)
+        self.assertIn("memory_1", injected)
+        absent = app.build_system_prompt({**base_context, "memories": []})
+        self.assertIn("本次运行没有注入长期记忆", absent)
+        self.assertIn("必须明确回答“否”", absent)
 
     def test_realtime_and_url_lookup_requests_are_tool_tasks(self):
         self.assertTrue(app.infer_task_profile("帮我查一下，今天上海的天气")["needs_tools"])
@@ -744,13 +811,13 @@ class AgentPlatformApiTests(unittest.TestCase):
             interrupted = conn.execute("SELECT status, error FROM runs WHERE id = 'run_interrupted'").fetchone()
             waiting = conn.execute("SELECT status FROM runs WHERE id = 'run_waiting'").fetchone()
             recovery_event = conn.execute(
-                "SELECT type, sequence FROM run_events WHERE run_id = 'run_interrupted'"
+                "SELECT type, sequence FROM run_events WHERE run_id = 'run_interrupted' AND type = 'run_recovered'"
             ).fetchone()
         self.assertEqual(interrupted["status"], "failed")
         self.assertIn("请重试", interrupted["error"])
         self.assertEqual(waiting["status"], "awaiting_confirmation")
         self.assertEqual(recovery_event["type"], "run_recovered")
-        self.assertEqual(recovery_event["sequence"], 1)
+        self.assertEqual(recovery_event["sequence"], 2)
 
     def test_delete_artifact_removes_file_and_record(self):
         original_artifact_dir = app.ARTIFACT_DIR

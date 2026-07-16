@@ -78,6 +78,41 @@
                   <option value="deep">深度</option>
                 </select>
                 <select id="modelSelect" aria-label="选择模型"></select>
+                <details class="execution-mode-picker">
+                  <summary>执行方式</summary>
+                  <div class="execution-mode-menu">
+                    <label>资料
+                      <select id="sourceModeSelect" aria-label="选择回答依据">
+                        <option value="general">通用回答</option>
+                        <option value="local_only">仅本地资料</option>
+                        <option value="web_only">仅联网资料</option>
+                        <option value="mixed">混合资料</option>
+                      </select>
+                    </label>
+                    <label>知识库
+                      <select id="knowledgeModeSelect" aria-label="选择知识库模式">
+                        <option value="auto">自动</option>
+                        <option value="off">关闭</option>
+                        <option value="required">必须使用</option>
+                      </select>
+                    </label>
+                    <label>网络
+                      <select id="webModeSelect" aria-label="选择网络模式">
+                        <option value="auto">自动</option>
+                        <option value="off">关闭</option>
+                        <option value="required">必须使用</option>
+                      </select>
+                    </label>
+                    <label>文件
+                      <select id="fileModeSelect" aria-label="选择文件模式">
+                        <option value="auto">自动</option>
+                        <option value="off">关闭</option>
+                        <option value="required">必须使用</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
+                <span id="executionModeHint" class="execution-mode-hint" aria-live="polite">本轮策略：自动判断资料与工具</span>
               </div>
               <button id="sendButton" type="submit">发送</button>
             </div>

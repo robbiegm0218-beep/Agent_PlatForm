@@ -4,14 +4,6 @@
 
 > 当前定位：可部署的单 Agent 平台，而不是多 Agent 编排或通用自动化平台。写入操作只覆盖受控的本地产物创建；已接入受限的只读 Remote MCP，外部写入与后台 Worker 尚未接入。
 
-## 当前开发进度（2026-07-16）
-
-- P28–P33 已完成：任务/模型路由评测、本地混合检索、结构化 Context、显式长期 Memory、Tool 风险与安全读取、Skill 能力包治理。
-- 最新完整服务端回归为 **107 项全部通过**；5 个内置 Skill 的 10 条合同评测全部通过。
-- 本机开发服务已由 macOS 用户级服务 `com.agentplatform.local` 托管在 `http://localhost:8765`；健康接口、SQLite、模型配置、首页和登录接口均已验证。
-- 下一阶段是 P34：持久化工作流、跨重启恢复、多审批点，以及 LangGraph 是否达到引入门槛的量化评估。
-- 当前开发暂时停在 P33 完成检查点。恢复时先阅读 `docs/implementation-plan.md` 的“暂停与交接记录”，确认工作区和测试状态后再开始 P34。
-
 ## 能力概览
 
 | 面向用户的能力 | 底层保障 |
@@ -36,7 +28,7 @@ Python HTTP 服务 ── Agent Loop ── DeepSeek Provider
 资料库 / 受控产物目录 / Run 审计事件
 ```
 
-每次对话都会建立一个 Run。Run 使用 `running → awaiting_confirmation → running → completed / failed / cancelled` 的受限状态流转；事件带有稳定递增序号与版本，便于前端回放和问题排查。服务重启后，遗留的 `running` Run 会标记为可重试失败，待确认任务会保留。
+每次对话都会建立一个 Run。对外状态使用 `running → awaiting_confirmation → running → completed / failed / cancelled` 的受限流转；内部阶段另行记录 `planning / retrieving / generating / executing_tool / reflecting` 等节点。每个步骤保留序列化输入输出、幂等键、超时、重试和恢复策略；事件带有稳定递增序号与版本，便于前端回放和问题排查。服务重启后，遗留的 `running` Run 会标记为可重试失败，待确认任务会保留。
 
 ## 快速开始（开发）
 
