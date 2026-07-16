@@ -6,6 +6,7 @@ const state = {
   collapsedFolderIds: new Set(),
   spacesCollapsed: false,
   tasksCollapsed: false,
+  demoMembersBySpace: {},
   currentThreadId: "",
   pendingFolderId: "",
   messages: [],
@@ -751,10 +752,28 @@ function createThreadRow(thread) {
 async function openSpace(spaceId) {
   const data = await api(`/api/folders/${spaceId}`);
   els.spaceTitle.textContent = data.space.name;
-  const tasks = data.tasks.map((item) => `<li>${escapeHtml(item.title)}</li>`).join("") || "<li>暂无任务</li>";
-  const artifacts = data.artifacts.map((item) => `<li>${escapeHtml(item.filename)}</li>`).join("") || "<li>暂无产物</li>";
-  const members = data.members.map((item) => `<li>${escapeHtml(item.name || item.email)} · ${escapeHtml(item.role)}</li>`).join("") || "<li>暂无成员</li>";
-  els.spaceDetail.innerHTML = `<section><h3>任务</h3><ul>${tasks}</ul></section><section><h3>产物</h3><ul>${artifacts}</ul></section><section><h3>成员</h3><ul>${members}</ul><button id="inviteSpaceMember" type="button">邀请成员</button></section>`;
+  const empty = (text) => `<p class="space-empty">${text}</p>`;
+  const tasks = data.tasks.map((item) => `<button class="space-list-item space-task-link" data-thread-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>打开任务</small></button>`).join("") || empty("该空间暂时没有任务");
+  const artifacts = data.artifacts.map((item) => `<button class="space-list-item space-artifact-link" data-artifact-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${escapeHtml(item.kind.toUpperCase())} · 关联任务：${escapeHtml(item.task_title || "未命名任务")}</small></button>`).join("") || empty("该空间暂时没有产物");
+  const sources = data.sources.map((item) => `<div class="space-list-item space-source"><span>${escapeHtml(item.title)}</span><small>${item.kind === "web" ? "网页" : "本地资料"} · 关联任务：${escapeHtml(item.task_title)}</small>${item.excerpt ? `<em>${escapeHtml(item.excerpt)}</em>` : ""}</div>`).join("") || empty("空间内任务尚未引用资料或网页来源");
+  if (!state.demoMembersBySpace[spaceId]) state.demoMembersBySpace[spaceId] = [{ id: "demo-linran", name: "林然", role: "member", demo: true }, { id: "demo-zhouning", name: "周宁", role: "member", demo: true }];
+  const demoMembers = data.members.length <= 1 ? state.demoMembersBySpace[spaceId] : [];
+  const members = [...data.members, ...demoMembers].map((item) => {
+    const name = item.name || item.email;
+    const initial = escapeHtml(name.slice(0, 1).toUpperCase());
+    const removable = item.role !== "owner";
+    return `<div class="space-member"><span class="member-avatar" aria-hidden="true">${initial}</span><span class="member-name">${escapeHtml(name)}${item.demo ? '<small>演示成员</small>' : ""}</span><span class="member-role">${escapeHtml(item.role === "owner" ? "所有者" : "成员")}</span>${removable ? `<button class="remove-space-member" data-member-id="${escapeHtml(item.id)}" data-demo="${item.demo ? "true" : "false"}" type="button" aria-label="移除 ${escapeHtml(name)}">×</button>` : '<span class="member-lock" title="空间所有者不可移除">•</span>'}</div>`;
+  }).join("") || empty("暂未添加成员");
+  const pending = data.invitations.filter((item) => item.status === "pending").map((item) => `<div class="space-invitation">已邀请 ${escapeHtml(item.email)} · 待加入</div>`).join("");
+  els.spaceDetail.innerHTML = `<div class="space-layout"><div class="space-overview"><section class="space-card"><div class="space-card-heading"><h3>任务</h3><span>${data.tasks.length}</span></div>${tasks}</section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div>${artifacts}</section><section class="space-card space-card-wide"><div class="space-card-heading"><h3>来源</h3><span>${data.sources.length}</span></div>${sources}</section></div><aside class="space-members-panel"><div class="space-card-heading"><h3>成员</h3><button id="inviteSpaceMember" type="button">邀请成员</button></div>${members}${pending}</aside></div>`;
+  els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
+  els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
+  els.spaceDetail.querySelectorAll(".remove-space-member").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("移除该成员？")) return;
+    if (button.dataset.demo === "true") state.demoMembersBySpace[spaceId] = state.demoMembersBySpace[spaceId].filter((member) => member.id !== button.dataset.memberId);
+    else await api(`/api/folders/${spaceId}/members/${button.dataset.memberId}`, { method: "DELETE" });
+    await openSpace(spaceId);
+  }));
   document.querySelector("#inviteSpaceMember").addEventListener("click", async () => {
     const email = window.prompt("输入成员邮箱");
     if (!email?.trim()) return;

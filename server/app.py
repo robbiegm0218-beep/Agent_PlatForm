@@ -76,7 +76,17 @@ WEB_DIR = ROOT_DIR / "web"
 DB_PATH = ROOT_DIR / "agent_platform.db"
 KNOWLEDGE_DIR = ROOT_DIR / "data" / "knowledge"
 ARTIFACT_DIR = ROOT_DIR / "data" / "artifacts"
-ARTIFACT_NODE = os.environ.get("ARTIFACT_NODE", shutil.which("node") or "node")
+def resolve_artifact_node() -> str:
+    """Find Node even when the macOS launchd PATH omits developer tools."""
+    configured = os.environ.get("ARTIFACT_NODE", "").strip()
+    candidates = [configured, shutil.which("node"), "/opt/homebrew/bin/node", "/usr/local/bin/node"]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return "node"
+
+
+ARTIFACT_NODE = resolve_artifact_node()
 ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
 
 
@@ -1483,6 +1493,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True})
             return
         if self.path.startswith("/api/folders/"):
+            if "/members/" in self.path:
+                self.remove_space_member(user)
+                return
             self.delete_folder(user)
             return
         if self.path.startswith("/api/memories/"):
@@ -1561,12 +1574,39 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
                 return
             tasks = conn.execute("SELECT * FROM threads WHERE user_id = ? AND folder_id = ? ORDER BY updated_at DESC, id DESC", (user["id"], space_id)).fetchall()
-            artifacts = conn.execute("""SELECT artifacts.* FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
+            artifacts = conn.execute("""SELECT artifacts.*, threads.title AS task_title FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
                 WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY artifacts.created_at DESC, artifacts.id DESC""", (user["id"], space_id)).fetchall()
+            runs = conn.execute("""SELECT runs.id, runs.execution_context, threads.title FROM runs JOIN threads ON threads.id = runs.thread_id
+                WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY runs.started_at DESC, runs.id DESC""", (user["id"], space_id)).fetchall()
+            web_events = conn.execute("""SELECT run_events.run_id, run_events.payload, threads.title FROM run_events JOIN runs ON runs.id = run_events.run_id JOIN threads ON threads.id = runs.thread_id
+                WHERE threads.user_id = ? AND threads.folder_id = ? AND run_events.type = 'tool_result' ORDER BY run_events.created_at DESC""", (user["id"], space_id)).fetchall()
             members = conn.execute("""SELECT users.id, users.name, users.email, space_members.role, space_members.created_at FROM space_members JOIN users ON users.id = space_members.user_id
                 WHERE space_members.space_id = ? ORDER BY space_members.created_at ASC""", (space_id,)).fetchall()
             invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
-        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations]})
+        sources: list[dict] = []
+        seen_sources: set[tuple[str, str]] = set()
+        for run in runs:
+            context = safe_json_object(run["execution_context"])
+            for reference in context.get("knowledge_refs", []):
+                if not isinstance(reference, dict):
+                    continue
+                key = ("knowledge", f"{reference.get('document_id', '')}:{reference.get('position', '')}")
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                sources.append({"kind": "knowledge", "title": str(reference.get("filename", "本地资料"))[:255], "excerpt": str(reference.get("excerpt", ""))[:320], "task_title": run["title"]})
+        for event in web_events:
+            payload = safe_json_object(event["payload"])
+            for source in payload.get("sources", []):
+                if not isinstance(source, dict) or source.get("kind") != "web":
+                    continue
+                url = str(source.get("url", ""))
+                key = ("web", url)
+                if not url or key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                sources.append({"kind": "web", "title": str(source.get("title", "网页来源"))[:255], "url": url[:2048], "excerpt": str(source.get("excerpt", ""))[:320], "task_title": event["title"]})
+        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations]})
 
     def invite_space_member(self, user: dict) -> None:
         space_id = self.path.split("/")[-2]
@@ -1587,6 +1627,21 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             invitation_id = new_id("invite")
             conn.execute("INSERT INTO space_invitations (id, space_id, email, role, status, invited_by, created_at) VALUES (?, ?, ?, 'member', 'pending', ?, ?)", (invitation_id, space_id, email, user["id"], now()))
         self.send_json({"invitation": {"id": invitation_id, "email": email, "status": "pending", "role": "member"}}, HTTPStatus.CREATED)
+
+    def remove_space_member(self, user: dict) -> None:
+        parts = self.path.split("?")[0].split("/")
+        space_id, member_id = parts[-3], parts[-1]
+        with db() as conn:
+            space = conn.execute("SELECT id FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
+            member = conn.execute("SELECT role FROM space_members WHERE space_id = ? AND user_id = ?", (space_id, member_id)).fetchone()
+            if not space or not member:
+                self.send_error_json("空间成员不存在", HTTPStatus.NOT_FOUND)
+                return
+            if member["role"] == "owner":
+                self.send_error_json("不能移除空间所有者", HTTPStatus.CONFLICT)
+                return
+            conn.execute("DELETE FROM space_members WHERE space_id = ? AND user_id = ?", (space_id, member_id))
+        self.send_json({"ok": True})
 
     def get_thread(self, user: dict) -> None:
         thread_id = self.path.split("/")[-1]

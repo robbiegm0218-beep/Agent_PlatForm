@@ -227,10 +227,32 @@ form button:hover,
 .thread-section-header h2 { margin: 0; color: #66665f; font-size: 14px; font-weight: 500; letter-spacing: 0; }
 .section-toggle { display: inline-flex; align-items: center; min-height: 25px; border: 0; padding: 0; background: transparent; color: #66665f; font-family: inherit; font-size: 14px; font-weight: 500; line-height: 1; cursor: pointer; }
 .section-toggle:hover { color: var(--text); }
-.space-detail { width: min(860px, 100%); padding: 8px 0; }
-.space-detail section { padding: 18px 0; border-bottom: 1px solid var(--border); }
-.space-detail h3 { margin: 0 0 10px; font-size: 15px; }
-.space-detail ul { margin: 0; padding-left: 20px; color: var(--muted); }
+.space-detail { width: min(920px, 100%); padding: 10px 0 28px; }
+.space-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; align-items: start; }
+.space-overview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.space-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.space-card-wide { grid-column: 1 / -1; }
+.space-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.space-card-heading h3 { margin: 0; font-size: 15px; }
+.space-card-heading > span { min-width: 22px; padding: 2px 6px; border-radius: 99px; background: var(--panel-soft); color: var(--muted); text-align: center; font-size: 12px; }
+.space-card-heading button { min-width: auto; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 12px; }
+.space-list-item { display: grid; gap: 2px; width: 100%; margin-top: 5px; padding: 8px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; text-decoration: none; font: inherit; }
+.space-list-item:hover { background: var(--panel-soft); }
+.space-list-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.space-list-item small, .space-member small, .space-invitation { color: var(--muted); font-size: 12px; }
+.space-source em { overflow: hidden; color: var(--muted); font-size: 12px; font-style: normal; white-space: nowrap; text-overflow: ellipsis; }
+.space-member { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto 22px; align-items: center; gap: 7px; margin-top: 6px; padding: 7px; border-radius: 7px; background: var(--panel-soft); font-size: 13px; }
+.member-avatar { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; background: #dcece8; color: #23675f; font-size: 12px; font-weight: 700; }
+.member-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-name small { display: block; color: var(--muted); font-size: 10px; }
+.member-role { padding: 2px 5px; border-radius: 99px; background: #fff; color: var(--muted); font-size: 11px; }
+.remove-space-member { width: 22px; min-width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
+.remove-space-member:hover { background: rgba(180, 50, 50, 0.1); color: var(--danger); }
+.member-lock { color: var(--muted); text-align: center; }
+.space-members-panel { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.space-invitation { margin-top: 7px; overflow: hidden; padding: 7px 8px; border-left: 2px solid var(--accent); background: #f1f7f5; white-space: nowrap; text-overflow: ellipsis; }
+.space-empty { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+@media (max-width: 900px) { .space-layout { grid-template-columns: 1fr; } .space-members-panel { order: -1; } }
 .section-add-folder { width: 25px; height: 25px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
 .section-add-folder:hover { border-color: var(--accent); color: var(--accent); }
 .section-empty { margin: 0 8px 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
