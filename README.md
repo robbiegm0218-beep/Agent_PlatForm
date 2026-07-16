@@ -4,6 +4,14 @@
 
 > 当前定位：可部署的单 Agent 平台，而不是多 Agent 编排或通用自动化平台。写入操作只覆盖受控的本地产物创建；已接入受限的只读 Remote MCP，外部写入与后台 Worker 尚未接入。
 
+## 当前开发进度（2026-07-16）
+
+- P28–P33 已完成：任务/模型路由评测、本地混合检索、结构化 Context、显式长期 Memory、Tool 风险与安全读取、Skill 能力包治理。
+- 最新完整服务端回归为 **107 项全部通过**；5 个内置 Skill 的 10 条合同评测全部通过。
+- 本机开发服务已由 macOS 用户级服务 `com.agentplatform.local` 托管在 `http://localhost:8765`；健康接口、SQLite、模型配置、首页和登录接口均已验证。
+- 下一阶段是 P34：持久化工作流、跨重启恢复、多审批点，以及 LangGraph 是否达到引入门槛的量化评估。
+- 当前开发暂时停在 P33 完成检查点。恢复时先阅读 `docs/implementation-plan.md` 的“暂停与交接记录”，确认工作区和测试状态后再开始 P34。
+
 ## 能力概览
 
 | 面向用户的能力 | 底层保障 |
@@ -205,12 +213,30 @@ python3 -m unittest \
   server.test_operations \
   server.test_app \
   server.test_model_registry \
-  server.test_provider_config -v
+  server.test_provider_config \
+  server.test_task_router \
+  server.test_evaluate_routing \
+  server.test_knowledge_retrieval \
+  server.test_evaluate_knowledge_retrieval \
+  server.test_structured_context \
+  server.test_evaluate_structured_context \
+  server.test_memory_policy \
+  server.test_evaluate_memory_policy \
+  server.test_tool_risk \
+  server.test_safe_web_reader \
+  server.test_skill_contract \
+  server.test_evaluate_skill_contracts -v
 
 python3 server/evaluate.py
 python3 server/evaluate.py \
   --baseline data/evaluations/latest.json \
   --output data/evaluations/after-change.json
+
+python3 -m server.evaluate_routing
+python3 -m server.evaluate_knowledge_retrieval
+python3 -m server.evaluate_structured_context
+python3 -m server.evaluate_memory_policy
+python3 -m server.evaluate_skill_contracts
 ```
 
 回归测试使用临时数据库与本地模型替身，覆盖流式响应、工具边界、审批与取消、运行审计、重启恢复、生产凭据、健康检查和数据库恢复演练。评测集位于 `server/evals/personal_baseline.json`，不会记录 API Key 或私有资料正文。
@@ -218,9 +244,9 @@ python3 server/evaluate.py \
 ## 当前限制与下一步
 
 - 当前是单进程、单 Agent 运行模型，适合交互式与分钟内完成的任务；不适合长时间后台工作、跨进程等待或高并发 Worker。
-- 当前工具包含平台状态、工作区文件名检索、Tavily 网页搜索和受限 Remote MCP 等只读能力。文件产物采用独立的受控审批流程；通用 `write_local`、`external_write`、`privileged` 工具审批将在真实工具接入时统一实现。
+- 当前工具包含平台状态、工作区文件名与受限正文读取、安全 HTTPS 页面读取、Tavily 网页搜索和受限 Remote MCP 等只读能力。所有非只读工具默认不向模型暴露，必须通过风险策略和用户确认；文件产物已采用结构化、可恢复且幂等的审批流程。
 - 工作区会在刷新完成认证、数据加载和原页面恢复后再显示，以避免页面闪烁；加载失败时会显示明确的错误状态。
-- 当前仅接入 Tavily 的只读 Remote MCP 搜索工具；页面提取、站点遍历等远程工具默认不在白名单内。新增 MCP 服务前应验证白名单、超时、审计与故障隔离。
+- 当前仅接入 Tavily 的只读 Remote MCP 搜索工具；安全页面读取由本地受控读取器完成，不开放站点遍历。新增 MCP 服务前应验证白名单、超时、审计与故障隔离。
 - SQLite 适合当前单机部署；当需要多实例写入、高并发或分布式 Worker 时，再评估迁移到服务化数据库和持久化执行框架。
 
 详细的完成项与迭代顺序见 [实施计划](docs/implementation-plan.md)。

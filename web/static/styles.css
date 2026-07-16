@@ -1159,6 +1159,38 @@ form button:hover,
   margin-top: 14px;
 }
 
+.memory-form {
+  margin: 24px 28px 0;
+  display: grid;
+  grid-template-columns: 150px 190px minmax(240px, 1fr) auto;
+  gap: 10px;
+}
+
+.memory-form input,
+.memory-form select {
+  min-width: 0;
+}
+
+.memory-notice {
+  margin: 0 28px 12px;
+  min-height: 20px;
+  color: var(--muted);
+}
+
+.memory-card {
+  min-height: 190px;
+}
+
+.memory-card h3 {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.memory-actions > div {
+  display: flex;
+  gap: 6px;
+}
+
 @media (max-width: 760px) {
   .workspace {
     grid-template-columns: 1fr;
@@ -1199,5 +1231,10 @@ form button:hover,
 
   .card-grid {
     grid-template-columns: 1fr;
+  }
+
+  .memory-form {
+    grid-template-columns: 1fr;
+    margin: 18px 16px 0;
   }
 }

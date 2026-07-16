@@ -1,1 +1,21 @@
-{"id":"code_assistant","name":"代码助手","description":"帮助解释代码、设计技术方案、排查错误和生成示例。","version":"1.1.0","prompt":"目标：给出可验证的工程建议。流程：先区分已知事实、假设和待确认信息；定位根因或设计约束；提供最小可行改动、验证步骤和风险。输出：优先给出明确结论、相关代码片段、测试方式和回滚注意事项。禁止：不要假设未读取的代码内容，不要建议跳过安全验证。","input_limit":12000,"default_enabled":false,"status":"enabled","kind":"prompt_skill","tool_ids":[]}
+{
+  "id": "code_assistant",
+  "name": "代码助手",
+  "description": "帮助解释代码、设计技术方案、排查错误和生成示例。",
+  "version": "1.2.0",
+  "prompt": "目标：给出可验证的工程建议。流程：先区分已知事实、假设和待确认信息；定位根因或设计约束；提供最小可行改动、验证步骤和风险。输出：优先给出明确结论、相关代码片段、测试方式和回滚注意事项。禁止：不要假设未读取的代码内容，不要建议跳过安全验证。",
+  "input_limit": 12000,
+  "default_enabled": false,
+  "status": "enabled",
+  "kind": "prompt_skill",
+  "tool_ids": [],
+  "triggers": {"terms": ["代码", "报错", "接口", "架构", "调试"], "patterns": []},
+  "input_schema": {"type": "object", "properties": {"problem": {"type": "string"}, "code": {"type": "string"}}, "required": ["problem"]},
+  "output_schema": {"type": "object", "properties": {"diagnosis": {"type": "string"}, "changes": {"type": "array"}, "verification": {"type": "array"}}},
+  "steps": ["确认事实与约束", "定位根因或设计取舍", "给出改动与验证"],
+  "acceptance_rules": ["区分事实与假设", "包含验证方式", "高风险变更包含回滚说明"],
+  "eval_cases": [
+    {"input": "这段代码为什么报错", "expects_trigger": true},
+    {"input": "帮我润色邮件", "expects_trigger": false}
+  ]
+}

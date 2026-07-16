@@ -1,0 +1,14 @@
+[
+  {"id":"explicit-preference","operation":"candidate","content":"我的偏好是使用中文。","expected_kinds":["preference"]},
+  {"id":"explicit-project-fact","operation":"candidate","content":"项目事实：代号为星河。","expected_kinds":["project_fact"]},
+  {"id":"explicit-decision","operation":"candidate","content":"决定记住：发布前必须回归。","expected_kinds":["decision"]},
+  {"id":"ordinary-chat","operation":"candidate","content":"今天使用中文回答。","expected_kinds":[]},
+  {"id":"password-rejected","operation":"validate","content":"password=abc123","expected_valid":false},
+  {"id":"api-key-rejected","operation":"validate","content":"API_KEY: secret-value","expected_valid":false},
+  {"id":"private-key-rejected","operation":"validate","content":"-----BEGIN PRIVATE KEY----- abc","expected_valid":false},
+  {"id":"project-scope","operation":"select","query":"星河数据库","project_id":"p1","records":[{"id":"a","kind":"project_fact","content":"星河数据库使用SQLite","scope_type":"project","scope_id":"p1","status":"active","updated_at":2},{"id":"b","kind":"project_fact","content":"星河数据库使用Postgres","scope_type":"project","scope_id":"p2","status":"active","updated_at":3}],"expected_ids":["a"]},
+  {"id":"disabled-excluded","operation":"select","query":"发布策略","project_id":"","records":[{"id":"a","kind":"decision","content":"发布策略采用蓝绿部署","scope_type":"global","scope_id":"","status":"disabled","updated_at":2}],"expected_ids":[]},
+  {"id":"expired-excluded","operation":"select","query":"中文回答","project_id":"","now_value":100,"records":[{"id":"a","kind":"preference","content":"使用中文回答","scope_type":"global","scope_id":"","status":"active","expires_at":99,"updated_at":2}],"expected_ids":[]},
+  {"id":"preference-prior","operation":"select","query":"介绍平台","project_id":"","records":[{"id":"a","kind":"preference","content":"回答保持简洁","scope_type":"global","scope_id":"","status":"active","updated_at":2}],"expected_ids":["a"]},
+  {"id":"bounded-selection","operation":"select","query":"项目规则","project_id":"","max_chars":9,"records":[{"id":"a","kind":"decision","content":"项目规则必须经过评审","scope_type":"global","scope_id":"","status":"active","updated_at":2}],"expected_ids":[]}
+]

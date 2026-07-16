@@ -1,0 +1,193 @@
+[
+  {
+    "id": "exact-chinese-phrase",
+    "query": "产品碳足迹核算",
+    "documents": [
+      {"id": "a1", "document_id": "d1", "filename": "指南.md", "position": 0, "content": "产品碳足迹核算需要明确功能单位和系统边界。"},
+      {"id": "a2", "document_id": "d2", "filename": "会议.md", "position": 0, "content": "产品设计会议讨论团队分工。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "filename-title-boost",
+    "query": "供应链排放",
+    "documents": [
+      {"id": "b1", "document_id": "d1", "filename": "供应链排放指南.md", "position": 0, "content": "本章说明数据收集。"},
+      {"id": "b2", "document_id": "d2", "filename": "普通材料.md", "position": 0, "content": "供应链排放数据需要经过核验。"}
+    ],
+    "expected_document_ids": ["d2", "d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "english-terms",
+    "query": "embedding model",
+    "documents": [
+      {"id": "c1", "document_id": "d1", "filename": "retrieval.txt", "position": 0, "content": "The embedding model converts text into vectors for retrieval."},
+      {"id": "c2", "document_id": "d2", "filename": "agent.txt", "position": 0, "content": "The agent invokes local tools."}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "noisy-request-wording",
+    "query": "请根据本地资料帮我总结功能单位定义",
+    "documents": [
+      {"id": "d1", "document_id": "doc-a", "filename": "术语.md", "position": 0, "content": "功能单位定义了产品系统被量化的性能。"},
+      {"id": "d2", "document_id": "doc-b", "filename": "待办.md", "position": 0, "content": "请总结团队本周工作。"}
+    ],
+    "expected_document_ids": ["doc-a"],
+    "expect_empty": false
+  },
+  {
+    "id": "distractor-overlap",
+    "query": "碳排放因子选择",
+    "documents": [
+      {"id": "e1", "document_id": "d1", "filename": "因子.md", "position": 0, "content": "碳排放因子选择应匹配地区、技术和年份。"},
+      {"id": "e2", "document_id": "d2", "filename": "新闻.md", "position": 0, "content": "某地区发布碳排放新闻。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "repeated-term-weight",
+    "query": "数据质量评估",
+    "documents": [
+      {"id": "f1", "document_id": "d1", "filename": "质量.md", "position": 0, "content": "数据质量评估包括完整性评估、准确性评估和代表性评估。"},
+      {"id": "f2", "document_id": "d2", "filename": "数据.md", "position": 0, "content": "数据质量需要记录来源。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "stable-tie-break",
+    "query": "项目风险清单",
+    "documents": [
+      {"id": "g2", "document_id": "d2", "filename": "乙.md", "position": 1, "content": "项目风险清单包含影响和概率。"},
+      {"id": "g1", "document_id": "d1", "filename": "甲.md", "position": 0, "content": "项目风险清单包含影响和概率。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "exact-phrase-beats-scattered",
+    "query": "系统边界定义",
+    "documents": [
+      {"id": "h1", "document_id": "d1", "filename": "边界.md", "position": 0, "content": "系统边界定义决定纳入核算的过程。"},
+      {"id": "h2", "document_id": "d2", "filename": "术语.md", "position": 0, "content": "系统设计需要明确边界，并记录术语定义。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "adjacent-both-sides",
+    "query": "数据质量要求",
+    "documents": [
+      {"id": "i0", "document_id": "d1", "filename": "质量.md", "position": 0, "content": "数据来源需要登记。"},
+      {"id": "i1", "document_id": "d1", "filename": "质量.md", "position": 1, "content": "数据质量要求包括完整性和准确性。"},
+      {"id": "i2", "document_id": "d1", "filename": "质量.md", "position": 2, "content": "评分结果需要复核。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false,
+    "expected_neighbor_positions": [0, 2]
+  },
+  {
+    "id": "adjacent-left-edge",
+    "query": "生命周期阶段",
+    "documents": [
+      {"id": "j0", "document_id": "d1", "filename": "周期.md", "position": 0, "content": "生命周期阶段从原料获取开始。"},
+      {"id": "j1", "document_id": "d1", "filename": "周期.md", "position": 1, "content": "随后进入生产与运输。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false,
+    "expected_neighbor_positions": [1]
+  },
+  {
+    "id": "adjacent-document-boundary",
+    "query": "审计证据记录",
+    "documents": [
+      {"id": "k0", "document_id": "d1", "filename": "审计.md", "position": 2, "content": "审计证据记录必须可追溯。"},
+      {"id": "k1", "document_id": "d1", "filename": "审计.md", "position": 3, "content": "复核人确认后归档。"},
+      {"id": "k2", "document_id": "d2", "filename": "其他.md", "position": 1, "content": "另一个文档的相邻位置不应扩展。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false,
+    "expected_neighbor_positions": [3]
+  },
+  {
+    "id": "duplicate-content-dedup",
+    "query": "运输排放计算",
+    "documents": [
+      {"id": "l1", "document_id": "d1", "filename": "甲.md", "position": 0, "content": "运输排放计算依据距离和运输方式。"},
+      {"id": "l2", "document_id": "d2", "filename": "乙.md", "position": 0, "content": "运输排放计算依据距离和运输方式。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "budget-pressure-ranking",
+    "query": "能源消耗核算",
+    "documents": [
+      {"id": "m1", "document_id": "d1", "filename": "能源.md", "position": 0, "content": "能源消耗核算需要统计电力燃气和蒸汽。能源消耗核算结果用于识别重点。"},
+      {"id": "m2", "document_id": "d2", "filename": "普通.md", "position": 0, "content": "能源消耗需要按月记录。"},
+      {"id": "m3", "document_id": "d3", "filename": "设备.md", "position": 0, "content": "设备核算需要维护台账。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "standard-number",
+    "query": "ISO 14067 产品碳足迹",
+    "documents": [
+      {"id": "n1", "document_id": "d1", "filename": "标准.md", "position": 0, "content": "ISO 14067 规定产品碳足迹量化与报告原则。"},
+      {"id": "n2", "document_id": "d2", "filename": "体系.md", "position": 0, "content": "ISO 14001 用于环境管理体系。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "filename-and-content",
+    "query": "模型路由策略",
+    "documents": [
+      {"id": "o1", "document_id": "d1", "filename": "模型路由策略.md", "position": 0, "content": "模型路由策略根据任务档位选择模型。"},
+      {"id": "o2", "document_id": "d2", "filename": "模型.md", "position": 0, "content": "模型需要配置上下文窗口。"}
+    ],
+    "expected_document_ids": ["d1"],
+    "expect_empty": false
+  },
+  {
+    "id": "empty-unrelated-policy",
+    "query": "员工考勤制度",
+    "documents": [{"id": "p1", "document_id": "d1", "filename": "碳核算.md", "position": 0, "content": "产品碳足迹需要定义功能单位。"}],
+    "expected_document_ids": [],
+    "expect_empty": true
+  },
+  {
+    "id": "empty-unrelated-technical",
+    "query": "量子通信协议",
+    "documents": [{"id": "q1", "document_id": "d1", "filename": "项目.md", "position": 0, "content": "项目计划包含范围进度和风险。"}],
+    "expected_document_ids": [],
+    "expect_empty": true
+  },
+  {
+    "id": "empty-query-noise-only",
+    "query": "请根据本地资料帮我总结一下",
+    "documents": [{"id": "r1", "document_id": "d1", "filename": "资料.md", "position": 0, "content": "这里包含任意资料正文。"}],
+    "expected_document_ids": [],
+    "expect_empty": true
+  },
+  {
+    "id": "empty-no-documents",
+    "query": "系统边界",
+    "documents": [],
+    "expected_document_ids": [],
+    "expect_empty": true
+  },
+  {
+    "id": "empty-single-overlap-noise",
+    "query": "采购审批流程",
+    "documents": [{"id": "t1", "document_id": "d1", "filename": "采购.md", "position": 0, "content": "采购价格每月更新。"}],
+    "expected_document_ids": [],
+    "expect_empty": true
+  }
+]

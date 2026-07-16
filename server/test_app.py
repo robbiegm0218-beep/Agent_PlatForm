@@ -222,7 +222,99 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertNotEqual(continuation_id, original_thread_id)
         detail = self.request_json(f"/api/threads/{continuation_id}", token=self.token)["thread"]
         self.assertEqual(detail["parent_thread_id"], original_thread_id)
-        self.assertIn("用户目标", detail["handoff_summary"])
+        self.assertIn("目标", detail["handoff_summary"])
+        continuation_context = self.request_json(
+            f"/api/threads/{continuation_id}/context", token=self.token
+        )["structured_context"]
+        self.assertTrue(any("第一轮" in item["text"] for item in continuation_context["goals"]))
+
+    def test_structured_context_tracks_sources_and_user_corrections(self):
+        first = self.chat({
+            "thread_id": "",
+            "content": "为星河项目制定发布计划。项目名：星河。必须使用中文。",
+        })
+        thread_id = next(event["data"]["thread_id"] for event in first if event["event"] == "meta")
+        self.chat({"thread_id": thread_id, "content": "目标改为制定迁移计划，最终采用分批迁移。"})
+
+        detail = self.request_json(f"/api/threads/{thread_id}", token=self.token)
+        user_message_ids = {message["id"] for message in detail["messages"] if message["role"] == "user"}
+        context = self.request_json(f"/api/threads/{thread_id}/context", token=self.token)["structured_context"]
+        active_goals = [item for item in context["goals"] if item["status"] == "active"]
+        self.assertEqual([item["text"] for item in active_goals], ["制定迁移计划，最终采用分批迁移。"])
+        self.assertIn(active_goals[0]["source_message_id"], user_message_ids)
+        self.assertTrue(any("星河" in item["text"] for item in context["entities"]))
+
+        latest_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        frozen = json.loads(latest_run["execution_context"])["structured_context"]
+        self.assertEqual(frozen["goals"][0]["source_message_id"], active_goals[0]["source_message_id"])
+
+    def test_explicit_memory_lifecycle_injection_and_usage_audit(self):
+        first = self.chat({"thread_id": "", "content": "我的偏好是使用简洁中文。"})
+        thread_id = next(event["data"]["thread_id"] for event in first if event["event"] == "meta")
+        detail = self.request_json(f"/api/threads/{thread_id}", token=self.token)
+        source_id = next(message["id"] for message in detail["messages"] if message["role"] == "user")
+
+        candidates = self.request_json(
+            "/api/memories/candidates",
+            {"content": "我的偏好是使用简洁中文。", "source_message_id": source_id},
+            self.token,
+        )["candidates"]
+        self.assertEqual(candidates[0]["kind"], "preference")
+        self.assertEqual(self.request_json("/api/memories", token=self.token)["memories"], [])
+        with self.assertRaises(urllib.error.HTTPError) as missing_confirmation:
+            self.request_json("/api/memories", {**candidates[0], "scope_type": "global"}, self.token)
+        self.assertEqual(missing_confirmation.exception.code, 400)
+
+        created = self.request_json(
+            "/api/memories",
+            {**candidates[0], "scope_type": "global", "confirmed": True},
+            self.token,
+        )["memory"]
+        memory_id = created["id"]
+        used = self.chat({"thread_id": "", "content": "请用中文回答这个问题。"})
+        used_thread_id = next(event["data"]["thread_id"] for event in used if event["event"] == "meta")
+        used_run = self.request_json(f"/api/threads/{used_thread_id}/runs", token=self.token)["runs"][0]
+        self.assertEqual(json.loads(used_run["execution_context"])["memories"][0]["id"], memory_id)
+        listed = self.request_json("/api/memories", token=self.token)["memories"]
+        self.assertEqual(listed[0]["use_count"], 1)
+
+        self.request_json(f"/api/memories/{memory_id}", {"status": "disabled"}, self.token, method="PATCH")
+        disabled = self.chat({"thread_id": "", "content": "请继续用中文回答。"})
+        disabled_thread_id = next(event["data"]["thread_id"] for event in disabled if event["event"] == "meta")
+        disabled_run = self.request_json(f"/api/threads/{disabled_thread_id}/runs", token=self.token)["runs"][0]
+        self.assertEqual(json.loads(disabled_run["execution_context"])["memories"], [])
+
+        self.request_json(f"/api/memories/{memory_id}", token=self.token, method="DELETE")
+        self.assertEqual(self.request_json("/api/memories", token=self.token)["memories"], [])
+        with self.assertRaises(urllib.error.HTTPError) as sensitive:
+            self.request_json(
+                "/api/memories",
+                {"kind": "project_fact", "content": "API_KEY: secret-value", "scope_type": "global", "confirmed": True},
+                self.token,
+            )
+        self.assertEqual(sensitive.exception.code, 400)
+
+    def test_memory_isolation_and_expiration(self):
+        with app.db() as conn:
+            timestamp = app.now()
+            current_user_id = conn.execute("SELECT id FROM users WHERE email = ?", ("admin@example.com",)).fetchone()["id"]
+            conn.execute(
+                """INSERT INTO memories
+                   (id, user_id, kind, content, scope_type, scope_id, confidence, status, expires_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'global', '', 'confirmed', 'active', 0, ?, ?)""",
+                ("other_memory", "other_user", "preference", "使用中文回答", timestamp, timestamp),
+            )
+            conn.execute(
+                """INSERT INTO memories
+                   (id, user_id, kind, content, scope_type, scope_id, confidence, status, expires_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'global', '', 'confirmed', 'active', ?, ?, ?)""",
+                ("expired_memory", current_user_id, "preference", "使用中文回答", timestamp - 1, timestamp, timestamp),
+            )
+        self.assertEqual(self.request_json("/api/memories", token=self.token)["memories"][0]["effective_status"], "expired")
+        events = self.chat({"thread_id": "", "content": "请使用中文回答。"})
+        thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
+        run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        self.assertEqual(json.loads(run["execution_context"])["memories"], [])
 
     def test_production_bootstrap_requires_explicit_admin_credentials(self):
         with patch.dict(
@@ -316,6 +408,10 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertEqual(detail["run"]["status"], "awaiting_confirmation")
             self.assertTrue(detail["steps"][0]["requires_confirmation"])
             self.assertEqual(detail["steps"][0]["status"], "awaiting_confirmation")
+            self.assertEqual(detail["confirmation"]["risk_level"], "local_write")
+            self.assertEqual(detail["confirmation"]["tool_id"], "create_artifact")
+            self.assertIn("删除该文件", detail["confirmation"]["rollback_summary"])
+            self.assertEqual(detail["confirmation"]["idempotency_key"], f"artifact:{run_id}:markdown")
 
             result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30)
             self.assertTrue(result["approved"])
@@ -329,6 +425,8 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertNotIn("storage_path", thread_context["outputs"][0])
             self.assertEqual(detail["run"]["status"], "completed")
             self.assertIn("artifact_created", [event["type"] for event in detail["events"]])
+            repeated = app.create_artifact(artifacts[0]["user_id"], run_id, "markdown", "ignored", "ignored")
+            self.assertEqual(repeated["id"], result["artifact"]["id"])
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
 
@@ -456,6 +554,9 @@ class AgentPlatformApiTests(unittest.TestCase):
         metrics = self.request_json("/api/metrics", token=self.token)
         self.assertGreaterEqual(metrics["sample_size"], 1)
         self.assertIn("quick", metrics["tiers"])
+        self.assertIn("success_rate", metrics["tools"])
+        self.assertIn("confirmation_rejection_rate", metrics["tools"])
+        self.assertGreaterEqual(metrics["tools"]["average_duration_ms"], 0)
 
     def test_task_router_keeps_structured_short_tasks_out_of_quick_mode(self):
         self.assertEqual(app.infer_task_profile("请改写这段通知")["task_tier"], "standard")
@@ -588,6 +689,24 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])
+
+    def test_knowledge_search_is_strictly_isolated_by_user(self):
+        with app.db() as conn:
+            conn.execute(
+                """INSERT INTO knowledge_documents
+                   (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("private_doc", "other_user", "private.md", "", "text/markdown", "hash", 12, 1, app.now()),
+            )
+            conn.execute(
+                "INSERT INTO knowledge_chunks (id, document_id, position, content) VALUES (?, ?, ?, ?)",
+                ("private_chunk", "private_doc", 0, "隔离验证标记只属于另一个用户。"),
+            )
+        current_user_results = self.request_json(
+            f"/api/knowledge/search?query={quote('隔离验证标记')}", token=self.token
+        )["results"]
+        self.assertEqual(current_user_results, [])
+        self.assertEqual(app.search_knowledge("other_user", "隔离验证标记")[0]["document_id"], "private_doc")
 
     def test_failed_run_can_retry_without_duplicate_user_message(self):
         app.DEEPSEEK_API_KEY = "test"

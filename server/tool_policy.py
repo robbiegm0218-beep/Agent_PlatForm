@@ -43,12 +43,17 @@ class ToolPolicy:
             "检索", "查找", "搜索", "查询", "查一下", "查一查", "帮我查", "看看", "看一下", "找一下", "找找", "找一些",
         ))
         mentions_file_scope = any(marker in content for marker in ("文件", "工作区", "目录"))
+        has_read_action = any(marker in content for marker in ("读取", "打开", "查看内容", "读一下"))
+        if has_read_action and mentions_file_scope:
+            return ToolDecision(self._by_id(read_only_tools, "read_workspace_file"), "high", "明确请求读取工作区文件内容")
         if has_lookup_action and mentions_file_scope:
             return ToolDecision(self._by_id(read_only_tools, "search_workspace_files"), "high", "明确请求本地文件或工作区检索")
 
         reasons: list[str] = []
         score = 0
         contains_url = bool(re.search(r"https?://\S+|\bwww\.", content, re.IGNORECASE))
+        if contains_url and any(marker in normalized for marker in ("读取", "打开", "查看内容", "总结这个网页", "总结网页")):
+            return ToolDecision(self._by_id(read_only_tools, "read_web_page"), "high", "明确请求读取指定网页正文")
         if contains_url:
             score += 4
             reasons.append("包含 URL")

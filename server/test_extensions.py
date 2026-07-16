@@ -32,11 +32,34 @@ class LocalExtensionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.execute("echo", {"text": "ok"}, set())
 
+    def test_write_tool_is_hidden_and_blocked_until_confirmed(self):
+        registry = LocalToolRegistry([
+            LocalTool(
+                "save", "保存", "写入本地状态", risk="local_write",
+                rollback_summary="可删除保存的本地状态",
+                execute_fn=lambda _arguments: {"saved": True},
+            )
+        ])
+        self.assertEqual(registry.list()[0]["rollback_summary"], "可删除保存的本地状态")
+        self.assertEqual(registry.callable_definitions({"save"}), [])
+        with self.assertRaisesRegex(ValueError, "需要用户确认"):
+            registry.execute("save", {}, {"save"})
+        self.assertEqual(registry.execute("save", {}, {"save"}, {"save"}), {"saved": True})
+
     def test_workflow_and_model_adapter_delegate_without_external_services(self):
         workflow = LocalWorkflowRunner()
         self.assertEqual(workflow.run(1, [lambda value: value + 2, lambda value: value * 3]), 9)
         adapter = CallableModelAdapter("test", lambda _system, _messages: iter(["a", "b"]))
         self.assertEqual("".join(adapter.stream("", [])), "ab")
+
+    def test_workspace_file_reader_is_bounded(self):
+        result = app.read_workspace_file({"path": "README.md", "max_chars": 80})
+        self.assertEqual(result["path"], "README.md")
+        self.assertLessEqual(len(result["content"]), 80)
+        with self.assertRaisesRegex(ValueError, "相对路径"):
+            app.read_workspace_file({"path": "/etc/passwd"})
+        with self.assertRaisesRegex(ValueError, "允许的读取范围"):
+            app.read_workspace_file({"path": ".env"})
 
 
 if __name__ == "__main__":

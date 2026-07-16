@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Protocol
 
@@ -83,6 +84,7 @@ class SingleAgentLoop:
         tool_call_id = call.get("id") or self._dependencies.new_id("toolcall")
         tool = self._dependencies.tools.get(tool_id)
         tool_name = tool.name if tool else tool_id
+        started = time.monotonic()
         try:
             arguments = json.loads(function.get("arguments") or "{}")
             if not isinstance(arguments, dict):
@@ -99,6 +101,7 @@ class SingleAgentLoop:
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "summary": self._dependencies.summarize_tool_result(content),
+                "duration_ms": round((time.monotonic() - started) * 1000, 3),
             }
             if tool_id == "web_search" and isinstance(content.get("sources"), list):
                 payload["sources"] = content["sources"][:10]
@@ -110,5 +113,6 @@ class SingleAgentLoop:
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "error": str(exc),
+                "duration_ms": round((time.monotonic() - started) * 1000, 3),
             })
         return {"tool_call_id": tool_call_id, "content": content}

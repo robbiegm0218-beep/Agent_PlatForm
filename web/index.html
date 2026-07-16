@@ -36,6 +36,7 @@
               <button id="newThreadButton" class="nav-button active" data-view="chat"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>新建对话</span></button>
               <button class="nav-button" data-view="skills"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 14.2 9l5.3 2.2-5.3 2.2L12 19l-2.2-5.6-5.3-2.2L9.8 9 12 3.5Z" /></svg><span>技能和应用</span></button>
               <button class="nav-button" data-view="knowledge"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="5.5" /><path d="m15.2 15.2 4.3 4.3" /></svg><span>知识库</span></button>
+              <button class="nav-button" data-view="memories"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5.5h10v13H7z" /><path d="M9.5 9h5M9.5 12h5M9.5 15h3" /></svg><span>长期记忆</span></button>
               <button class="nav-button" data-view="artifacts"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3.5h10l4 4v13H5z" /><path d="M15 3.5v4h4M8.5 12h7M8.5 15.5h7" /></svg><span>产物</span></button>
             </nav>
           </div>
@@ -188,6 +189,28 @@
             <p>支持生成 <strong>Markdown（.md）</strong> 和 <strong>Excel（.xlsx）</strong> 文件。所有文件在创建前需要确认，生成后保存到本地 data/artifacts/ 目录。确认后的文件可在此页下载或删除。</p>
           </div>
           <div id="artifactsGrid" class="card-grid"></div>
+        </section>
+
+        <section id="memoriesPage" class="page hidden">
+          <header class="page-header">
+            <div>
+              <h2>长期记忆</h2>
+              <span>只有你明确确认的内容才会跨对话使用</span>
+            </div>
+          </header>
+          <form id="memoryForm" class="memory-form">
+            <select id="memoryKind" aria-label="记忆类型">
+              <option value="preference">个人偏好</option>
+              <option value="project_fact">项目事实</option>
+              <option value="decision">已确认决策</option>
+            </select>
+            <select id="memoryScope" aria-label="记忆作用域"><option value="global">所有对话</option></select>
+            <input id="memoryContent" type="text" maxlength="500" placeholder="输入需要长期记住的内容" required />
+            <button type="submit">确认保存</button>
+          </form>
+          <div class="knowledge-toolbar"><input id="memorySearch" type="search" placeholder="搜索长期记忆" /></div>
+          <div id="memoryNotice" class="notice memory-notice"></div>
+          <div id="memoryList" class="card-grid"></div>
         </section>
       </section>
     </main>

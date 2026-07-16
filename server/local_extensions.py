@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any, Callable, Protocol
 
+try:
+    from server.tool_risk import ToolRiskPolicy
+except ModuleNotFoundError:
+    from tool_risk import ToolRiskPolicy
+
 
 class ModelAdapter(Protocol):
     name: str
@@ -32,12 +37,18 @@ class LocalTool:
     output_schema: dict[str, Any] | None = None
     timeout_seconds: int = 5
     execute_fn: Callable[[dict], dict] | None = None
+    idempotent: bool = True
+    effect_summary: str = ""
+    rollback_summary: str = ""
 
 
 class LocalToolRegistry:
     """Lists and executes bounded, opt-in local tools."""
 
     def __init__(self, tools: list[LocalTool]):
+        risk_policy = ToolRiskPolicy()
+        for tool in tools:
+            risk_policy.validate_registration(tool.risk, tool.idempotent)
         self._tools = {tool.id: tool for tool in tools}
 
     def list(self) -> list[dict]:
@@ -53,16 +64,23 @@ class LocalToolRegistry:
             "input_schema": tool.input_schema or {"type": "object", "properties": {}},
             "output_schema": tool.output_schema or {"type": "object"},
             "timeout_seconds": tool.timeout_seconds,
+            "requires_confirmation": ToolRiskPolicy().assess(tool.risk).requires_confirmation,
+            "idempotent": tool.idempotent,
+            "effect_summary": tool.effect_summary or tool.description,
+            "rollback_summary": tool.rollback_summary,
         }
 
     def get(self, tool_id: str) -> LocalTool | None:
         return self._tools.get(tool_id)
 
-    def callable_definitions(self, allowed_ids: set[str]) -> list[dict]:
+    def callable_definitions(self, allowed_ids: set[str], confirmed_ids: set[str] | None = None) -> list[dict]:
         definitions = []
         for tool_id in allowed_ids:
             tool = self.get(tool_id)
-            if tool and tool.enabled and tool.execute_fn:
+            requires_confirmation = ToolRiskPolicy().assess(tool.risk).requires_confirmation if tool else True
+            if tool and tool.enabled and tool.execute_fn and (
+                not requires_confirmation or tool_id in (confirmed_ids or set())
+            ):
                 definitions.append({
                     "type": "function",
                     "function": {
@@ -73,10 +91,13 @@ class LocalToolRegistry:
                 })
         return definitions
 
-    def execute(self, tool_id: str, arguments: dict, allowed_ids: set[str]) -> dict:
+    def execute(self, tool_id: str, arguments: dict, allowed_ids: set[str], confirmed_ids: set[str] | None = None) -> dict:
         tool = self.get(tool_id)
         if tool_id not in allowed_ids or not tool or not tool.enabled or not tool.execute_fn:
             raise ValueError("工具未启用或未获授权")
+        decision = ToolRiskPolicy().assess(tool.risk)
+        if decision.requires_confirmation and tool_id not in (confirmed_ids or set()):
+            raise ValueError("工具操作需要用户确认")
         if not isinstance(arguments, dict):
             raise ValueError("工具参数必须是对象")
         self._validate_arguments(arguments, tool.input_schema or {})

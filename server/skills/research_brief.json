@@ -1,0 +1,50 @@
+{
+  "id": "research_brief",
+  "name": "研究简报",
+  "description": "基于公开网页或用户资料形成带来源、边界和行动建议的研究简报。",
+  "version": "1.0.0",
+  "prompt": "先明确研究问题、范围和时间边界，再收集证据。将已验证事实、合理推断和建议分开；关键事实给出对应来源。若证据不足，明确列出缺口，不用模型常识伪装成检索结果。",
+  "input_limit": 12000,
+  "default_enabled": false,
+  "status": "enabled",
+  "kind": "tool_skill",
+  "scope_policy_tools": true,
+  "triggers": {
+    "terms": ["调研", "研究简报", "竞品分析", "资料综述", "research brief"],
+    "patterns": ["(?:搜索|检索).{0,12}(?:资料|来源|网页)"]
+  },
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "topic": {"type": "string"},
+      "scope": {"type": "string"},
+      "time_range": {"type": "string"}
+    },
+    "required": ["topic"]
+  },
+  "tool_ids": ["web_search", "read_web_page"],
+  "resources": ["references/method.md"],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "summary": {"type": "string"},
+      "findings": {"type": "array"},
+      "evidence_gaps": {"type": "array"},
+      "recommendations": {"type": "array"},
+      "sources": {"type": "array"}
+    },
+    "required": ["summary", "findings", "evidence_gaps", "recommendations", "sources"]
+  },
+  "steps": ["定义研究范围", "检索并筛选证据", "区分事实推断与建议", "形成简报并检查来源"],
+  "acceptance_rules": [
+    "每项关键事实能够对应到实际返回的来源",
+    "事实、推断和建议明确区分",
+    "证据不足时列出缺口而不是编造结论",
+    "结尾给出可执行的下一步"
+  ],
+  "eval_cases": [
+    {"input": "调研个人 Agent 平台的主流架构并形成研究简报", "expects_trigger": true},
+    {"input": "帮我润色这段文字", "expects_trigger": false},
+    {"input": "搜索网页资料并总结来源", "expects_trigger": true}
+  ]
+}

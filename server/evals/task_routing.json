@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "name": "Agent_Platform 任务路由评测",
+  "cases": [
+    {"id":"quick_greeting","category":"普通问答","prompt":"你好","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":false,"quality_check":false}},
+    {"id":"quick_explanation","category":"普通问答","prompt":"解释幂等性","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":false}},
+    {"id":"standard_rewrite","category":"结构化任务","prompt":"请改写这段通知","expected_route":{"task_tier":"standard","needs_tools":false,"needs_knowledge":false}},
+    {"id":"standard_code","category":"结构化任务","prompt":"分析这段代码","expected_route":{"task_tier":"standard","needs_tools":false,"needs_knowledge":false}},
+    {"id":"standard_todo","category":"结构化任务","prompt":"补充下一步待办和负责人","expected_route":{"task_tier":"standard","needs_tools":false,"needs_knowledge":false}},
+    {"id":"deep_research","category":"复杂任务","prompt":"请制定产品竞品调研方案","expected_route":{"task_tier":"deep","needs_tools":false,"needs_knowledge":false,"quality_check":true}},
+    {"id":"deep_architecture","category":"复杂任务","prompt":"设计高可用系统架构方案","expected_route":{"task_tier":"deep","needs_tools":false,"needs_knowledge":false}},
+    {"id":"short_complex_proof","category":"短但复杂","prompt":"证明这个并发算法不会死锁","expected_route":{"task_tier":"deep","needs_tools":false,"needs_knowledge":false}},
+    {"id":"short_complex_tradeoff","category":"短但复杂","prompt":"比较 AP 与 CP 并说明关键取舍","expected_route":{"task_tier":"deep","needs_tools":false,"needs_knowledge":true}},
+    {"id":"long_simple_extract","category":"长但简单","prompt":"从下面这段很长的会议记录中提取所有负责人和截止日期，并按负责人、事项、日期三列输出：产品负责人周一完成需求确认，研发负责人周三完成接口联调，测试负责人周五完成回归测试，运营负责人下周一准备上线公告。","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":false}},
+    {"id":"long_simple_translate","category":"长但简单","prompt":"把下面这段英文翻译成中文，保持原意和段落，不需要解释：This document describes a routine weekly status update. It lists completed work, upcoming tasks, and known risks for the project team.","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":false}},
+    {"id":"platform_status","category":"平台工具","prompt":"请告诉我平台状态","expected_route":{"task_tier":"quick","needs_tools":true,"needs_knowledge":false}},
+    {"id":"workspace_lookup","category":"本地工具","prompt":"请查找工作区中的配置文件","expected_route":{"task_tier":"quick","needs_tools":true,"needs_knowledge":false}},
+    {"id":"explicit_web","category":"网页工具","prompt":"请联网查询最新 Agent 新闻","expected_route":{"task_tier":"quick","needs_tools":true,"needs_knowledge":false}},
+    {"id":"realtime_weather","category":"网页工具","prompt":"帮我查一下今天上海的天气","expected_route":{"task_tier":"quick","needs_tools":true,"needs_knowledge":false}},
+    {"id":"realtime_news","category":"网页工具","prompt":"查一下今天最新科技新闻","expected_route":{"task_tier":"quick","needs_tools":true,"needs_knowledge":false}},
+    {"id":"local_knowledge","category":"本地知识","prompt":"请基于本地资料总结结论","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":true}},
+    {"id":"factual_knowledge","category":"事实问题","prompt":"什么是碳足迹","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":true}},
+    {"id":"operational_offline","category":"平台问答","prompt":"这个平台有哪些模型","expected_route":{"task_tier":"quick","needs_tools":false,"needs_knowledge":false}},
+    {"id":"manual_quick","category":"用户覆盖","prompt":"请制定完整产品方案","task_mode":"quick","expected_route":{"task_tier":"quick","route":"manual_task_mode","quality_check":false}},
+    {"id":"manual_standard","category":"用户覆盖","prompt":"你好","task_mode":"standard","expected_route":{"task_tier":"standard","route":"manual_task_mode","quality_check":false}},
+    {"id":"manual_deep","category":"用户覆盖","prompt":"你好","task_mode":"deep","expected_route":{"task_tier":"deep","route":"manual_task_mode","quality_check":true}},
+    {"id":"manual_model","category":"模型覆盖","prompt":"你好","model":"deepseek-v4-pro","expected_route":{"task_tier":"quick","model":"deepseek-v4-pro","route":"manual"}},
+    {"id":"tool_model","category":"模型工具组合","prompt":"请告诉我平台状态","model":"deepseek-v4-pro","expected_route":{"task_tier":"quick","model":"deepseek-v4-pro","route":"manual","needs_tools":true}}
+  ]
+}

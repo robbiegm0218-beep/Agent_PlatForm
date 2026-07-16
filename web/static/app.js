@@ -13,13 +13,14 @@ const state = {
   models: [],
   artifacts: [],
   knowledgeDocuments: [],
+  memories: [],
   selectedSkillIds: [],
   activeView: "chat",
   streaming: false,
 };
 
 const UI_STATE_KEY = "agent_platform_workspace_state";
-const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "artifacts"]);
+const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "memories", "artifacts"]);
 
 const els = {
   loginView: document.querySelector("#loginView"),
@@ -35,6 +36,7 @@ const els = {
   skillsPage: document.querySelector("#skillsPage"),
   settingsPage: document.querySelector("#settingsPage"),
   knowledgePage: document.querySelector("#knowledgePage"),
+  memoriesPage: document.querySelector("#memoriesPage"),
   messages: document.querySelector("#messages"),
   threadTitle: document.querySelector("#threadTitle"),
   modelStatus: document.querySelector("#modelStatus"),
@@ -66,6 +68,13 @@ const els = {
   knowledgeSearch: document.querySelector("#knowledgeSearch"),
   knowledgeList: document.querySelector("#knowledgeList"),
   knowledgeResults: document.querySelector("#knowledgeResults"),
+  memoryForm: document.querySelector("#memoryForm"),
+  memoryKind: document.querySelector("#memoryKind"),
+  memoryScope: document.querySelector("#memoryScope"),
+  memoryContent: document.querySelector("#memoryContent"),
+  memorySearch: document.querySelector("#memorySearch"),
+  memoryNotice: document.querySelector("#memoryNotice"),
+  memoryList: document.querySelector("#memoryList"),
   artifactsPage: document.querySelector("#artifactsPage"),
   artifactsGrid: document.querySelector("#artifactsGrid"),
   threadContextPanel: document.querySelector("#threadContextPanel"),
@@ -173,7 +182,7 @@ function showWorkspace(reveal = true) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadArtifacts()]);
+  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadMemories(), loadArtifacts()]);
   renderThreads();
   renderMessages();
 }
@@ -214,6 +223,7 @@ async function loadThreads() {
 async function loadFolders() {
   const data = await api("/api/folders");
   state.folders = data.folders;
+  renderMemoryScopes();
 }
 
 async function loadThread(threadId) {
@@ -348,6 +358,70 @@ async function loadKnowledge() {
   const data = await api("/api/knowledge");
   state.knowledgeDocuments = data.documents;
   renderKnowledge(data.documents);
+}
+
+async function loadMemories() {
+  const query = els.memorySearch?.value.trim() || "";
+  const data = await api(`/api/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`);
+  state.memories = data.memories;
+  renderMemoryScopes();
+  renderMemories();
+}
+
+function renderMemoryScopes() {
+  if (!els.memoryScope) return;
+  const selected = els.memoryScope.value;
+  els.memoryScope.innerHTML = '<option value="global">所有对话</option>';
+  state.folders.filter((folder) => folder.section === "project").forEach((folder) => {
+    const option = document.createElement("option");
+    option.value = `project:${folder.id}`;
+    option.textContent = `项目：${folder.name}`;
+    els.memoryScope.appendChild(option);
+  });
+  if ([...els.memoryScope.options].some((option) => option.value === selected)) els.memoryScope.value = selected;
+}
+
+function renderMemories() {
+  els.memoryList.innerHTML = "";
+  if (!state.memories.length) {
+    els.memoryList.innerHTML = '<div class="empty-state"><h2>暂无长期记忆</h2><p>明确确认保存的偏好、项目事实和决策会显示在这里。</p></div>';
+    return;
+  }
+  const labels = { preference: "个人偏好", project_fact: "项目事实", decision: "已确认决策" };
+  state.memories.forEach((memory) => {
+    const card = document.createElement("article");
+    card.className = "capability-card memory-card";
+    const scope = memory.scope_type === "project"
+      ? `项目：${state.folders.find((folder) => folder.id === memory.scope_id)?.name || "已删除项目"}`
+      : "所有对话";
+    const status = memory.effective_status === "expired" ? "已过期" : memory.status === "active" ? "使用中" : "已停用";
+    card.innerHTML = `
+      <div><span class="status-pill">${labels[memory.kind] || "长期记忆"}</span></div>
+      <h3>${escapeHtml(memory.content)}</h3>
+      <p>${escapeHtml(scope)} · 已使用 ${memory.use_count} 次 · ${status}</p>
+      <div class="card-footer memory-actions">
+        <label class="switch" title="启用或停用"><input type="checkbox" ${memory.status === "active" ? "checked" : ""} ${memory.effective_status === "expired" ? "disabled" : ""} /><span></span></label>
+        <div><button class="skill-action" type="button">修改</button> <button class="skill-action danger" type="button">删除</button></div>
+      </div>`;
+    const toggle = card.querySelector("input");
+    const [editButton, deleteButton] = card.querySelectorAll("button");
+    toggle.addEventListener("change", async () => {
+      await api(`/api/memories/${memory.id}`, { method: "PATCH", body: JSON.stringify({ status: toggle.checked ? "active" : "disabled" }) });
+      await loadMemories();
+    });
+    editButton.addEventListener("click", async () => {
+      const content = window.prompt("修改长期记忆", memory.content)?.trim();
+      if (!content || content === memory.content) return;
+      await api(`/api/memories/${memory.id}`, { method: "PATCH", body: JSON.stringify({ content }) });
+      await loadMemories();
+    });
+    deleteButton.addEventListener("click", async () => {
+      if (!window.confirm("删除这条长期记忆？删除后不会再用于任何对话。")) return;
+      await api(`/api/memories/${memory.id}`, { method: "DELETE" });
+      await loadMemories();
+    });
+    els.memoryList.appendChild(card);
+  });
 }
 
 async function loadArtifacts() {
@@ -1247,9 +1321,11 @@ function switchView(view) {
   els.skillsPage.classList.toggle("hidden", view !== "skills");
   els.settingsPage.classList.toggle("hidden", view !== "settings");
   els.knowledgePage.classList.toggle("hidden", view !== "knowledge");
+  els.memoriesPage.classList.toggle("hidden", view !== "memories");
   els.artifactsPage.classList.toggle("hidden", view !== "artifacts");
   els.threadContextPanel.classList.toggle("hidden", view !== "chat");
   if (view === "artifacts") loadArtifacts();
+  if (view === "memories") loadMemories();
   document.querySelectorAll(".nav-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
   });
@@ -1723,6 +1799,39 @@ let knowledgeSearchTimer;
 els.knowledgeSearch.addEventListener("input", () => {
   window.clearTimeout(knowledgeSearchTimer);
   knowledgeSearchTimer = window.setTimeout(() => searchKnowledge(), 180);
+});
+
+let memorySearchTimer;
+els.memorySearch.addEventListener("input", () => {
+  window.clearTimeout(memorySearchTimer);
+  memorySearchTimer = window.setTimeout(() => loadMemories().catch((error) => {
+    els.memoryNotice.textContent = error.message;
+  }), 180);
+});
+
+els.memoryForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const content = els.memoryContent.value.trim();
+  if (!content || !window.confirm(`确认将“${content}”保存为长期记忆？`)) return;
+  const scopeValue = els.memoryScope.value;
+  const projectScope = scopeValue.startsWith("project:");
+  try {
+    await api("/api/memories", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: els.memoryKind.value,
+        content,
+        scope_type: projectScope ? "project" : "global",
+        scope_id: projectScope ? scopeValue.slice(8) : "",
+        confirmed: true,
+      }),
+    });
+    els.memoryContent.value = "";
+    els.memoryNotice.textContent = "长期记忆已保存";
+    await loadMemories();
+  } catch (error) {
+    els.memoryNotice.textContent = error.message;
+  }
 });
 
 document.querySelectorAll(".nav-button[data-view]").forEach((button) => {
