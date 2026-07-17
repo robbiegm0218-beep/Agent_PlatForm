@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
@@ -39,13 +40,14 @@ try:
     from server.mcp_client import McpServerConfig, McpToolManager
     from server.tool_policy import ToolPolicy
     from server.task_router import TaskRouter, classify_knowledge_intent
-    from server.knowledge_retrieval import KnowledgeRetriever
+    from server.knowledge_retrieval import KnowledgeRetriever, query_terms
     from server.structured_context import StructuredContextBuilder
     from server.memory_policy import (
         MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content,
     )
     from server.safe_web_reader import SafeWebPageReader
     from server.skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
+    from server.intent_planner import IntentPlanner
 except ModuleNotFoundError:
     from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
     from agent_runtime import AgentRuntimeStore, RuntimeDependencies
@@ -57,13 +59,14 @@ except ModuleNotFoundError:
     from mcp_client import McpServerConfig, McpToolManager
     from tool_policy import ToolPolicy
     from task_router import TaskRouter, classify_knowledge_intent
-    from knowledge_retrieval import KnowledgeRetriever
+    from knowledge_retrieval import KnowledgeRetriever, query_terms
     from structured_context import StructuredContextBuilder
     from memory_policy import (
         MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content,
     )
     from safe_web_reader import SafeWebPageReader
     from skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
+    from intent_planner import IntentPlanner
 
 try:
     import certifi
@@ -88,6 +91,7 @@ def resolve_artifact_node() -> str:
 
 ARTIFACT_NODE = resolve_artifact_node()
 ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
+INTENT_PLANNER = IntentPlanner()
 
 
 def deployment_environment() -> str:
@@ -187,12 +191,18 @@ MODEL_CATALOG = {
         "name": "DeepSeek V4 Flash",
         "tier": "quick",
         "supports_tools": True,
+        "vision": False,
+        "structured_output": False,
+        "context_window": None,
         "max_output_tokens": {"quick": 2048, "standard": 4096, "deep": 6144},
     },
     "deepseek-v4-pro": {
         "name": "DeepSeek V4 Pro",
         "tier": "deep",
         "supports_tools": True,
+        "vision": False,
+        "structured_output": False,
+        "context_window": None,
         "max_output_tokens": {"quick": 4096, "standard": 6144, "deep": 8192},
     },
 }
@@ -212,6 +222,9 @@ for provider_config in EXTERNAL_PROVIDER_CONFIGS:
             "name": f"{provider_config.display_name} · {model_id}",
             "tier": "standard",
             "supports_tools": False,
+            "vision": False,
+            "structured_output": False,
+            "context_window": None,
             "max_output_tokens": {"quick": 2048, "standard": 4096, "deep": 4096},
             "provider_id": provider_config.provider_id,
         }
@@ -244,8 +257,14 @@ def build_model_registry() -> ModelRegistry:
                 provider_id=provider_id,
                 model_id=model_id,
                 display_name=profile["name"],
-                capabilities=ModelCapabilities(streaming=True, tool_calling=profile["supports_tools"]),
+                capabilities=ModelCapabilities(
+                    streaming=True,
+                    tool_calling=profile["supports_tools"],
+                    vision=profile.get("vision", False),
+                    structured_output=profile.get("structured_output", False),
+                ),
                 task_tier=profile["tier"],
+                context_window=profile.get("context_window"),
                 max_output_tokens=max(profile["max_output_tokens"].values()),
             )
         )
@@ -788,6 +807,26 @@ def init_db() -> None:
                 sequence INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS run_feedback (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                rating INTEGER NOT NULL,
+                note TEXT DEFAULT '',
+                citation_correct INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS manual_tool_invocations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                tool_id TEXT NOT NULL,
+                argument_keys TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                result_summary TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS user_enabled_skills (
                 user_id TEXT NOT NULL,
@@ -909,6 +948,7 @@ def init_db() -> None:
         ensure_column(conn, "runs", "run_phase", "TEXT NOT NULL DEFAULT 'planning'")
         ensure_column(conn, "runs", "phase_updated_at", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "resume_policy", "TEXT DEFAULT '{}'")
+        ensure_column(conn, "run_feedback", "citation_correct", "INTEGER")
         ensure_column(conn, "run_events", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(conn, "run_events", "sequence", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "sessions", "expires_at", "INTEGER DEFAULT 0")
@@ -1002,6 +1042,10 @@ def infer_task_profile(content: str, requested_model: str = "auto", requested_ta
     return TASK_ROUTER.route(content, requested_model, requested_task_mode).as_profile()
 
 
+def plan_intent(content: str, task_profile: dict) -> dict:
+    return INTENT_PLANNER.plan(content, task_profile).as_dict()
+
+
 def resolve_execution_modes(payload: dict) -> dict:
     """Normalize user-controlled evidence and tool execution boundaries."""
     modes = {
@@ -1040,8 +1084,53 @@ def extract_knowledge_text(filename: str, raw: bytes) -> str:
         if not PdfReader:
             raise ValueError("当前环境未安装 PDF 解析组件 pypdf")
         reader = PdfReader(io.BytesIO(raw))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    raise ValueError("仅支持 Markdown、TXT、DOCX 和 PDF 文件")
+        return "\n\n".join(f"【PDF 第 {index + 1} 页】\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages))
+    if suffix == ".xlsx":
+        return extract_xlsx_knowledge_text(raw)
+    raise ValueError("仅支持 Markdown、TXT、DOCX、PDF 和 XLSX 文件")
+
+
+def extract_xlsx_knowledge_text(raw: bytes) -> str:
+    """Extract displayed cell values from XLSX locally, preserving worksheet provenance."""
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    rel_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package_rel_namespace = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            shared = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared = ["".join(node.itertext()).strip() for node in root.findall(f"{namespace}si")]
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            targets = {relation.attrib.get("Id"): relation.attrib.get("Target", "") for relation in relationships.findall(f"{package_rel_namespace}Relationship")}
+            sheets = []
+            for sheet in workbook.findall(f"{namespace}sheets/{namespace}sheet"):
+                rel_id = sheet.attrib.get(f"{rel_namespace}id")
+                target = targets.get(rel_id, "")
+                path = "xl/" + target.lstrip("/")
+                if path not in archive.namelist():
+                    continue
+                sheet_root = ET.fromstring(archive.read(path))
+                rows = []
+                for row in sheet_root.findall(f".//{namespace}sheetData/{namespace}row"):
+                    values = []
+                    for cell in row.findall(f"{namespace}c"):
+                        value = cell.findtext(f"{namespace}v", default="")
+                        if cell.attrib.get("t") == "s" and value.isdigit() and int(value) < len(shared):
+                            value = shared[int(value)]
+                        elif cell.attrib.get("t") == "inlineStr":
+                            value = "".join(cell.find(f"{namespace}is").itertext()) if cell.find(f"{namespace}is") is not None else ""
+                        values.append(value.strip())
+                    if any(values):
+                        rows.append(" | ".join(values))
+                if rows:
+                    sheets.append(f"【工作表：{sheet.attrib.get('name', '未命名')}】\n" + "\n".join(rows))
+    except (KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
+        raise ValueError("无法解析 Excel 文件") from exc
+    if not sheets:
+        raise ValueError("Excel 文件中没有可检索的文本单元格")
+    return "\n\n".join(sheets)
 
 
 def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list[str]:
@@ -1081,6 +1170,31 @@ def search_knowledge(user_id: str, query: str, limit: int = 4) -> list[dict]:
     return retriever.search(query, rows)
 
 
+def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: dict) -> tuple[list[dict], dict]:
+    """Retrieve once, then make at most one explainable lexical retry."""
+    primary = search_knowledge(user_id, content)
+    terms = query_terms(content)
+    expected_matches = 1 if len(terms) <= 1 else 2
+    top = primary[0] if primary else None
+    sufficient = bool(top and len(top.get("matched_terms", [])) >= expected_matches and top.get("score", 0) >= 2.0)
+    trace = {"initial_query": content[:300], "initial_matches": len(primary), "sufficient": sufficient, "retry_query": "", "retry_matches": 0}
+    if sufficient or not intent_plan.get("knowledge_needed"):
+        return primary, trace
+    retry_query = " ".join(terms[:8]).strip()
+    if not retry_query or retry_query == content:
+        return primary, trace
+    retry = search_knowledge(user_id, retry_query)
+    merged: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for reference in [*primary, *retry]:
+        key = (str(reference.get("document_id", "")), int(reference.get("position", 0)))
+        if key not in seen:
+            seen.add(key)
+            merged.append(reference)
+    trace.update({"retry_query": retry_query, "retry_matches": len(retry), "sufficient": bool(merged)})
+    return merged[:4], trace
+
+
 def build_execution_plan(content: str, active_skills: list[dict], allowed_tools: list[dict]) -> list[dict]:
     def step(step_id: str, title: str, phase: str, *, requires_confirmation: bool = False, timeout_seconds: int = 30, max_retries: int = 0) -> dict:
         return {
@@ -1110,7 +1224,7 @@ def build_execution_plan(content: str, active_skills: list[dict], allowed_tools:
 
 def build_execution_context(
     user_id: str, task_profile: dict, active_skills: list[dict], requested_skill_ids: list[str] | None,
-    content: str, knowledge_refs: list[dict], execution_modes: dict | None = None,
+    content: str, knowledge_refs: list[dict], execution_modes: dict | None = None, intent_plan: dict | None = None,
 ) -> dict:
     execution_modes = execution_modes or {"knowledge": "auto", "web": "auto", "file": "auto", "source": "general"}
     tool_decision = TOOL_POLICY.decide(content)
@@ -1156,8 +1270,9 @@ def build_execution_context(
         "input_limit": min([skill["input_limit"] for skill in active_skills] or [MAX_REQUEST_BYTES]),
         "task_preview": content[:160],
         "knowledge_refs": knowledge_refs,
-        "knowledge_route": "retrieved" if knowledge_refs else ("required_no_match" if execution_modes["knowledge"] == "required" or task_profile["needs_knowledge"] else "not_needed"),
+        "knowledge_route": "retrieved" if knowledge_refs else ("insufficient" if (intent_plan or {}).get("knowledge_needed") else ("required_no_match" if execution_modes["knowledge"] == "required" or task_profile["needs_knowledge"] else "not_needed")),
         "knowledge_intent": task_profile["knowledge_intent"],
+        "intent_plan": intent_plan or plan_intent(content, task_profile),
         "knowledge_match_count": len(knowledge_refs),
         "execution_modes": execution_modes,
         "required_tool_errors": required_tool_errors,
@@ -1320,6 +1435,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                         "tool_calling": registered.capabilities.tool_calling if registered else profile["supports_tools"],
                         "vision": registered.capabilities.vision if registered else False,
                         "structured_output": registered.capabilities.structured_output if registered else False,
+                        "context_window": registered.context_window if registered else profile.get("context_window"),
                     },
                 })
             self.send_json({"models": models, "default_model": DEEPSEEK_MODEL, "deep_model": DEEPSEEK_DEEP_MODEL})
@@ -1350,6 +1466,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/folders/"):
             self.get_space(user)
+            return
+        if self.path.startswith("/api/runs?"):
+            self.list_all_runs(user)
             return
         if self.path.startswith("/api/runs/"):
             self.get_run(user)
@@ -1384,6 +1503,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/tools":
             self.send_json({"tools": LOCAL_TOOLS.list()})
+            return
+        if self.path == "/api/tool-invocations":
+            self.list_manual_tool_invocations(user)
             return
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
@@ -1435,6 +1557,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/runs/") and self.path.endswith("/cancel"):
             self.cancel_run(user)
+            return
+        if self.path.startswith("/api/runs/") and self.path.endswith("/feedback"):
+            self.create_run_feedback(user)
+            return
+        if self.path.startswith("/api/tools/") and self.path.endswith("/execute"):
+            self.execute_manual_tool(user)
             return
         if self.path == "/api/route-preview":
             try:
@@ -2027,6 +2155,51 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
         self.send_json({"runs": [row_to_dict(row) for row in rows]})
 
+    def list_all_runs(self, user: dict) -> None:
+        """Return a bounded, user-isolated audit list without exposing run content."""
+        query = parse_qs(urlparse(self.path).query)
+        status = query.get("status", [""])[0]
+        tier = query.get("tier", [""])[0]
+        model = query.get("model", [""])[0]
+        tool = query.get("tool", [""])[0]
+        knowledge = query.get("knowledge", [""])[0]
+        if status and status not in {"completed", "failed", "cancelled", "running", "awaiting_confirmation"}:
+            raise ValueError("运行状态筛选无效")
+        if tier and tier not in {"quick", "standard", "deep"}:
+            raise ValueError("任务档位筛选无效")
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT runs.id, runs.status, runs.model, runs.started_at, runs.completed_at, runs.run_phase,
+                          runs.execution_context, threads.title AS thread_title
+                   FROM runs JOIN threads ON threads.id = runs.thread_id
+                   WHERE threads.user_id = ? ORDER BY runs.started_at DESC, runs.id DESC LIMIT 200""",
+                (user["id"],),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = row_to_dict(row)
+            context = safe_json_object(item.pop("execution_context", "{}"))
+            if status and item["status"] != status:
+                continue
+            if tier and context.get("task_tier") != tier:
+                continue
+            if model and item["model"] != model:
+                continue
+            if tool and tool not in context.get("allowed_tool_ids", []):
+                continue
+            has_knowledge = bool(context.get("knowledge_refs"))
+            if knowledge == "used" and not has_knowledge:
+                continue
+            if knowledge == "none" and has_knowledge:
+                continue
+            item.update({
+                "task_tier": context.get("task_tier", "standard"),
+                "knowledge_used": has_knowledge,
+                "tool_count": len(context.get("allowed_tool_ids", [])),
+            })
+            result.append(item)
+        self.send_json({"runs": result, "filters": {"status": status, "tier": tier, "model": model, "tool": tool, "knowledge": knowledge}})
+
     def get_run(self, user: dict) -> None:
         run_id = self.path.split("/")[-1]
         with db() as conn:
@@ -2138,6 +2311,59 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             append_run_event(conn, run_id, "cancelled", {"source": "user"})
         self.send_json({"ok": True, "run_id": run_id, "status": "cancelled"})
 
+    def create_run_feedback(self, user: dict) -> None:
+        run_id = self.path.split("/")[-2]
+        payload = self.read_json()
+        rating = payload.get("rating")
+        if not isinstance(rating, int) or rating not in {-1, 1}:
+            self.send_error_json("反馈评分必须为 1 或 -1")
+            return
+        note = str(payload.get("note", ""))[:800]
+        citation_correct = payload.get("citation_correct")
+        if citation_correct is not None and not isinstance(citation_correct, bool):
+            self.send_error_json("引用评价必须为布尔值")
+            return
+        with db() as conn:
+            run = conn.execute("SELECT runs.id FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
+            if not run:
+                self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
+                return
+            conn.execute("DELETE FROM run_feedback WHERE run_id = ? AND user_id = ?", (run_id, user["id"]))
+            conn.execute("INSERT INTO run_feedback (id, run_id, user_id, rating, note, citation_correct, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id("feedback"), run_id, user["id"], rating, note, int(citation_correct) if citation_correct is not None else None, now()))
+            append_run_event(conn, run_id, "user_feedback", {"rating": rating, "citation_correct": citation_correct, "has_note": bool(note)})
+        self.send_json({"ok": True, "run_id": run_id, "rating": rating, "citation_correct": citation_correct})
+
+    def list_manual_tool_invocations(self, user: dict) -> None:
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT id, tool_id, argument_keys, status, duration_ms, result_summary, error, created_at
+                   FROM manual_tool_invocations WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 100""",
+                (user["id"],),
+            ).fetchall()
+        self.send_json({"invocations": [row_to_dict(row) for row in rows]})
+
+    def execute_manual_tool(self, user: dict) -> None:
+        tool_id = self.path.split("/")[-2]
+        tool = LOCAL_TOOLS.get(tool_id)
+        if not tool or not tool.enabled or tool.risk != "read_only":
+            self.send_error_json("该工具不可在此处手动执行", HTTPStatus.FORBIDDEN)
+            return
+        arguments = self.read_json().get("arguments", {})
+        invocation_id = new_id("toolrun")
+        started = time.monotonic_ns()
+        try:
+            result = LOCAL_TOOLS.execute(tool_id, arguments, {tool_id})
+            result_summary = f"已返回 {len(result)} 个顶层字段：" + "、".join(sorted(str(key) for key in result)[:12])
+            duration_ms = round((time.monotonic_ns() - started) / 1_000_000)
+            with db() as conn:
+                conn.execute("INSERT INTO manual_tool_invocations (id, user_id, tool_id, argument_keys, status, duration_ms, result_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (invocation_id, user["id"], tool_id, json.dumps(sorted(arguments)), "completed", duration_ms, result_summary, now()))
+            self.send_json({"invocation": {"id": invocation_id, "tool_id": tool_id, "status": "completed", "duration_ms": duration_ms}, "result": result})
+        except (ValueError, TypeError, KeyError) as exc:
+            duration_ms = round((time.monotonic_ns() - started) / 1_000_000)
+            with db() as conn:
+                conn.execute("INSERT INTO manual_tool_invocations (id, user_id, tool_id, argument_keys, status, duration_ms, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (invocation_id, user["id"], tool_id, json.dumps(sorted(arguments)) if isinstance(arguments, dict) else "[]", "failed", duration_ms, str(exc)[:500], now()))
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+
     def get_metrics(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
@@ -2162,9 +2388,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                    SELECT run_approval_requests.status AS status FROM run_approval_requests JOIN runs ON runs.id = run_approval_requests.run_id JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ?""",
                 (user["id"], user["id"]),
             ).fetchall()
+            feedback = conn.execute("SELECT rating, citation_correct FROM run_feedback WHERE user_id = ?", (user["id"],)).fetchall()
         buckets: dict[str, dict] = {}
         routes: dict[str, int] = {}
-        knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0}
+        knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0, "insufficient": 0, "retried": 0}
+        decisions = {"runs": 0, "implicit_knowledge_retrievals": 0, "low_confidence": 0}
         for row in rows:
             run = row_to_dict(row)
             context = json.loads(run["execution_context"] or "{}")
@@ -2182,6 +2410,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             knowledge["runs"] += 1
             if context.get("knowledge_match_count", 0): knowledge["with_matches"] += 1
             if context.get("knowledge_route") == "required_no_match": knowledge["required_no_match"] += 1
+            if context.get("knowledge_route") == "insufficient": knowledge["insufficient"] += 1
+            if context.get("retrieval_trace", {}).get("retry_query"): knowledge["retried"] += 1
+            decisions["runs"] += 1
+            intent = context.get("intent_plan", {})
+            if intent.get("confidence") == "low": decisions["low_confidence"] += 1
+            if intent.get("knowledge_needed") and not context.get("knowledge_intent", {}).get("needed"):
+                decisions["implicit_knowledge_retrievals"] += 1
         for bucket in buckets.values():
             bucket["average_seconds"] = round(bucket["average_seconds"] / bucket["runs"], 2)
         successes = sum(event["type"] == "tool_result" for event in tool_events)
@@ -2204,7 +2439,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         for bucket in buckets.values():
             bucket["completion_rate"] = round(bucket["completed"] / bucket["runs"], 4) if bucket["runs"] else 0.0
         knowledge["match_rate"] = round(knowledge["with_matches"] / knowledge["runs"], 4) if knowledge["runs"] else 0.0
-        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge})
+        citation_feedback = [row for row in feedback if row["citation_correct"] is not None]
+        feedback_metrics = {
+            "count": len(feedback),
+            "positive": sum(row["rating"] == 1 for row in feedback),
+            "negative": sum(row["rating"] == -1 for row in feedback),
+            "citation_assessed": len(citation_feedback),
+            "citation_correct": sum(row["citation_correct"] == 1 for row in citation_feedback),
+            "citation_accuracy": round(sum(row["citation_correct"] == 1 for row in citation_feedback) / len(citation_feedback), 4) if citation_feedback else None,
+        }
+        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "feedback": feedback_metrics})
 
     def list_knowledge(self, user: dict) -> None:
         with db() as conn:
@@ -2492,6 +2736,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             raise ValueError("模型或任务档位无效")
         modes = resolve_execution_modes(payload)
         task_profile = infer_task_profile(content, requested_model, requested_task_mode)
+        intent_plan = plan_intent(content, task_profile)
         thread_id = str(payload.get("thread_id", ""))
         requested_skill_ids = payload.get("skill_ids")
         if requested_skill_ids is not None and (
@@ -2499,9 +2744,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         ):
             raise ValueError("技能参数无效")
         active_skills = enabled_skills(user["id"], thread_id, requested_skill_ids=requested_skill_ids)
-        needs_knowledge = modes["knowledge"] == "required" or (modes["knowledge"] == "auto" and task_profile["needs_knowledge"])
-        knowledge_refs = search_knowledge(user["id"], content) if needs_knowledge else []
-        context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, modes)
+        needs_knowledge = modes["knowledge"] == "required" or (modes["knowledge"] == "auto" and intent_plan["knowledge_needed"])
+        knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan) if needs_knowledge else ([], {})
+        context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, modes, intent_plan)
         self.send_json({
             "ready": True,
             "task_tier": context["task_tier"],
@@ -2511,6 +2756,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             "allowed_tools": [{"id": tool["id"], "name": tool["name"]} for tool in context["tools"]],
             "tool_reason": context["tool_route_reason"],
             "memory_count": 0,
+            "intent_plan": intent_plan,
+            "retrieval_trace": retrieval_trace,
             "required_errors": context["required_tool_errors"],
         })
 
@@ -2623,16 +2870,19 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
             structured_context = refresh_structured_context(conn, thread_id)
             active_skills = requested_active_skills if requested_active_skills is not None else enabled_skills(user["id"], thread_id)
+            intent_plan = plan_intent(content, task_profile)
             needs_knowledge = execution_modes["knowledge"] == "required" or (
-                execution_modes["knowledge"] == "auto" and task_profile["needs_knowledge"]
+                execution_modes["knowledge"] == "auto" and intent_plan["knowledge_needed"]
             )
-            knowledge_refs = search_knowledge(user["id"], content) if needs_knowledge else []
+            knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan) if needs_knowledge else ([], {})
             memories = load_relevant_memories(conn, user["id"], thread_id, content)
             execution_context = build_execution_context(
-                user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes,
+                user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes, intent_plan,
             )
             execution_context["structured_context"] = STRUCTURED_CONTEXT.select(structured_context, content)
             execution_context["memories"] = memories
+            execution_context["space_context"] = load_space_context(conn, user["id"], thread_id)
+            execution_context["retrieval_trace"] = retrieval_trace
             execution_context["route_summary"]["memory_count"] = len(memories)
             if handoff_from:
                 execution_context["handoff"] = {
@@ -2682,6 +2932,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "execution_modes": execution_context["execution_modes"],
                 "knowledge_matches": len(knowledge_refs),
                 "memory_count": len(memories),
+                "intent_plan": execution_context["intent_plan"],
             })
             append_run_event(conn, run_id, "skill_routed", {
                 "route": execution_context["skill_route"],
@@ -2694,6 +2945,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "count": len(knowledge_refs),
                 "intent": task_profile["knowledge_intent"]["reason"],
             })
+            if retrieval_trace:
+                append_run_event(conn, run_id, "knowledge_retrieval_assessed", retrieval_trace)
+                if retrieval_trace.get("retry_query"):
+                    append_run_event(conn, run_id, "knowledge_retrieval_retried", {
+                        "query": retrieval_trace["retry_query"], "matches": retrieval_trace["retry_matches"],
+                    })
             append_run_event(conn, run_id, "plan_created", {"steps": execution_plan})
             conn.executemany(
                 """
@@ -2944,6 +3201,21 @@ def load_relevant_memories(conn: sqlite3.Connection, user_id: str, thread_id: st
     return select_memories(rows, query, project_id, now_value=now())
 
 
+def load_space_context(conn: sqlite3.Connection, user_id: str, thread_id: str) -> dict:
+    """Small, user-isolated workspace summary for tasks that belong to a space."""
+    thread = conn.execute("SELECT folder_id FROM threads WHERE id = ? AND user_id = ?", (thread_id, user_id)).fetchone()
+    space_id = thread["folder_id"] if thread else ""
+    if not space_id:
+        return {}
+    space = conn.execute("SELECT name FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user_id)).fetchone()
+    if not space:
+        return {}
+    tasks = conn.execute("SELECT id, title, updated_at FROM threads WHERE user_id = ? AND folder_id = ? ORDER BY updated_at DESC LIMIT 6", (user_id, space_id)).fetchall()
+    artifacts = conn.execute("""SELECT artifacts.filename, artifacts.kind FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
+        WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY artifacts.created_at DESC LIMIT 4""", (user_id, space_id)).fetchall()
+    return {"id": space_id, "name": space["name"], "tasks": [row_to_dict(row) for row in tasks], "artifacts": [row_to_dict(row) for row in artifacts]}
+
+
 def refresh_structured_context(conn: sqlite3.Connection, thread_id: str) -> dict:
     thread = conn.execute(
         "SELECT structured_context FROM threads WHERE id = ?", (thread_id,)
@@ -3007,6 +3279,7 @@ def build_system_prompt(execution_context: dict) -> str:
     skill_prompts = enabled_skill_prompts(active_skills)
     if skill_prompts:
         system_prompt += "\n\n[技能规则]\n本次消息仅允许使用以下技能：\n" + "\n\n".join(skill_prompts)
+        system_prompt += "\n\n[技能验收]\n完成前逐项检查已启用技能的验收规则。无法满足某项规则时，明确说明缺少的证据、工具结果或用户输入；不得把未执行步骤描述为已完成。"
     else:
         system_prompt += "\n\n[技能规则]\n本次消息没有启用技能。不得声称或使用任何技能。"
     skill_resources = execution_context.get("skill_resources", [])
@@ -3031,6 +3304,11 @@ def build_system_prompt(execution_context: dict) -> str:
             "\n\n[结构化上下文]\n以下内容来自历史消息的可追溯状态，仅使用仍为 active 的条目。"
             "若当前用户消息与其冲突，以当前消息为准；不要把开放问题表述为已确认事实。\n" + structured_text
         )
+    space_context = execution_context.get("space_context", {})
+    if space_context:
+        task_names = "、".join(item["title"] for item in space_context.get("tasks", [])[:6]) or "暂无其他任务"
+        artifact_names = "、".join(item["filename"] for item in space_context.get("artifacts", [])[:4]) or "暂无产物"
+        system_prompt += f"\n\n[当前空间]\n空间：{space_context['name']}。近期任务：{task_names}。已有产物：{artifact_names}。仅在与当前请求相关时使用，不得把空间内容当作已验证资料。"
     memories = execution_context.get("memories", [])
     if memories:
         memory_text = "\n".join(
@@ -3073,8 +3351,8 @@ def build_system_prompt(execution_context: dict) -> str:
     if references:
         source_text = "\n\n".join(f"资料：{item['filename']}\n内容：{item['excerpt']}" for item in references)
         system_prompt += "\n\n[本地资料]\n以下为本次检索到的资料片段。引用资料中的事实时，请在对应表述后标注资料名称；资料未覆盖的内容需说明是建议或推断。\n" + source_text
-    elif execution_context.get("knowledge_route") == "required_no_match":
-        system_prompt += "\n\n[资料边界]\n本次任务需要资料依据，但本地知识库没有命中内容。不得把模型常识说成已验证事实；请将结论表述为建议、假设或待验证项。"
+    elif execution_context.get("knowledge_route") in {"required_no_match", "insufficient"}:
+        system_prompt += "\n\n[资料边界]\n本次任务需要或可能依赖本地资料，但检索未获得足够证据。不得把模型常识说成已验证事实；请明确说明资料不足，并建议用户补充资料、关键词或范围。"
     web_sources = execution_context.get("web_search_sources", [])
     if web_sources:
         source_text = "\n\n".join(
@@ -3094,7 +3372,10 @@ def build_system_prompt(execution_context: dict) -> str:
 
 
 def append_knowledge_sources(answer: str, references: list[dict], knowledge_route: str) -> str:
-    labels = list(dict.fromkeys(f"{item['filename']}（片段 {item['position'] + 1}）" for item in references))
+    labels = list(dict.fromkeys(
+        f"{item['filename']}（片段 {item['position'] + 1} · 摘录：{re.sub(r'\s+', ' ', item.get('excerpt', '')).strip()[:88]}）"
+        for item in references
+    ))
     if labels:
         return answer.rstrip() + "\n\n参考资料：" + "、".join(labels)
     if knowledge_route == "required_no_match":

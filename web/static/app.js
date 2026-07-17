@@ -15,6 +15,7 @@ const state = {
   skills: [],
   models: [],
   artifacts: [],
+  tools: [],
   knowledgeDocuments: [],
   memories: [],
   selectedSkillIds: [],
@@ -50,6 +51,11 @@ const els = {
   runDrawer: document.querySelector("#runDrawer"),
   closeRunDrawer: document.querySelector("#closeRunDrawer"),
   runList: document.querySelector("#runList"),
+  viewAllRunsButton: document.querySelector("#viewAllRunsButton"),
+  runFilters: document.querySelector("#runFilters"),
+  runStatusFilter: document.querySelector("#runStatusFilter"),
+  runTierFilter: document.querySelector("#runTierFilter"),
+  runKnowledgeFilter: document.querySelector("#runKnowledgeFilter"),
   runDetail: document.querySelector("#runDetail"),
   chatForm: document.querySelector("#chatForm"),
   chatInput: document.querySelector("#chatInput"),
@@ -358,11 +364,8 @@ function toggleSelectedSkill(skillId) {
 
 async function loadApps() {
   const [apps, tools] = await Promise.all([api("/api/apps"), api("/api/tools")]);
-  renderApps([...apps.apps, ...tools.tools.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    status: tool.enabled ? "本地可用" : "未启用",
-  }))]);
+  state.tools = tools.tools;
+  renderApps(apps.apps, tools.tools);
 }
 
 async function loadKnowledge() {
@@ -890,6 +893,17 @@ async function loadRuns() {
   await loadThreadContext();
 }
 
+async function loadAuditRuns() {
+  const params = new URLSearchParams();
+  if (els.runStatusFilter.value) params.set("status", els.runStatusFilter.value);
+  if (els.runTierFilter.value) params.set("tier", els.runTierFilter.value);
+  if (els.runKnowledgeFilter.value) params.set("knowledge", els.runKnowledgeFilter.value);
+  const data = await api(`/api/runs?${params.toString()}`);
+  state.runs = data.runs;
+  renderRuns();
+  els.runDetail.textContent = "已按筛选条件显示最近 200 条运行。选择一条查看可审计详情。";
+}
+
 async function loadThreadContext() {
   if (!state.currentThreadId) return;
   const data = await api(`/api/threads/${state.currentThreadId}/context`);
@@ -1068,6 +1082,32 @@ async function loadRunDetail(runId) {
     els.runDetail.appendChild(artifactBlock);
   }
 
+  if (context.knowledge_refs?.length) {
+    const feedback = document.createElement("div");
+    feedback.className = "confirmation-actions run-feedback";
+    const label = document.createElement("span");
+    label.textContent = "本次引用是否准确？";
+    feedback.append(label);
+    [[true, "引用准确"], [false, "引用有误"]].forEach(([citationCorrect, text]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary";
+      button.textContent = text;
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await api(`/api/runs/${run.id}/feedback`, { method: "POST", body: JSON.stringify({ rating: citationCorrect ? 1 : -1, citation_correct: citationCorrect }) });
+          feedback.replaceChildren(Object.assign(document.createElement("span"), { textContent: "已记录引用评价" }));
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = error.message || "提交失败";
+        }
+      });
+      feedback.append(button);
+    });
+    els.runDetail.appendChild(feedback);
+  }
+
   if (["running", "awaiting_confirmation"].includes(run.status)) {
     const actions = document.createElement("div");
     actions.className = "confirmation-actions";
@@ -1151,7 +1191,7 @@ function renderMessageContent(element, content, role = "assistant") {
     const source = document.createElement("button");
     source.type = "button";
     source.className = "knowledge-source-link";
-    const filename = sourceLabel.replace(/（片段\s*\d+）$/, "");
+    const filename = sourceLabel.replace(/（片段\s*\d+(?:\s*·\s*摘录：[\s\S]*)?）$/, "");
     source.textContent = sourceLabel;
     source.title = `查看本地资料：${filename}`;
     source.addEventListener("click", async () => {
@@ -1399,7 +1439,7 @@ async function restoreSkillVersion(skill) {
   await loadSkills();
 }
 
-function renderApps(apps) {
+function renderApps(apps, tools = []) {
   els.appsGrid.innerHTML = "";
   apps.forEach((app) => {
     const card = document.createElement("article");
@@ -1411,6 +1451,59 @@ function renderApps(apps) {
         <span class="status-pill">${escapeHtml(app.status)}</span>
       </div>
     `;
+    els.appsGrid.appendChild(card);
+  });
+  tools.forEach((tool) => {
+    const card = document.createElement("article");
+    card.className = "capability-card tool-card";
+    const heading = document.createElement("h3");
+    heading.textContent = tool.name;
+    const description = document.createElement("p");
+    description.textContent = tool.description;
+    const form = document.createElement("form");
+    form.className = "tool-form";
+    const properties = tool.input_schema?.properties || {};
+    Object.entries(properties).forEach(([key, definition]) => {
+      const label = document.createElement("label");
+      label.textContent = definition.description || key;
+      const input = document.createElement("input");
+      input.name = key;
+      input.type = definition.type === "integer" ? "number" : "text";
+      input.required = (tool.input_schema?.required || []).includes(key);
+      if (definition.type === "integer") input.min = key === "limit" ? "1" : "";
+      label.appendChild(input);
+      form.appendChild(label);
+    });
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.textContent = tool.enabled ? "执行" : "未启用";
+    submit.disabled = !tool.enabled;
+    const result = document.createElement("pre");
+    result.className = "tool-result hidden";
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const argumentsValue = {};
+      Object.entries(properties).forEach(([key, definition]) => {
+        const raw = form.elements[key]?.value.trim();
+        if (raw !== "") argumentsValue[key] = definition.type === "integer" ? Number(raw) : raw;
+      });
+      submit.disabled = true;
+      result.classList.remove("hidden");
+      result.textContent = "正在执行…";
+      try {
+        const response = await api(`/api/tools/${tool.id}/execute`, { method: "POST", body: JSON.stringify({ arguments: argumentsValue }) });
+        result.textContent = JSON.stringify(response.result, null, 2);
+      } catch (error) {
+        result.textContent = `执行失败：${error.message}\n修改参数后可再次执行。`;
+      } finally {
+        submit.disabled = !tool.enabled;
+      }
+    });
+    form.append(submit, result);
+    const footer = document.createElement("div");
+    footer.className = "card-footer";
+    footer.innerHTML = `<span class="status-pill">${tool.enabled ? "本地只读工具" : "未启用"}</span>`;
+    card.append(heading, description, form, footer);
     els.appsGrid.appendChild(card);
   });
 }
@@ -1846,11 +1939,20 @@ els.threadSearch.addEventListener("input", renderThreads);
 
 els.runDetailsButton.addEventListener("click", () => {
   els.runDrawer.classList.remove("hidden");
+  els.runFilters.classList.add("hidden");
   renderRuns();
   if (state.runs[0]) loadRunDetail(state.runs[0].id);
 });
 
 els.closeRunDrawer.addEventListener("click", () => els.runDrawer.classList.add("hidden"));
+els.viewAllRunsButton.addEventListener("click", async () => {
+  els.runDrawer.classList.remove("hidden");
+  els.runFilters.classList.remove("hidden");
+  await loadAuditRuns();
+});
+[els.runStatusFilter, els.runTierFilter, els.runKnowledgeFilter].forEach((select) => {
+  select.addEventListener("change", () => loadAuditRuns().catch((error) => { els.runDetail.textContent = error.message; }));
+});
 
 els.viewKnowledgeButton.addEventListener("click", () => switchView("knowledge"));
 els.viewArtifactsButton.addEventListener("click", () => switchView("artifacts"));

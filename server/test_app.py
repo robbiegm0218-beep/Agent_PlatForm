@@ -572,6 +572,18 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("success_rate", metrics["tools"])
         self.assertIn("confirmation_rejection_rate", metrics["tools"])
         self.assertGreaterEqual(metrics["tools"]["average_duration_ms"], 0)
+        audit_runs = self.request_json("/api/runs?tier=quick", token=self.token)["runs"]
+        self.assertEqual(len(audit_runs), 1)
+        self.assertEqual(audit_runs[0]["task_tier"], "quick")
+
+    def test_manual_read_only_tool_execution_is_audited_and_validated(self):
+        result = self.request_json("/api/tools/platform_status/execute", {"arguments": {}}, self.token)
+        self.assertEqual(result["invocation"]["status"], "completed")
+        invocations = self.request_json("/api/tool-invocations", token=self.token)["invocations"]
+        self.assertEqual(invocations[0]["tool_id"], "platform_status")
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request_json("/api/tools/search_workspace_files/execute", {"arguments": {}}, self.token)
+        self.assertEqual(failure.exception.code, 400)
 
     def test_execution_modes_are_frozen_and_constrain_knowledge_and_file_tools(self):
         off_events = self.chat({
@@ -732,7 +744,7 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         events = self.chat({"thread_id": "", "content": "请说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
-        self.assertIn("参考资料：product.md（片段 1）", answer)
+        self.assertIn("参考资料：product.md（片段 1 · 摘录：", answer)
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         context = json.loads(run["execution_context"])
@@ -744,6 +756,16 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(thread_context["sources"][0]["filename"], "product.md")
         self.assertEqual(thread_context["sources"][0]["position"], 0)
 
+        feedback = self.request_json(
+            f"/api/runs/{run['id']}/feedback",
+            {"rating": 1, "citation_correct": True},
+            self.token,
+        )
+        self.assertTrue(feedback["citation_correct"])
+        metrics = self.request_json("/api/metrics", token=self.token)
+        self.assertEqual(metrics["feedback"]["citation_assessed"], 1)
+        self.assertEqual(metrics["feedback"]["citation_accuracy"], 1.0)
+
         generic_events = self.chat({"thread_id": thread_id, "content": "请分析一下这个平台的界面布局"})
         generic_answer = "".join(event["data"].get("content", "") for event in generic_events)
         generic_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
@@ -754,6 +776,17 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])
+
+    def test_xlsx_knowledge_extraction_preserves_sheet_and_cell_text(self):
+        workbook = io.BytesIO()
+        with zipfile.ZipFile(workbook, "w") as archive:
+            archive.writestr("xl/workbook.xml", """<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"预算\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>""")
+            archive.writestr("xl/_rels/workbook.xml.rels", """<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"/></Relationships>""")
+            archive.writestr("xl/sharedStrings.xml", """<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><si><t>项目</t></si><si><t>预算</t></si></sst>""")
+            archive.writestr("xl/worksheets/sheet1.xml", """<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row></sheetData></worksheet>""")
+        text = app.extract_knowledge_text("budget.xlsx", workbook.getvalue())
+        self.assertIn("【工作表：预算】", text)
+        self.assertIn("项目 | 预算", text)
 
     def test_knowledge_search_is_strictly_isolated_by_user(self):
         with app.db() as conn:

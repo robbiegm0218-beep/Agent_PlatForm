@@ -457,10 +457,15 @@ form button:hover,
 
 .drawer-header { display: flex; align-items: center; justify-content: space-between; }
 .drawer-header h2 { margin: 0; font-size: 17px; }
+.run-filters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0 4px; }
+.run-filters select:last-child { grid-column: 1 / -1; }
 .run-list { display: grid; gap: 8px; margin: 20px 0; }
 .run-item { min-height: 38px; padding: 8px 10px; text-align: left; border-radius: 6px; background: var(--panel-soft); color: var(--text); }
 .run-item.failed { color: var(--danger); }
 .run-detail { white-space: pre-wrap; border-top: 1px solid var(--line); padding-top: 16px; color: var(--muted); line-height: 1.65; font-size: 13px; }
+.tool-form { display: grid; gap: 8px; margin-top: 12px; }
+.tool-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+.tool-result { max-height: 180px; overflow: auto; margin: 0; padding: 8px; border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 12px; white-space: pre-wrap; }
 
 .messages {
   flex: 1;

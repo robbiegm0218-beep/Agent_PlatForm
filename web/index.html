@@ -147,7 +147,8 @@
         </aside>
 
         <aside id="runDrawer" class="run-drawer hidden" aria-label="运行详情">
-          <div class="drawer-header"><h2>运行详情</h2><button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button></div>
+          <div class="drawer-header"><h2>运行详情</h2><button id="viewAllRunsButton" class="context-all-button" type="button">全部审计</button><button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button></div>
+          <div id="runFilters" class="run-filters hidden"><select id="runStatusFilter"><option value="">全部状态</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="awaiting_confirmation">待确认</option></select><select id="runTierFilter"><option value="">全部档位</option><option value="quick">快速</option><option value="standard">标准</option><option value="deep">深度</option></select><select id="runKnowledgeFilter"><option value="">资料使用不限</option><option value="used">使用了资料</option><option value="none">未使用资料</option></select></div>
           <div id="runList" class="run-list"></div>
           <div id="runDetail" class="run-detail">选择一条运行记录查看详情。</div>
         </aside>
