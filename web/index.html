@@ -222,6 +222,8 @@
           </header>
           <div class="knowledge-toolbar">
             <input id="knowledgeSearch" type="search" placeholder="检索本地资料" />
+            <select id="knowledgeScopeSelect" aria-label="选择知识资料范围"><option value="general">通用知识库</option><option value="project">项目专属</option></select>
+            <select id="knowledgeProjectSelect" class="hidden" aria-label="选择项目空间"></select>
           </div>
           <div id="knowledgeResults" class="knowledge-results hidden"></div>
           <div id="knowledgeList" class="card-grid"></div>

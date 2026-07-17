@@ -601,6 +601,23 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.request_json(f"/api/threads/{member_thread['id']}", {"title": "越权编辑"}, self.token, method="PATCH")
         self.assertEqual(failure.exception.code, 404)
 
+    def test_project_knowledge_is_shared_in_its_space_and_not_in_general_search(self):
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("knowledge_member", "knowledge-member@example.com", app.hash_password("member123"), "资料成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "knowledge-member@example.com", "password": "member123"})["token"]
+        space = self.request_json("/api/folders", {"name": "资料项目", "section": "project"}, self.token)["folder"]
+        self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "knowledge-member@example.com"}, self.token)
+        payload = {"filename": "项目资料.md", "mime_type": "text/markdown", "content_base64": base64.b64encode("项目专属指标是 42".encode("utf-8")).decode("ascii")}
+        document = self.request_json(f"/api/folders/{space['id']}/knowledge", payload, self.token)["document"]
+        self.assertEqual(document["scope"], "project")
+        self.assertEqual(document["project_space_id"], space["id"])
+        self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('项目专属指标')}", token=self.token)["results"], [])
+        member_space = self.request_json(f"/api/folders/{space['id']}", token=member_token)
+        self.assertEqual(member_space["knowledge_documents"][0]["filename"], "项目资料.md")
+        self.assertEqual(len(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"])), 1)
+        self.request_json(f"/api/folders/{space['id']}", token=self.token, method="DELETE")
+        self.assertEqual(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"]), [])
+
     def test_execution_modes_are_frozen_and_constrain_knowledge_and_file_tools(self):
         off_events = self.chat({
             "thread_id": "", "content": "请根据本地资料说明产品指标", "knowledge_mode": "off", "file_mode": "off",

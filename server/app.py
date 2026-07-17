@@ -933,6 +933,10 @@ def init_db() -> None:
         ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
         ensure_column(conn, "thread_folders", "section", "TEXT NOT NULL DEFAULT 'project'")
         ensure_column(conn, "thread_folders", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "knowledge_documents", "scope", "TEXT NOT NULL DEFAULT 'general'")
+        ensure_column(conn, "knowledge_documents", "project_space_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "knowledge_documents", "upload_origin", "TEXT NOT NULL DEFAULT 'knowledge_library'")
+        ensure_column(conn, "knowledge_documents", "created_by_user_id", "TEXT NOT NULL DEFAULT ''")
         # Task folders are no longer part of the product model. Preserve their
         # tasks by moving them to the root task list before deleting the folders.
         conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id IN (SELECT id FROM thread_folders WHERE section = 'conversation')")
@@ -1155,25 +1159,32 @@ def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list
     return chunks
 
 
-def search_knowledge(user_id: str, query: str, limit: int = 4) -> list[dict]:
+def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "") -> list[dict]:
     with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT knowledge_chunks.*, knowledge_documents.filename
-            FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
-            WHERE knowledge_documents.user_id = ?
-            """,
-            (user_id,),
-        ).fetchall()
+        if project_space_id:
+            rows = conn.execute(
+                """SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
+                   FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
+                   WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
+                     AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = ? AND space_members.user_id = ?)""",
+                (project_space_id, project_space_id, user_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
+                   FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
+                   WHERE knowledge_documents.user_id = ? AND knowledge_documents.scope = 'general'""",
+                (user_id,),
+            ).fetchall()
     retriever = KNOWLEDGE_RETRIEVER
     if limit != retriever.config.limit:
         retriever = KnowledgeRetriever(replace(retriever.config, limit=min(max(limit, 1), 20)))
     return retriever.search(query, rows)
 
 
-def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: dict) -> tuple[list[dict], dict]:
+def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: dict, project_space_id: str = "") -> tuple[list[dict], dict]:
     """Retrieve once, then make at most one explainable lexical retry."""
-    primary = search_knowledge(user_id, content)
+    primary = search_knowledge(user_id, content, project_space_id=project_space_id)
     terms = query_terms(content)
     expected_matches = 1 if len(terms) <= 1 else 2
     top = primary[0] if primary else None
@@ -1184,7 +1195,7 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
     retry_query = " ".join(terms[:8]).strip()
     if not retry_query or retry_query == content:
         return primary, trace
-    retry = search_knowledge(user_id, retry_query)
+    retry = search_knowledge(user_id, retry_query, project_space_id=project_space_id)
     merged: list[dict] = []
     seen: set[tuple[str, int]] = set()
     for reference in [*primary, *retry]:
@@ -1551,6 +1562,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/knowledge":
             self.create_knowledge(user)
             return
+        if self.path.startswith("/api/folders/") and self.path.endswith("/knowledge"):
+            self.create_space_knowledge(user)
+            return
         if self.path == "/api/memories/candidates":
             try:
                 self.memory_candidates(user)
@@ -1607,6 +1621,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.update_memory(user)
             except (ValueError, TypeError) as exc:
                 self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        if self.path.startswith("/api/knowledge/"):
+            self.update_knowledge(user)
             return
         if self.path.startswith("/api/folders/"):
             self.update_folder(user)
@@ -1743,6 +1760,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             members = conn.execute("""SELECT users.id, users.name, users.email, space_members.role, space_members.created_at FROM space_members JOIN users ON users.id = space_members.user_id
                 WHERE space_members.space_id = ? ORDER BY space_members.created_at ASC""", (space_id,)).fetchall()
             invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
+            knowledge_documents = conn.execute("""SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
+                knowledge_documents.size_bytes, knowledge_documents.chunk_count, knowledge_documents.created_at,
+                knowledge_documents.upload_origin, users.name AS author_name
+                FROM knowledge_documents JOIN users ON users.id = knowledge_documents.created_by_user_id
+                WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
+                ORDER BY knowledge_documents.created_at DESC""", (space_id,)).fetchall()
         sources: list[dict] = []
         seen_sources: set[tuple[str, str]] = set()
         for run in runs:
@@ -1766,7 +1789,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     continue
                 seen_sources.add(key)
                 sources.append({"kind": "web", "title": str(source.get("title", "网页来源"))[:255], "url": url[:2048], "excerpt": str(source.get("excerpt", ""))[:320], "task_title": event["title"]})
-        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations], "can_manage_members": space["user_id"] == user["id"]})
+        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "knowledge_documents": [row_to_dict(item) for item in knowledge_documents], "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations], "can_manage_members": space["user_id"] == user["id"]})
 
     def invite_space_member(self, user: dict) -> None:
         space_id = self.path.split("/")[-2]
@@ -2145,9 +2168,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if not folder:
                 self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
                 return
+            documents = conn.execute("SELECT storage_path FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?", (folder_id,)).fetchall()
+            conn.execute("DELETE FROM knowledge_chunks WHERE document_id IN (SELECT id FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?)", (folder_id,))
+            conn.execute("DELETE FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?", (folder_id,))
             conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id = ?", (folder_id,))
             conn.execute("DELETE FROM space_members WHERE space_id = ?", (folder_id,))
             conn.execute("DELETE FROM thread_folders WHERE id = ?", (folder_id,))
+        for document in documents:
+            Path(document["storage_path"]).unlink(missing_ok=True)
         self.send_json({"ok": True})
 
     def update_thread(self, user: dict) -> None:
@@ -2493,8 +2521,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def list_knowledge(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
-                "SELECT id, filename, mime_type, size_bytes, chunk_count, created_at FROM knowledge_documents WHERE user_id = ? ORDER BY created_at DESC",
-                (user["id"],),
+                """SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
+                          knowledge_documents.size_bytes, knowledge_documents.chunk_count, knowledge_documents.created_at,
+                          knowledge_documents.scope, knowledge_documents.project_space_id, knowledge_documents.upload_origin,
+                          knowledge_documents.created_by_user_id, thread_folders.name AS project_space_name
+                   FROM knowledge_documents LEFT JOIN thread_folders ON thread_folders.id = knowledge_documents.project_space_id
+                   WHERE (knowledge_documents.user_id = ? AND knowledge_documents.scope = 'general')
+                      OR (knowledge_documents.scope = 'project' AND EXISTS
+                         (SELECT 1 FROM space_members WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))
+                   ORDER BY knowledge_documents.created_at DESC""",
+                (user["id"], user["id"]),
             ).fetchall()
         self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader)})
 
@@ -2546,6 +2582,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_json({"results": search_knowledge(user["id"], query) if query else []})
 
     def create_knowledge(self, user: dict) -> None:
+        self.create_knowledge_for_scope(user)
+
+    def create_space_knowledge(self, user: dict) -> None:
+        space_id = self.path.split("/")[-2]
+        self.create_knowledge_for_scope(user, forced_space_id=space_id, origin="project_space")
+
+    def create_knowledge_for_scope(self, user: dict, forced_space_id: str = "", origin: str = "knowledge_library") -> None:
         try:
             payload = self.read_json(MAX_KNOWLEDGE_UPLOAD_BYTES)
             filename = Path(payload.get("filename", "")).name
@@ -2562,6 +2605,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, UnicodeError, binascii.Error) as exc:
             self.send_error_json(str(exc))
             return
+        scope = "project" if forced_space_id or payload.get("scope") == "project" else "general"
+        project_space_id = forced_space_id or str(payload.get("project_space_id", "")).strip()
+        if scope == "project" and not project_space_id:
+            self.send_error_json("项目专属资料必须选择项目空间")
+            return
+        if project_space_id:
+            with db() as conn:
+                allowed = conn.execute("""SELECT id FROM thread_folders WHERE id = ? AND section = 'project' AND EXISTS
+                    (SELECT 1 FROM space_members WHERE space_members.space_id = thread_folders.id AND space_members.user_id = ?)""", (project_space_id, user["id"])).fetchone()
+            if not allowed:
+                self.send_error_json("没有该项目空间的资料上传权限", HTTPStatus.FORBIDDEN)
+                return
         document_id = new_id("knowledge")
         storage_dir = KNOWLEDGE_DIR / user["id"]
         storage_dir.mkdir(parents=True, exist_ok=True)
@@ -2571,24 +2626,24 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         with db() as conn:
             conn.execute(
                 """
-                INSERT INTO knowledge_documents (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO knowledge_documents (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at, scope, project_space_id, upload_origin, created_by_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (document_id, user["id"], filename, str(storage_path), mime_type, hashlib.sha256(raw).hexdigest(), len(raw), len(chunks), now()),
+                (document_id, user["id"], filename, str(storage_path), mime_type, hashlib.sha256(raw).hexdigest(), len(raw), len(chunks), now(), scope, project_space_id, origin, user["id"]),
             )
             conn.executemany(
                 "INSERT INTO knowledge_chunks (id, document_id, position, content) VALUES (?, ?, ?, ?)",
                 [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)],
             )
-        self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks)}}, HTTPStatus.CREATED)
+        self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin}}, HTTPStatus.CREATED)
 
     def delete_knowledge(self, user: dict) -> None:
         document_id = self.path.split("?")[0].split("/")[-1]
         with db() as conn:
-            row = conn.execute(
-                "SELECT storage_path FROM knowledge_documents WHERE id = ? AND user_id = ?",
-                (document_id, user["id"]),
-            ).fetchone()
+            row = conn.execute("""SELECT knowledge_documents.storage_path FROM knowledge_documents WHERE knowledge_documents.id = ? AND
+                (knowledge_documents.user_id = ? OR (knowledge_documents.scope = 'project' AND EXISTS
+                (SELECT 1 FROM thread_folders WHERE thread_folders.id = knowledge_documents.project_space_id AND thread_folders.user_id = ?)))""",
+                (document_id, user["id"], user["id"])).fetchone()
             if not row:
                 self.send_error_json("资料不存在", HTTPStatus.NOT_FOUND)
                 return
@@ -2598,6 +2653,37 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if path.exists():
             path.unlink()
         self.send_json({"ok": True})
+
+    def update_knowledge(self, user: dict) -> None:
+        document_id = self.path.split("?")[0].split("/")[-1]
+        payload = self.read_json()
+        filename = Path(str(payload.get("filename", "")).strip()).name
+        scope = str(payload.get("scope", "")).strip()
+        project_space_id = str(payload.get("project_space_id", "")).strip()
+        if scope not in {"general", "project"}:
+            self.send_error_json("资料范围必须是通用知识库或项目专属")
+            return
+        if scope == "project" and not project_space_id:
+            self.send_error_json("项目专属资料必须选择项目空间")
+            return
+        with db() as conn:
+            document = conn.execute("""SELECT * FROM knowledge_documents WHERE id = ? AND
+                (user_id = ? OR (scope = 'project' AND EXISTS (SELECT 1 FROM thread_folders WHERE thread_folders.id = knowledge_documents.project_space_id AND thread_folders.user_id = ?)))""",
+                (document_id, user["id"], user["id"])).fetchone()
+            if not document:
+                self.send_error_json("资料不存在或没有编辑权限", HTTPStatus.NOT_FOUND)
+                return
+            if project_space_id:
+                target = conn.execute("""SELECT id FROM thread_folders WHERE id = ? AND section = 'project' AND EXISTS
+                    (SELECT 1 FROM space_members WHERE space_members.space_id = thread_folders.id AND space_members.user_id = ?)""", (project_space_id, user["id"])).fetchone()
+                if not target:
+                    self.send_error_json("没有目标项目空间的资料管理权限", HTTPStatus.FORBIDDEN)
+                    return
+            updated_name = filename or document["filename"]
+            conn.execute("""UPDATE knowledge_documents SET filename = ?, scope = ?, project_space_id = ?, user_id = ? WHERE id = ?""",
+                (updated_name, scope, project_space_id if scope == "project" else "", user["id"] if scope == "general" else document["user_id"], document_id))
+            updated = conn.execute("SELECT * FROM knowledge_documents WHERE id = ?", (document_id,)).fetchone()
+        self.send_json({"document": row_to_dict(updated)})
 
     def list_skills(self, user: dict) -> None:
         with db() as conn:
@@ -2919,7 +3005,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             needs_knowledge = execution_modes["knowledge"] == "required" or (
                 execution_modes["knowledge"] == "auto" and intent_plan["knowledge_needed"]
             )
-            knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan) if needs_knowledge else ([], {})
+            project_row = conn.execute("SELECT folder_id FROM threads WHERE id = ?", (thread_id,)).fetchone()
+            project_space_id = project_row["folder_id"] if project_row else ""
+            knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan, project_space_id) if needs_knowledge else ([], {})
             memories = load_relevant_memories(conn, user["id"], thread_id, content)
             execution_context = build_execution_context(
                 user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes, intent_plan,

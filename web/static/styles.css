@@ -240,6 +240,10 @@ form button:hover,
 .space-side-panel { min-width: 0; padding: 18px 14px; border-left: 1px solid var(--line); background: #efefeb; overflow: auto; }
 .space-side-panel .space-card { margin-bottom: 14px; background: var(--panel); }
 .space-side-list { max-height: 260px; overflow-y: auto; padding-right: 3px; scrollbar-gutter: stable; }
+.space-knowledge-search { width: 100%; height: 32px; margin: 0 0 7px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-soft); font: inherit; font-size: 12px; }
+.space-knowledge-edit, .space-knowledge-delete { justify-self: start; min-width: auto !important; height: auto !important; margin-top: 3px; margin-right: 8px; padding: 2px 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; font-size: 11px !important; font-weight: 500 !important; }
+.space-knowledge-edit { color: var(--accent) !important; }
+.space-knowledge-delete { color: var(--danger) !important; }
 .space-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .space-card-wide { grid-column: 1 / -1; }
 .space-sources-list { max-height: min(520px, 54vh); overflow-y: auto; padding-right: 4px; scrollbar-gutter: stable; }
@@ -899,16 +903,21 @@ form button:hover,
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 14px;
+  align-items: start;
   overflow: auto;
 }
 
 .knowledge-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 20px 28px 0;
 }
 
 .knowledge-toolbar input {
   width: min(520px, 100%);
 }
+.knowledge-toolbar select { height: 32px; max-width: 150px; }
 
 .knowledge-results {
   margin: 18px 28px 0;
@@ -1174,9 +1183,13 @@ form button:hover,
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: auto;
 }
+.knowledge-card { min-height: 190px; align-self: start; }
+.knowledge-card .card-footer { justify-content: flex-start; gap: 7px; }
+.knowledge-card .status-pill { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .skill-state,
 .skill-actions {

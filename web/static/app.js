@@ -23,6 +23,8 @@ const state = {
   streaming: false,
   currentThreadEditable: true,
   spaceComposerFolder: null,
+  knowledgeUploadSpaceId: "",
+  currentSpaceId: "",
 };
 
 const UI_STATE_KEY = "agent_platform_workspace_state";
@@ -86,6 +88,8 @@ const els = {
   uploadKnowledgeButton: document.querySelector("#uploadKnowledgeButton"),
   knowledgeFileInput: document.querySelector("#knowledgeFileInput"),
   knowledgeSearch: document.querySelector("#knowledgeSearch"),
+  knowledgeScopeSelect: document.querySelector("#knowledgeScopeSelect"),
+  knowledgeProjectSelect: document.querySelector("#knowledgeProjectSelect"),
   knowledgeList: document.querySelector("#knowledgeList"),
   knowledgeResults: document.querySelector("#knowledgeResults"),
   memoryForm: document.querySelector("#memoryForm"),
@@ -244,6 +248,23 @@ async function loadFolders() {
   const data = await api("/api/folders");
   state.folders = data.folders;
   renderMemoryScopes();
+  renderKnowledgeProjectOptions();
+}
+
+function renderKnowledgeProjectOptions() {
+  const spaces = state.folders.filter((folder) => folder.section === "project");
+  const previous = els.knowledgeProjectSelect.value;
+  els.knowledgeProjectSelect.innerHTML = `<option value="">全部项目</option>${spaces.map((space) => `<option value="${escapeHtml(space.id)}">${escapeHtml(space.name)}</option>`).join("")}`;
+  els.knowledgeProjectSelect.value = spaces.some((space) => space.id === previous) ? previous : "";
+  els.knowledgeProjectSelect.disabled = !spaces.length;
+  syncKnowledgeScopeControls();
+}
+
+function syncKnowledgeScopeControls() {
+  const project = els.knowledgeScopeSelect.value === "project";
+  els.knowledgeProjectSelect.classList.toggle("hidden", !project);
+  els.knowledgeProjectSelect.required = false;
+  renderKnowledge(state.knowledgeDocuments);
 }
 
 async function loadThread(threadId) {
@@ -540,19 +561,25 @@ async function deleteArtifact(artifact) {
 
 function renderKnowledge(documents) {
   els.knowledgeList.innerHTML = "";
-  documents.forEach((knowledgeDocument) => {
+  const scope = els.knowledgeScopeSelect.value;
+  const projectId = els.knowledgeProjectSelect.value;
+  const filtered = documents.filter((document) => document.scope === scope && (scope !== "project" || !projectId || document.project_space_id === projectId));
+  filtered.forEach((knowledgeDocument) => {
     const card = document.createElement("article");
-    card.className = "capability-card";
+    card.className = "capability-card knowledge-card";
     const size = knowledgeDocument.size_bytes < 1024 * 1024 ? `${Math.ceil(knowledgeDocument.size_bytes / 1024)} KB` : `${(knowledgeDocument.size_bytes / 1024 / 1024).toFixed(1)} MB`;
     card.innerHTML = `
       <h3>${escapeHtml(knowledgeDocument.filename)}</h3>
       <p>${knowledgeDocument.chunk_count} 个检索片段 · ${size}</p>
       <div class="card-footer">
-        <span class="status-pill">本地资料</span>
+        <span class="status-pill">${knowledgeDocument.scope === "project" ? `项目专属 · ${escapeHtml(knowledgeDocument.project_space_name || "项目空间")}` : "通用知识库"}</span>
+        <span class="status-pill">来源：${knowledgeDocument.upload_origin === "project_space" ? "项目空间" : "知识库"}</span>
+        <button class="skill-action knowledge-edit" type="button">编辑</button>
         <button class="skill-action danger" type="button">删除</button>
       </div>
     `;
-    card.querySelector("button").addEventListener("click", async () => {
+    card.querySelector(".knowledge-edit").addEventListener("click", () => editKnowledge(knowledgeDocument));
+    card.querySelector(".danger").addEventListener("click", async () => {
       if (!window.confirm(`删除资料“${knowledgeDocument.filename}”？`)) return;
       await api(`/api/knowledge/${knowledgeDocument.id}`, { method: "DELETE" });
       await loadKnowledge();
@@ -560,6 +587,33 @@ function renderKnowledge(documents) {
     });
     els.knowledgeList.appendChild(card);
   });
+  if (!filtered.length) els.knowledgeList.innerHTML = '<div class="empty-state"><h2>没有符合当前筛选条件的资料</h2><p>可切换资料类型或所属项目查看。</p></div>';
+}
+
+async function refreshKnowledgeViews() {
+  await loadKnowledge();
+  if (state.activeView === "space" && state.currentSpaceId) await openSpace(state.currentSpaceId);
+}
+
+async function editKnowledge(document) {
+  const filename = window.prompt("资料名称", document.filename);
+  if (!filename?.trim()) return;
+  const scope = window.prompt("输入 general（通用知识库）或 project（项目专属）", document.scope || "general");
+  if (!scope || !["general", "project"].includes(scope)) return window.alert("请输入 general 或 project");
+  let projectSpaceId = "";
+  if (scope === "project") {
+    const spaces = state.folders.filter((folder) => folder.section === "project");
+    const options = spaces.map((space) => `${space.name} (${space.id})`).join("\n");
+    const selected = window.prompt(`输入目标项目空间 ID：\n${options}`, document.project_space_id || "");
+    if (!selected?.trim()) return;
+    projectSpaceId = selected.trim();
+  }
+  try {
+    await api(`/api/knowledge/${document.id}`, { method: "PATCH", body: JSON.stringify({ filename, scope, project_space_id: projectSpaceId }) });
+    await refreshKnowledgeViews();
+  } catch (error) {
+    window.alert(error.message);
+  }
 }
 
 async function searchKnowledge() {
@@ -777,11 +831,13 @@ function createThreadRow(thread) {
 }
 
 async function openSpace(spaceId) {
+  state.currentSpaceId = spaceId;
   const data = await api(`/api/folders/${spaceId}`);
   els.spaceTitle.textContent = data.space.name;
   const empty = (text) => `<p class="space-empty">${text}</p>`;
   const tasks = data.tasks.map((item) => `<button class="space-list-item space-task-link" data-thread-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>创建者：${escapeHtml(item.author_name || "成员")} · ${item.user_id === state.user?.id ? "可编辑" : "仅查看"}</small></button>`).join("") || empty("该项目空间暂时没有对话");
   const artifacts = data.artifacts.map((item) => `<button class="space-list-item space-artifact-link" data-artifact-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${escapeHtml(item.kind.toUpperCase())} · ${escapeHtml(item.author_name || "成员")} · 关联对话：${escapeHtml(item.task_title || "未命名对话")}</small></button>`).join("") || empty("该空间暂时没有产物");
+  const knowledgeDocuments = (data.knowledge_documents || []).map((item) => `<div class="space-list-item space-knowledge-item" data-knowledge-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${item.chunk_count} 个检索片段 · 上传者：${escapeHtml(item.author_name || "成员")}</small>${data.can_manage_members ? `<button class="space-knowledge-edit" type="button">编辑</button><button class="space-knowledge-delete" type="button" aria-label="删除资料 ${escapeHtml(item.filename)}">删除</button>` : ""}</div>`).join("") || empty("该项目空间暂未上传知识资料");
   const sources = data.sources.map((item) => `<div class="space-list-item space-source"><span>${escapeHtml(item.title)}</span><small>${item.kind === "web" ? "网页" : "本地资料"} · 关联任务：${escapeHtml(item.task_title)}</small>${item.excerpt ? `<em>${escapeHtml(item.excerpt)}</em>` : ""}</div>`).join("") || empty("空间内任务尚未引用资料或网页来源");
   if (!state.demoMembersBySpace[spaceId]) state.demoMembersBySpace[spaceId] = [{ id: "demo-linran", name: "林然", role: "member", demo: true }, { id: "demo-zhouning", name: "周宁", role: "member", demo: true }];
   const demoMembers = data.members.length <= 1 ? state.demoMembersBySpace[spaceId] : [];
@@ -793,7 +849,8 @@ async function openSpace(spaceId) {
   }).join("") || empty("暂未添加成员");
   const pending = data.invitations.filter((item) => item.status === "pending").map((item) => `<div class="space-invitation">已邀请 ${escapeHtml(item.email)} · 待加入</div>`).join("");
   const inviteButton = data.can_manage_members ? '<button id="inviteSpaceMember" type="button">邀请成员</button>' : '';
-  els.spaceDetail.innerHTML = `<div class="space-workbench"><section class="space-conversation-panel"><div class="space-conversation-empty"><h1>在 ${escapeHtml(data.space.name)} 中开始协作</h1><p>选择成员或 Agent 发起对话，记录会保留在当前项目空间。</p></div><div id="spaceComposerMount"></div></section><aside class="space-side-panel"><section class="space-card space-members-panel"><div class="space-card-heading"><h3>成员</h3>${inviteButton}</div>${members}${pending}</section><section class="space-card"><div class="space-card-heading"><h3>对话</h3><span>${data.tasks.length}</span></div><div class="space-side-list">${tasks}</div></section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div><div class="space-side-list">${artifacts}</div></section></aside></div>`;
+  const knowledgeUploadButton = '<button id="uploadSpaceKnowledge" type="button">上传资料</button>';
+  els.spaceDetail.innerHTML = `<div class="space-workbench"><section class="space-conversation-panel"><div class="space-conversation-empty"><h1>在 ${escapeHtml(data.space.name)} 中开始协作</h1><p>选择成员或 Agent 发起对话，记录会保留在当前项目空间。</p></div><div id="spaceComposerMount"></div></section><aside class="space-side-panel"><section class="space-card space-members-panel"><div class="space-card-heading"><h3>成员</h3>${inviteButton}</div>${members}${pending}</section><section class="space-card"><div class="space-card-heading"><h3>知识库</h3>${knowledgeUploadButton}</div><input id="spaceKnowledgeSearch" class="space-knowledge-search" type="search" placeholder="检索项目资料" /><div class="space-side-list">${knowledgeDocuments}</div></section><section class="space-card"><div class="space-card-heading"><h3>对话</h3><span>${data.tasks.length}</span></div><div class="space-side-list">${tasks}</div></section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div><div class="space-side-list">${artifacts}</div></section></aside></div>`;
   mountSpaceComposer(data.space);
   els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
   els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
@@ -809,6 +866,24 @@ async function openSpace(spaceId) {
     await api(`/api/folders/${spaceId}/invitations`, { method: "POST", body: JSON.stringify({ email }) });
     await openSpace(spaceId);
   });
+  els.spaceDetail.querySelector("#uploadSpaceKnowledge")?.addEventListener("click", () => {
+    state.knowledgeUploadSpaceId = spaceId;
+    els.knowledgeFileInput.click();
+  });
+  els.spaceDetail.querySelector("#spaceKnowledgeSearch")?.addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    els.spaceDetail.querySelectorAll(".space-knowledge-item").forEach((item) => { item.hidden = Boolean(query && !item.textContent.toLowerCase().includes(query)); });
+  });
+  els.spaceDetail.querySelectorAll(".space-knowledge-delete").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("删除该项目资料？资料会同步从知识库移除。")) return;
+    await api(`/api/knowledge/${button.closest(".space-knowledge-item").dataset.knowledgeId}`, { method: "DELETE" });
+    await loadKnowledge();
+    await openSpace(spaceId);
+  }));
+  els.spaceDetail.querySelectorAll(".space-knowledge-edit").forEach((button) => button.addEventListener("click", () => {
+    const document = (data.knowledge_documents || []).find((item) => item.id === button.closest(".space-knowledge-item").dataset.knowledgeId);
+    if (document) editKnowledge({ ...document, scope: "project", project_space_id: spaceId });
+  }));
   switchView("space");
 }
 
@@ -2184,7 +2259,10 @@ els.skillDropZone.addEventListener("drop", async (event) => {
   }
 });
 
-els.uploadKnowledgeButton.addEventListener("click", () => els.knowledgeFileInput.click());
+els.uploadKnowledgeButton.addEventListener("click", () => {
+  state.knowledgeUploadSpaceId = "";
+  els.knowledgeFileInput.click();
+});
 els.knowledgeFileInput.addEventListener("change", async () => {
   const [file] = els.knowledgeFileInput.files;
   if (!file) return;
@@ -2195,17 +2273,24 @@ els.knowledgeFileInput.addEventListener("change", async () => {
   }
   try {
     const contentBase64 = await fileAsBase64(file);
-    await api("/api/knowledge", {
+    const projectSpaceId = state.knowledgeUploadSpaceId || (els.knowledgeScopeSelect.value === "project" ? els.knowledgeProjectSelect.value : "");
+    if (els.knowledgeScopeSelect.value === "project" && !projectSpaceId) throw new Error("请先选择项目空间");
+    await api(state.knowledgeUploadSpaceId ? `/api/folders/${state.knowledgeUploadSpaceId}/knowledge` : "/api/knowledge", {
       method: "POST",
-      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64 }),
+      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId }),
     });
     await loadKnowledge();
+    if (state.knowledgeUploadSpaceId) await openSpace(state.knowledgeUploadSpaceId);
   } catch (error) {
     window.alert(error.message);
   } finally {
     els.knowledgeFileInput.value = "";
+    state.knowledgeUploadSpaceId = "";
   }
 });
+
+els.knowledgeScopeSelect.addEventListener("change", syncKnowledgeScopeControls);
+els.knowledgeProjectSelect.addEventListener("change", () => renderKnowledge(state.knowledgeDocuments));
 
 function fileAsBase64(file) {
   return new Promise((resolve, reject) => {
