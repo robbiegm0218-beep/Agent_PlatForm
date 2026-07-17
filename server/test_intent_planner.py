@@ -39,6 +39,14 @@ class IntentPlannerTests(unittest.TestCase):
         self.assertEqual(search.call_count, 1)
         self.assertFalse(trace["retry_query"])
 
+    def test_reasoning_summary_is_auditable_and_does_not_include_private_reasoning(self):
+        summary = app.build_reasoning_summary({
+            "task_tier": "standard", "model": "deepseek-v4-flash", "intent_plan": {"knowledge_needed": True},
+            "knowledge_match_count": 2, "tools": [], "quality_check": True,
+        })
+        self.assertTrue(any("本地资料" in item for item in summary))
+        self.assertFalse(any("思维链" in item or "推理过程" in item for item in summary))
+
     def test_insufficient_first_retrieval_retries_once_with_terms(self):
         responses = [[], [{"document_id": "doc", "position": 0, "matched_terms": ["公司", "制度"], "score": 3.0}]]
         with patch.object(app, "search_knowledge", side_effect=responses) as search:

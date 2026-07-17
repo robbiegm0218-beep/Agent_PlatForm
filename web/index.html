@@ -71,48 +71,55 @@
                   <button id="skillPickerButton" class="skill-picker-button" type="button" aria-expanded="false">选择技能</button>
                   <div id="skillPickerMenu" class="skill-picker-menu hidden" role="menu"></div>
                 </div>
-                <div class="runtime-config" aria-label="模型与任务档位">
-                  <select id="taskModeSelect" aria-label="选择任务档位">
-                    <option value="auto">自动档位</option>
-                    <option value="quick">快速</option>
-                    <option value="standard">标准</option>
-                    <option value="deep">深度</option>
-                  </select>
-                  <span class="runtime-config-divider" aria-hidden="true"></span>
-                  <select id="modelSelect" aria-label="选择模型"></select>
-                </div>
+                <details class="model-config-picker">
+                  <summary><span>模型配置</span><span id="modelConfigHint" class="model-config-hint" aria-live="polite">自动选择</span></summary>
+                  <div class="model-config-menu">
+                    <label>模型
+                      <select id="modelSelect" aria-label="选择模型"></select>
+                    </label>
+                    <label>任务深度
+                      <select id="taskModeSelect" aria-label="选择任务深度">
+                        <option value="auto">自动</option>
+                        <option value="quick">快速</option>
+                        <option value="standard">标准</option>
+                        <option value="deep">深度</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
                 <details class="execution-mode-picker">
                   <summary><span>执行方式</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">自动</span></summary>
                   <div class="execution-mode-menu">
-                    <label>资料
+                    <label>回答依据
                       <select id="sourceModeSelect" aria-label="选择回答依据">
-                        <option value="general">通用回答</option>
-                        <option value="local_only">仅本地资料</option>
-                        <option value="web_only">仅联网资料</option>
-                        <option value="mixed">混合资料</option>
+                        <option value="general">智能选择</option>
+                        <option value="local_only">仅知识库</option>
+                        <option value="web_only">仅网络</option>
+                        <option value="mixed">知识库 + 网络</option>
                       </select>
                     </label>
-                    <label>知识库
-                      <select id="knowledgeModeSelect" aria-label="选择知识库模式">
-                        <option value="auto">自动</option>
-                        <option value="off">关闭</option>
-                        <option value="required">必须使用</option>
-                      </select>
-                    </label>
-                    <label>网络
-                      <select id="webModeSelect" aria-label="选择网络模式">
-                        <option value="auto">自动</option>
-                        <option value="off">关闭</option>
-                        <option value="required">必须使用</option>
-                      </select>
-                    </label>
-                    <label>文件
+                    <label>工作区文件
                       <select id="fileModeSelect" aria-label="选择文件模式">
                         <option value="auto">自动</option>
                         <option value="off">关闭</option>
                         <option value="required">必须使用</option>
                       </select>
                     </label>
+                    <details class="execution-advanced">
+                      <summary>高级控制</summary>
+                      <div class="execution-advanced-fields">
+                        <label>知识库
+                          <select id="knowledgeModeSelect" aria-label="选择知识库模式">
+                            <option value="auto">自动</option><option value="off">关闭</option><option value="required">必须使用</option>
+                          </select>
+                        </label>
+                        <label>网络
+                          <select id="webModeSelect" aria-label="选择网络模式">
+                            <option value="auto">自动</option><option value="off">关闭</option><option value="required">必须使用</option>
+                          </select>
+                        </label>
+                      </div>
+                    </details>
                   </div>
                 </details>
               </div>
@@ -120,7 +127,7 @@
             </div>
           </form>
         </section>
-        <section id="spacePage" class="page hidden">
+        <section id="spacePage" class="page space-page hidden">
           <header class="page-header"><div><h2 id="spaceTitle">空间</h2><span id="spaceMeta">独立项目空间</span></div></header>
           <div id="spaceDetail" class="space-detail"></div>
         </section>

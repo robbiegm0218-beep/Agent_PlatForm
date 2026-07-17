@@ -938,6 +938,7 @@ def init_db() -> None:
         conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id IN (SELECT id FROM thread_folders WHERE section = 'conversation')")
         conn.execute("DELETE FROM thread_folders WHERE section = 'conversation'")
         conn.execute("UPDATE thread_folders SET section = 'project' WHERE section != 'project'")
+        conn.execute("INSERT OR IGNORE INTO space_members (space_id, user_id, role, created_at) SELECT id, user_id, 'owner', created_at FROM thread_folders WHERE section = 'project'")
         ensure_column(conn, "runs", "skill_snapshot", "TEXT DEFAULT '[]'")
         ensure_column(conn, "runs", "execution_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "runs", "plan_snapshot", "TEXT DEFAULT '[]'")
@@ -1314,6 +1315,25 @@ def event_summary(event_type: str, payload: dict) -> str:
     return "正在处理任务"
 
 
+def build_reasoning_summary(execution_context: dict) -> list[str]:
+    """Produce user-facing, auditable rationale without exposing model reasoning."""
+    summary = [f"按{execution_context['task_tier']}档位处理，并选择 {execution_context['model']}。"]
+    intent = execution_context.get("intent_plan", {})
+    if intent.get("knowledge_needed"):
+        count = execution_context.get("knowledge_match_count", 0)
+        summary.append(f"识别到可能需要本地资料；本轮命中 {count} 个资料片段。")
+    else:
+        summary.append("未识别到必须依赖本地资料的证据需求。")
+    tools = execution_context.get("tools", [])
+    if tools:
+        summary.append("仅在需要时可调用：" + "、".join(tool["name"] for tool in tools[:4]) + "。")
+    else:
+        summary.append("本轮未授权额外工具，基于已提供上下文生成回答。")
+    if execution_context.get("quality_check"):
+        summary.append("生成后将进行结果质量检查，必要时最多修订一次。")
+    return summary
+
+
 class AgentPlatformHandler(SimpleHTTPRequestHandler):
     server_version = "AgentPlatform/0.1"
 
@@ -1649,6 +1669,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if not user or not verify_password(password, user["password_hash"]):
                 self.send_error_json("邮箱或密码错误", HTTPStatus.UNAUTHORIZED)
                 return
+            conn.execute("""INSERT OR IGNORE INTO space_members (space_id, user_id, role, created_at)
+                SELECT space_id, ?, role, ? FROM space_invitations WHERE email = ? AND status = 'pending'""", (user["id"], now(), email))
+            conn.execute("UPDATE space_invitations SET status = 'accepted' WHERE email = ? AND status = 'pending'", (email,))
             token = new_id("session")
             if not user["password_hash"].startswith("pbkdf2_sha256$"):
                 conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(password), user["id"]))
@@ -1680,34 +1703,43 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def list_threads(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
-                "SELECT * FROM threads WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
-                (user["id"],),
+                """SELECT threads.*, users.name AS author_name FROM threads JOIN users ON users.id = threads.user_id
+                   WHERE threads.user_id = ? OR (threads.folder_id != '' AND EXISTS
+                     (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?))
+                   ORDER BY threads.updated_at DESC, threads.id DESC""",
+                (user["id"], user["id"]),
             ).fetchall()
         self.send_json({"threads": [row_to_dict(row) for row in rows]})
 
     def list_folders(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
-                """SELECT * FROM thread_folders WHERE user_id = ?
+                """SELECT thread_folders.*, space_members.role AS member_role FROM thread_folders
+                   LEFT JOIN space_members ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
+                   WHERE thread_folders.user_id = ? OR space_members.user_id = ?
                    ORDER BY CASE section WHEN 'project' THEN 0 ELSE 1 END, sort_order ASC, created_at ASC, id ASC""",
-                (user["id"],),
+                (user["id"], user["id"], user["id"]),
             ).fetchall()
         self.send_json({"folders": [row_to_dict(row) for row in rows]})
 
     def get_space(self, user: dict) -> None:
         space_id = self.path.split("?")[0].split("/")[-1]
         with db() as conn:
-            space = conn.execute("SELECT * FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
+            space = conn.execute("""SELECT thread_folders.*, space_members.role AS member_role FROM thread_folders
+                LEFT JOIN space_members ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
+                WHERE thread_folders.id = ? AND thread_folders.section = 'project'
+                  AND (thread_folders.user_id = ? OR space_members.user_id = ?)""", (user["id"], space_id, user["id"], user["id"])).fetchone()
             if not space:
                 self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
                 return
-            tasks = conn.execute("SELECT * FROM threads WHERE user_id = ? AND folder_id = ? ORDER BY updated_at DESC, id DESC", (user["id"], space_id)).fetchall()
-            artifacts = conn.execute("""SELECT artifacts.*, threads.title AS task_title FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY artifacts.created_at DESC, artifacts.id DESC""", (user["id"], space_id)).fetchall()
+            tasks = conn.execute("""SELECT threads.*, users.name AS author_name FROM threads JOIN users ON users.id = threads.user_id
+                WHERE folder_id = ? ORDER BY updated_at DESC, id DESC""", (space_id,)).fetchall()
+            artifacts = conn.execute("""SELECT artifacts.*, threads.title AS task_title, users.name AS author_name FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id JOIN users ON users.id = threads.user_id
+                WHERE threads.folder_id = ? ORDER BY artifacts.created_at DESC, artifacts.id DESC""", (space_id,)).fetchall()
             runs = conn.execute("""SELECT runs.id, runs.execution_context, threads.title FROM runs JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY runs.started_at DESC, runs.id DESC""", (user["id"], space_id)).fetchall()
+                WHERE threads.folder_id = ? ORDER BY runs.started_at DESC, runs.id DESC""", (space_id,)).fetchall()
             web_events = conn.execute("""SELECT run_events.run_id, run_events.payload, threads.title FROM run_events JOIN runs ON runs.id = run_events.run_id JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.user_id = ? AND threads.folder_id = ? AND run_events.type = 'tool_result' ORDER BY run_events.created_at DESC""", (user["id"], space_id)).fetchall()
+                WHERE threads.folder_id = ? AND run_events.type = 'tool_result' ORDER BY run_events.created_at DESC""", (space_id,)).fetchall()
             members = conn.execute("""SELECT users.id, users.name, users.email, space_members.role, space_members.created_at FROM space_members JOIN users ON users.id = space_members.user_id
                 WHERE space_members.space_id = ? ORDER BY space_members.created_at ASC""", (space_id,)).fetchall()
             invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
@@ -1734,7 +1766,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     continue
                 seen_sources.add(key)
                 sources.append({"kind": "web", "title": str(source.get("title", "网页来源"))[:255], "url": url[:2048], "excerpt": str(source.get("excerpt", ""))[:320], "task_title": event["title"]})
-        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations]})
+        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations], "can_manage_members": space["user_id"] == user["id"]})
 
     def invite_space_member(self, user: dict) -> None:
         space_id = self.path.split("/")[-2]
@@ -1753,8 +1785,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("该邮箱已有待处理邀请", HTTPStatus.CONFLICT)
                 return
             invitation_id = new_id("invite")
-            conn.execute("INSERT INTO space_invitations (id, space_id, email, role, status, invited_by, created_at) VALUES (?, ?, ?, 'member', 'pending', ?, ?)", (invitation_id, space_id, email, user["id"], now()))
-        self.send_json({"invitation": {"id": invitation_id, "email": email, "status": "pending", "role": "member"}}, HTTPStatus.CREATED)
+            invited_user = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+            status = "accepted" if invited_user else "pending"
+            conn.execute("INSERT INTO space_invitations (id, space_id, email, role, status, invited_by, created_at) VALUES (?, ?, ?, 'member', ?, ?, ?)", (invitation_id, space_id, email, status, user["id"], now()))
+            if invited_user:
+                conn.execute("INSERT OR IGNORE INTO space_members (space_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)", (space_id, invited_user["id"], now()))
+        self.send_json({"invitation": {"id": invitation_id, "email": email, "status": status, "role": "member"}}, HTTPStatus.CREATED)
 
     def remove_space_member(self, user: dict) -> None:
         parts = self.path.split("?")[0].split("/")
@@ -1774,10 +1810,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def get_thread(self, user: dict) -> None:
         thread_id = self.path.split("/")[-1]
         with db() as conn:
-            thread = conn.execute(
-                "SELECT * FROM threads WHERE id = ? AND user_id = ?",
-                (thread_id, user["id"]),
-            ).fetchone()
+            thread = conn.execute("""SELECT threads.*, users.name AS author_name FROM threads JOIN users ON users.id = threads.user_id
+                WHERE threads.id = ? AND (threads.user_id = ? OR (threads.folder_id != '' AND EXISTS
+                (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)))""", (thread_id, user["id"], user["id"])).fetchone()
             if not thread:
                 self.send_error_json("对话不存在", HTTPStatus.NOT_FOUND)
                 return
@@ -1791,9 +1826,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         """Return only the sources and file outputs actually associated with one conversation."""
         thread_id = self.path.split("/")[-2]
         with db() as conn:
-            thread = conn.execute(
-                "SELECT id FROM threads WHERE id = ? AND user_id = ?", (thread_id, user["id"])
-            ).fetchone()
+            thread = conn.execute("""SELECT threads.id FROM threads WHERE threads.id = ? AND (threads.user_id = ? OR
+                (threads.folder_id != '' AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)))""", (thread_id, user["id"], user["id"])).fetchone()
             if not thread:
                 self.send_error_json("对话不存在", HTTPStatus.NOT_FOUND)
                 return
@@ -1806,10 +1840,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 """
                 SELECT artifacts.id, artifacts.run_id, artifacts.filename, artifacts.kind, artifacts.summary, artifacts.created_at
                 FROM artifacts JOIN runs ON runs.id = artifacts.run_id
-                WHERE runs.thread_id = ? AND artifacts.user_id = ?
+                WHERE runs.thread_id = ?
                 ORDER BY artifacts.created_at DESC, artifacts.id DESC
                 """,
-                (thread_id, user["id"]),
+                (thread_id,),
             ).fetchall()
             web_events = conn.execute(
                 """
@@ -2016,7 +2050,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return ""
         with db() as conn:
             folder = conn.execute(
-                "SELECT id FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user_id)
+                """SELECT thread_folders.id FROM thread_folders LEFT JOIN space_members
+                   ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
+                   WHERE thread_folders.id = ? AND (thread_folders.user_id = ? OR space_members.user_id = ?)""",
+                (user_id, folder_id, user_id, user_id),
             ).fetchone()
         if not folder:
             raise ValueError("文件夹不存在")
@@ -2108,7 +2145,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if not folder:
                 self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
                 return
-            conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id = ? AND user_id = ?", (folder_id, user["id"]))
+            conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id = ?", (folder_id,))
+            conn.execute("DELETE FROM space_members WHERE space_id = ?", (folder_id,))
             conn.execute("DELETE FROM thread_folders WHERE id = ?", (folder_id,))
         self.send_json({"ok": True})
 
@@ -2148,10 +2186,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             rows = conn.execute(
                 """
                 SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id
-                WHERE runs.thread_id = ? AND threads.user_id = ?
+                WHERE runs.thread_id = ? AND (threads.user_id = ? OR (threads.folder_id != '' AND EXISTS
+                  (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)))
                 ORDER BY runs.started_at DESC, runs.id DESC
                 """,
-                (thread_id, user["id"]),
+                (thread_id, user["id"], user["id"]),
             ).fetchall()
         self.send_json({"runs": [row_to_dict(row) for row in rows]})
 
@@ -2206,9 +2245,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             run = conn.execute(
                 """
                 SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id
-                WHERE runs.id = ? AND threads.user_id = ?
+                WHERE runs.id = ? AND (threads.user_id = ? OR (threads.folder_id != '' AND EXISTS
+                  (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)))
                 """,
-                (run_id, user["id"]),
+                (run_id, user["id"], user["id"]),
             ).fetchone()
             if not run:
                 self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
@@ -2806,6 +2846,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (thread_id, user["id"]),
             ).fetchone()
             if not thread:
+                shared_thread = conn.execute("""SELECT threads.id FROM threads WHERE threads.id = ? AND threads.folder_id != ''
+                    AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)""", (thread_id, user["id"])).fetchone() if thread_id else None
+                if shared_thread:
+                    self.send_error_json("这是项目空间成员的对话，你可以查看，但只有创建者可以继续编辑", HTTPStatus.FORBIDDEN)
+                    return
                 if retry:
                     self.send_error_json("无法重试：原对话不存在", HTTPStatus.NOT_FOUND)
                     return
@@ -2938,6 +2983,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "route": execution_context["skill_route"],
                 "skills": [skill["name"] for skill in active_skills],
             })
+            append_run_event(conn, run_id, "reasoning_summary", {"items": build_reasoning_summary(execution_context)})
             knowledge_event = "knowledge_retrieved" if knowledge_refs else (
                 "knowledge_no_match" if task_profile["needs_knowledge"] else "knowledge_not_needed"
             )
@@ -3012,6 +3058,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         reflection = {"applied": False, "passed": True, "issues": [], "summary": "未触发质量检查", "revision_count": 0}
         try:
             self.write_event("meta", {"thread_id": thread_id, "run_id": run_id, "model": actual_model})
+            self.write_event("reasoning_summary", {"items": build_reasoning_summary(execution_context)})
             self.write_event("status", {"summary": event_summary("skill_routed", {"skills": [skill["name"] for skill in active_skills]})})
             self.write_event("status", {"summary": event_summary(knowledge_event, {"count": len(knowledge_refs)})})
             self.write_event("status", {"summary": event_summary("plan_created", {"steps": execution_plan})})

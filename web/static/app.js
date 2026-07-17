@@ -21,6 +21,8 @@ const state = {
   selectedSkillIds: [],
   activeView: "chat",
   streaming: false,
+  currentThreadEditable: true,
+  spaceComposerFolder: null,
 };
 
 const UI_STATE_KEY = "agent_platform_workspace_state";
@@ -61,6 +63,7 @@ const els = {
   chatInput: document.querySelector("#chatInput"),
   taskModeSelect: document.querySelector("#taskModeSelect"),
   modelSelect: document.querySelector("#modelSelect"),
+  modelConfigHint: document.querySelector("#modelConfigHint"),
   sourceModeSelect: document.querySelector("#sourceModeSelect"),
   knowledgeModeSelect: document.querySelector("#knowledgeModeSelect"),
   webModeSelect: document.querySelector("#webModeSelect"),
@@ -249,7 +252,12 @@ async function loadThread(threadId) {
   state.pendingFolderId = "";
   persistWorkspaceState();
   state.messages = data.messages;
+  state.currentThreadEditable = data.thread.user_id === state.user?.id;
   els.threadTitle.textContent = data.thread.title || "新对话";
+  if (!state.currentThreadEditable && data.thread.author_name) els.threadTitle.textContent += ` · ${data.thread.author_name}`;
+  els.chatInput.contentEditable = String(state.currentThreadEditable);
+  els.sendButton.disabled = !state.currentThreadEditable;
+  els.chatInput.dataset.placeholder = state.currentThreadEditable ? "给 Agent_Platform 发送消息" : "此对话由其他项目成员创建，仅可查看";
   renderThreads();
   renderMessages();
   await loadRuns();
@@ -276,6 +284,14 @@ async function loadModels() {
     els.modelSelect.appendChild(option);
   });
   els.modelSelect.value = state.models.some((model) => model.id === previous) ? previous : state.models[0]?.id || "";
+  renderModelConfigHint();
+}
+
+function renderModelConfigHint() {
+  const modeLabels = { auto: "深度自动", quick: "快速", standard: "标准", deep: "深度" };
+  const model = state.models.find((item) => item.id === els.modelSelect.value);
+  const modelLabel = model?.id === "auto" || !model ? "自动选模型" : model.name;
+  els.modelConfigHint.textContent = `${modelLabel} · ${modeLabels[els.taskModeSelect.value] || "深度自动"}`;
 }
 
 function renderSkillContext() {
@@ -723,7 +739,8 @@ function createThreadGroup(title, threads, folder = null) {
       renderThreads();
     });
     heading.appendChild(disclosure);
-    controls.append(newThread, menu);
+    controls.append(newThread);
+    if (folder.user_id === state.user?.id) controls.append(menu);
     header.appendChild(controls);
   }
   group.appendChild(header);
@@ -748,7 +765,14 @@ function createThreadRow(thread) {
     menu.textContent = "⋯";
     menu.setAttribute("aria-label", `管理对话：${thread.title}`);
     menu.addEventListener("click", () => manageThread(thread));
-    row.append(button, menu);
+    if (thread.user_id === state.user?.id) row.append(button, menu);
+    else {
+      const author = document.createElement("span");
+      author.className = "thread-author";
+      author.textContent = thread.author_name || "成员";
+      author.title = `创建者：${thread.author_name || "成员"}`;
+      row.append(button, author);
+    }
     return row;
 }
 
@@ -756,19 +780,21 @@ async function openSpace(spaceId) {
   const data = await api(`/api/folders/${spaceId}`);
   els.spaceTitle.textContent = data.space.name;
   const empty = (text) => `<p class="space-empty">${text}</p>`;
-  const tasks = data.tasks.map((item) => `<button class="space-list-item space-task-link" data-thread-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>打开任务</small></button>`).join("") || empty("该空间暂时没有任务");
-  const artifacts = data.artifacts.map((item) => `<button class="space-list-item space-artifact-link" data-artifact-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${escapeHtml(item.kind.toUpperCase())} · 关联任务：${escapeHtml(item.task_title || "未命名任务")}</small></button>`).join("") || empty("该空间暂时没有产物");
+  const tasks = data.tasks.map((item) => `<button class="space-list-item space-task-link" data-thread-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>创建者：${escapeHtml(item.author_name || "成员")} · ${item.user_id === state.user?.id ? "可编辑" : "仅查看"}</small></button>`).join("") || empty("该项目空间暂时没有对话");
+  const artifacts = data.artifacts.map((item) => `<button class="space-list-item space-artifact-link" data-artifact-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${escapeHtml(item.kind.toUpperCase())} · ${escapeHtml(item.author_name || "成员")} · 关联对话：${escapeHtml(item.task_title || "未命名对话")}</small></button>`).join("") || empty("该空间暂时没有产物");
   const sources = data.sources.map((item) => `<div class="space-list-item space-source"><span>${escapeHtml(item.title)}</span><small>${item.kind === "web" ? "网页" : "本地资料"} · 关联任务：${escapeHtml(item.task_title)}</small>${item.excerpt ? `<em>${escapeHtml(item.excerpt)}</em>` : ""}</div>`).join("") || empty("空间内任务尚未引用资料或网页来源");
   if (!state.demoMembersBySpace[spaceId]) state.demoMembersBySpace[spaceId] = [{ id: "demo-linran", name: "林然", role: "member", demo: true }, { id: "demo-zhouning", name: "周宁", role: "member", demo: true }];
   const demoMembers = data.members.length <= 1 ? state.demoMembersBySpace[spaceId] : [];
   const members = [...data.members, ...demoMembers].map((item) => {
     const name = item.name || item.email;
     const initial = escapeHtml(name.slice(0, 1).toUpperCase());
-    const removable = item.role !== "owner";
+    const removable = data.can_manage_members && item.role !== "owner";
     return `<div class="space-member"><span class="member-avatar" aria-hidden="true">${initial}</span><span class="member-name">${escapeHtml(name)}${item.demo ? '<small>演示成员</small>' : ""}</span><span class="member-role">${escapeHtml(item.role === "owner" ? "所有者" : "成员")}</span>${removable ? `<button class="remove-space-member" data-member-id="${escapeHtml(item.id)}" data-demo="${item.demo ? "true" : "false"}" type="button" aria-label="移除 ${escapeHtml(name)}">×</button>` : '<span class="member-lock" title="空间所有者不可移除">•</span>'}</div>`;
   }).join("") || empty("暂未添加成员");
   const pending = data.invitations.filter((item) => item.status === "pending").map((item) => `<div class="space-invitation">已邀请 ${escapeHtml(item.email)} · 待加入</div>`).join("");
-  els.spaceDetail.innerHTML = `<div class="space-layout"><div class="space-overview"><section class="space-card"><div class="space-card-heading"><h3>任务</h3><span>${data.tasks.length}</span></div>${tasks}</section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div>${artifacts}</section><section class="space-card space-card-wide"><div class="space-card-heading"><h3>来源</h3><span>${data.sources.length}</span></div>${sources}</section></div><aside class="space-members-panel"><div class="space-card-heading"><h3>成员</h3><button id="inviteSpaceMember" type="button">邀请成员</button></div>${members}${pending}</aside></div>`;
+  const inviteButton = data.can_manage_members ? '<button id="inviteSpaceMember" type="button">邀请成员</button>' : '';
+  els.spaceDetail.innerHTML = `<div class="space-workbench"><section class="space-conversation-panel"><div class="space-conversation-empty"><h1>在 ${escapeHtml(data.space.name)} 中开始协作</h1><p>选择成员或 Agent 发起对话，记录会保留在当前项目空间。</p></div><div id="spaceComposerMount"></div></section><aside class="space-side-panel"><section class="space-card space-members-panel"><div class="space-card-heading"><h3>成员</h3>${inviteButton}</div>${members}${pending}</section><section class="space-card"><div class="space-card-heading"><h3>对话</h3><span>${data.tasks.length}</span></div><div class="space-side-list">${tasks}</div></section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div><div class="space-side-list">${artifacts}</div></section></aside></div>`;
+  mountSpaceComposer(data.space);
   els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
   els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
   els.spaceDetail.querySelectorAll(".remove-space-member").forEach((button) => button.addEventListener("click", async () => {
@@ -777,7 +803,7 @@ async function openSpace(spaceId) {
     else await api(`/api/folders/${spaceId}/members/${button.dataset.memberId}`, { method: "DELETE" });
     await openSpace(spaceId);
   }));
-  document.querySelector("#inviteSpaceMember").addEventListener("click", async () => {
+  els.spaceDetail.querySelector("#inviteSpaceMember")?.addEventListener("click", async () => {
     const email = window.prompt("输入成员邮箱");
     if (!email?.trim()) return;
     await api(`/api/folders/${spaceId}/invitations`, { method: "POST", body: JSON.stringify({ email }) });
@@ -832,15 +858,21 @@ async function createFolder(section) {
   }
 }
 
-async function startThreadInFolder(folder) {
+async function startThreadInFolder(folder, { preserveComposer = false } = {}) {
   state.pendingFolderId = folder.id;
   state.currentThreadId = "";
   state.messages = [];
   state.runs = [];
   state.threadContext = { sources: [], outputs: [] };
-  state.selectedSkillIds = [];
-  renderComposerSkills();
-  renderSkillPicker();
+  if (!preserveComposer) state.selectedSkillIds = [];
+  state.currentThreadEditable = true;
+  els.chatInput.contentEditable = "true";
+  els.chatInput.dataset.placeholder = "给 Agent_Platform 发送消息";
+  els.sendButton.disabled = false;
+  if (!preserveComposer) {
+    renderComposerSkills();
+    renderSkillPicker();
+  }
   els.threadTitle.textContent = `新建任务 · ${folder.name}`;
   switchView("chat");
   renderThreads();
@@ -990,7 +1022,7 @@ async function restorePendingConfirmation() {
   const detail = await api(`/api/runs/${pending.id}`);
   if (!detail.confirmation || detail.confirmation.status !== "pending") return;
   const assistant = appendAssistantMessage();
-  assistant.status.textContent = "处理状态 · 等待你的确认";
+  appendExecutionTrace(assistant, "等待你的确认");
   assistant.content.textContent = detail.confirmation.request;
   const context = safeJson(detail.run.execution_context, {});
   appendConfirmationActions(assistant, {
@@ -1335,16 +1367,85 @@ function appendAssistantMessage() {
   wrapper.className = "message assistant";
   wrapper.innerHTML = `
     <div class="message-role">Agent_Platform</div>
-    <div class="assistant-status">处理状态 · 正在准备运行</div>
+    <section class="reasoning-summary hidden">
+      <button class="reasoning-summary-toggle" type="button" aria-expanded="false"><span>推理摘要</span><span class="reasoning-summary-chevron">⌄</span></button>
+      <div class="reasoning-summary-body hidden"><ul></ul></div>
+    </section>
+    <section class="execution-trace">
+      <button class="execution-trace-toggle" type="button" aria-expanded="true"><span class="execution-trace-title">执行过程</span><span class="execution-trace-time">预计剩余 30 秒</span><span class="execution-trace-chevron">⌃</span></button>
+      <div class="execution-trace-body"><ol class="execution-trace-list"><li>正在准备运行</li></ol></div>
+    </section>
     <div class="answer-label">最终回答</div>
     <div class="message-content"></div>
   `;
   els.messages.appendChild(wrapper);
   els.messages.scrollTop = els.messages.scrollHeight;
+  const traceToggle = wrapper.querySelector(".execution-trace-toggle");
+  const traceBody = wrapper.querySelector(".execution-trace-body");
+  traceToggle.addEventListener("click", () => {
+    const expanded = traceToggle.getAttribute("aria-expanded") === "true";
+    traceToggle.setAttribute("aria-expanded", String(!expanded));
+    traceBody.classList.toggle("hidden", expanded);
+  });
+  const reasoning = wrapper.querySelector(".reasoning-summary");
+  const reasoningToggle = wrapper.querySelector(".reasoning-summary-toggle");
+  const reasoningBody = wrapper.querySelector(".reasoning-summary-body");
+  reasoningToggle.addEventListener("click", () => {
+    const expanded = reasoningToggle.getAttribute("aria-expanded") === "true";
+    reasoningToggle.setAttribute("aria-expanded", String(!expanded));
+    reasoningBody.classList.toggle("hidden", expanded);
+  });
   return {
     wrapper,
-    status: wrapper.querySelector(".assistant-status"),
+    traceToggle,
+    traceTitle: wrapper.querySelector(".execution-trace-title"),
+    traceTime: wrapper.querySelector(".execution-trace-time"),
+    traceList: wrapper.querySelector(".execution-trace-list"),
+    reasoning,
+    reasoningToggle,
+    reasoningBody,
+    reasoningList: reasoning.querySelector("ul"),
     content: wrapper.querySelector(".message-content"),
+  };
+}
+
+function renderReasoningSummary(assistant, items) {
+  if (!Array.isArray(items) || !items.length) return;
+  assistant.reasoningList.replaceChildren();
+  items.slice(0, 5).forEach((text) => {
+    const item = document.createElement("li");
+    item.textContent = text;
+    assistant.reasoningList.appendChild(item);
+  });
+  assistant.reasoning.classList.remove("hidden");
+}
+
+function appendExecutionTrace(assistant, summary) {
+  const last = assistant.traceList.lastElementChild;
+  if (last?.textContent === summary) return;
+  const item = document.createElement("li");
+  item.textContent = summary;
+  assistant.traceList.appendChild(item);
+  assistant.traceTitle.textContent = `执行过程 · ${assistant.traceList.children.length} 步`;
+  els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+function startExecutionCountdown(assistant) {
+  const startedAt = Date.now();
+  const update = () => {
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    const remaining = Math.max(0, 30 - elapsed);
+    assistant.traceTime.textContent = remaining ? `预计剩余 ${remaining} 秒 · 已用 ${elapsed} 秒` : `正在继续处理 · 已用 ${elapsed} 秒`;
+  };
+  update();
+  const timer = window.setInterval(update, 1000);
+  return {
+    stop(label = "已完成") {
+      window.clearInterval(timer);
+      const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+      assistant.traceTime.textContent = `${label} · 用时 ${elapsed} 秒`;
+    },
+    timer,
   };
 }
 
@@ -1509,6 +1610,7 @@ function renderApps(apps, tools = []) {
 }
 
 function switchView(view) {
+  if (view !== "space") restoreChatComposer();
   state.activeView = view;
   persistWorkspaceState();
   els.chatPage.classList.toggle("hidden", view !== "chat");
@@ -1526,6 +1628,23 @@ function switchView(view) {
   });
 }
 
+function restoreChatComposer() {
+  if (els.chatForm.parentElement === els.chatPage) return;
+  els.messages.insertAdjacentElement("afterend", els.chatForm);
+  els.chatForm.classList.remove("space-composer");
+  els.chatInput.dataset.placeholder = "给 Agent_Platform 发送消息";
+  state.spaceComposerFolder = null;
+}
+
+function mountSpaceComposer(space) {
+  const mount = els.spaceDetail.querySelector("#spaceComposerMount");
+  if (!mount) return;
+  state.spaceComposerFolder = space;
+  els.chatForm.classList.add("space-composer");
+  els.chatInput.dataset.placeholder = "给项目空间发送消息";
+  mount.appendChild(els.chatForm);
+}
+
 async function sendMessage(content, { retry = false } = {}) {
   if (state.streaming) return;
   state.streaming = true;
@@ -1533,6 +1652,7 @@ async function sendMessage(content, { retry = false } = {}) {
   els.sendButton.textContent = "发送中";
 
   let assistant;
+  let executionTimer;
   let assistantContent = "";
   let awaitingConfirmation = false;
   let cancelled = false;
@@ -1545,6 +1665,7 @@ async function sendMessage(content, { retry = false } = {}) {
       appendMessage("user", content);
     }
     assistant = appendAssistantMessage();
+    executionTimer = startExecutionCountdown(assistant);
 
     const chatPayload = {
       thread_id: state.currentThreadId,
@@ -1588,10 +1709,13 @@ async function sendMessage(content, { retry = false } = {}) {
           state.currentThreadId = event.data.thread_id;
           state.pendingFolderId = "";
           persistWorkspaceState();
-          assistant.status.textContent = `处理状态 · 正在调用 ${event.data.model}`;
+          appendExecutionTrace(assistant, `已选择模型：${event.data.model}`);
+        }
+        if (event.event === "reasoning_summary") {
+          renderReasoningSummary(assistant, event.data.items);
         }
         if (event.event === "status") {
-          assistant.status.textContent = `处理状态 · ${event.data.summary || "正在执行"}`;
+          appendExecutionTrace(assistant, event.data.summary || "正在执行");
         }
         if (event.event === "delta") {
           assistantContent += event.data.content;
@@ -1600,13 +1724,15 @@ async function sendMessage(content, { retry = false } = {}) {
         }
         if (event.event === "confirmation") {
           awaitingConfirmation = true;
-          assistant.status.textContent = "处理状态 · 等待你的确认";
+          appendExecutionTrace(assistant, "等待你的确认");
+          executionTimer.stop("等待确认");
           assistant.content.textContent = event.data.request || "此操作需要确认后才能执行。";
           appendConfirmationActions(assistant, event.data, content);
         }
         if (event.event === "cancelled") {
           cancelled = true;
-          assistant.status.textContent = "处理状态 · 已取消";
+          appendExecutionTrace(assistant, "运行已取消");
+          executionTimer.stop("已取消");
           assistant.content.textContent = "本次运行已取消，未保存后续回答。";
         }
         if (event.event === "error") {
@@ -1614,23 +1740,26 @@ async function sendMessage(content, { retry = false } = {}) {
         }
       }
     }
-    if (cancelled) return;
+    if (cancelled || awaitingConfirmation) return;
     if (!assistantContent && !awaitingConfirmation) {
       throw new Error("模型未返回内容");
     }
-    assistant.status.textContent = "处理状态 · 已完成";
+    appendExecutionTrace(assistant, "已生成最终回答");
+    executionTimer.stop("已完成");
     renderMessageContent(assistant.content, assistantContent);
     state.messages.push({ role: "assistant", content: assistantContent });
   } catch (error) {
     const message = error.message || "发送失败";
     if (assistant) {
-      assistant.status.textContent = "处理状态 · 运行失败";
+      appendExecutionTrace(assistant, "运行失败");
+      executionTimer?.stop("运行失败");
       assistant.content.textContent = message;
       appendRetryButton(assistant.wrapper, content);
     } else {
       appendMessage("assistant", message);
     }
   } finally {
+    if (cancelled) executionTimer?.stop("已取消");
     state.streaming = false;
     els.sendButton.disabled = false;
     els.sendButton.textContent = "发送";
@@ -1656,20 +1785,20 @@ function appendConfirmationActions(assistant, confirmation, sourceContent) {
   };
   approveButton.addEventListener("click", async () => {
     setBusy(true);
-    assistant.status.textContent = "处理状态 · 正在继续运行";
+    appendExecutionTrace(assistant, "正在继续执行已确认操作");
     try {
       const result = await api(`/api/runs/${confirmation.run_id}/confirmation`, {
         method: "POST",
         body: JSON.stringify({ approved: true }),
       });
-      assistant.status.textContent = "处理状态 · 已完成";
+      appendExecutionTrace(assistant, "已完成已确认操作");
       renderMessageContent(assistant.content, result.content || "");
       if (result.content) state.messages.push({ role: "assistant", content: result.content });
       actions.remove();
       if (result.artifact) appendArtifactLink(assistant.wrapper, result.artifact);
       await Promise.all([refreshThreadList(), loadRuns()]);
     } catch (error) {
-      assistant.status.textContent = "处理状态 · 运行失败";
+      appendExecutionTrace(assistant, "已确认操作执行失败");
       assistant.content.textContent = error.message || "文件生成失败";
       setBusy(false);
     }
@@ -1681,12 +1810,12 @@ function appendConfirmationActions(assistant, confirmation, sourceContent) {
         method: "POST",
         body: JSON.stringify({ approved: false }),
       });
-      assistant.status.textContent = "处理状态 · 已取消";
+      appendExecutionTrace(assistant, "已取消待确认操作");
       assistant.content.textContent = "已取消本次文件生成，未创建任何文件。";
       actions.remove();
       await loadRuns();
     } catch (error) {
-      assistant.status.textContent = "处理状态 · 取消失败";
+      appendExecutionTrace(assistant, "取消待确认操作失败");
       assistant.content.textContent = error.message || "取消失败";
       setBusy(false);
     }
@@ -1795,8 +1924,10 @@ let routePreviewSequence = 0;
 function renderExecutionModeHint() {
   syncEvidenceModeControls();
   const labels = { off: "关闭", auto: "自动", required: "必须" };
-  const sourceLabels = { general: "通用", local_only: "仅本地资料", web_only: "仅联网资料", mixed: "混合资料" };
-  els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · 知识库${labels[els.knowledgeModeSelect.value]} · 网络${labels[els.webModeSelect.value]}`;
+  const sourceLabels = { general: "智能选择", local_only: "仅知识库", web_only: "仅网络", mixed: "知识库 + 网络" };
+  const advanced = els.sourceModeSelect.value === "general" && (els.knowledgeModeSelect.value !== "auto" || els.webModeSelect.value !== "auto")
+    ? ` · 高级已设定` : "";
+  els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · 文件${labels[els.fileModeSelect.value]}${advanced}`;
 }
 
 function scheduleRoutePreview() {
@@ -1865,8 +1996,12 @@ els.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const content = getChatContent();
   if (!content) return;
+  const space = state.activeView === "space" ? state.spaceComposerFolder : null;
   els.chatInput.innerHTML = "";
   try {
+    if (space) {
+      await startThreadInFolder(space, { preserveComposer: true });
+    }
     await sendMessage(content);
   } catch (error) {
     appendMessage("assistant", error.message);
@@ -1875,6 +2010,18 @@ els.chatForm.addEventListener("submit", async (event) => {
 
 [els.sourceModeSelect, els.knowledgeModeSelect, els.webModeSelect, els.fileModeSelect]
   .forEach((select) => select.addEventListener("change", scheduleRoutePreview));
+
+[els.modelSelect, els.taskModeSelect].forEach((select) => select.addEventListener("change", () => {
+  renderModelConfigHint();
+  scheduleRoutePreview();
+}));
+
+const modelConfigPicker = document.querySelector(".model-config-picker");
+const executionModePicker = document.querySelector(".execution-mode-picker");
+[modelConfigPicker, executionModePicker].forEach((picker) => picker?.addEventListener("toggle", () => {
+  if (!picker.open) return;
+  [modelConfigPicker, executionModePicker].filter((other) => other && other !== picker).forEach((other) => { other.open = false; });
+}));
 
 renderExecutionModeHint();
 

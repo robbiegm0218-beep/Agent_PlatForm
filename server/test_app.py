@@ -585,6 +585,22 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.request_json("/api/tools/search_workspace_files/execute", {"arguments": {}}, self.token)
         self.assertEqual(failure.exception.code, 400)
 
+    def test_project_space_members_share_visibility_but_keep_thread_editing_private(self):
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("member_user", "member@example.com", app.hash_password("member123"), "项目成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "member@example.com", "password": "member123"})["token"]
+        space = self.request_json("/api/folders", {"name": "共享项目", "section": "project"}, self.token)["folder"]
+        invitation = self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "member@example.com"}, self.token)["invitation"]
+        self.assertEqual(invitation["status"], "accepted")
+        member_thread = self.request_json("/api/threads", {"title": "成员任务", "folder_id": space["id"]}, member_token)["thread"]
+        owner_threads = self.request_json("/api/threads", token=self.token)["threads"]
+        self.assertEqual(next(item for item in owner_threads if item["id"] == member_thread["id"])["author_name"], "项目成员")
+        space_detail = self.request_json(f"/api/folders/{space['id']}", token=member_token)
+        self.assertEqual(space_detail["tasks"][0]["author_name"], "项目成员")
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request_json(f"/api/threads/{member_thread['id']}", {"title": "越权编辑"}, self.token, method="PATCH")
+        self.assertEqual(failure.exception.code, 404)
+
     def test_execution_modes_are_frozen_and_constrain_knowledge_and_file_tools(self):
         off_events = self.chat({
             "thread_id": "", "content": "请根据本地资料说明产品指标", "knowledge_mode": "off", "file_mode": "off",
