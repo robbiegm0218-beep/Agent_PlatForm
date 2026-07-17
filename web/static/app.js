@@ -1,135 +1,22 @@
-const state = {
-  token: localStorage.getItem("agent_platform_token") || "",
-  user: null,
-  threads: [],
-  folders: [],
-  collapsedFolderIds: new Set(),
-  spacesCollapsed: false,
-  tasksCollapsed: false,
-  demoMembersBySpace: {},
-  currentThreadId: "",
-  pendingFolderId: "",
-  messages: [],
-  runs: [],
-  threadContext: { sources: [], outputs: [] },
-  skills: [],
-  models: [],
-  artifacts: [],
-  tools: [],
-  knowledgeDocuments: [],
-  memories: [],
-  selectedSkillIds: [],
-  activeView: "chat",
-  streaming: false,
-  currentThreadEditable: true,
-  spaceComposerFolder: null,
-  knowledgeUploadSpaceId: "",
-  currentSpaceId: "",
-};
+const state = window.AgentState;
+const UI_STATE_KEY = window.AgentUiState.key;
+const VALID_VIEWS = window.AgentUiState.validViews;
+const els = window.AgentElements;
+const storage = window.AgentStorage;
+const composer = window.AgentChatComposer;
+const chatStream = window.AgentChatStream;
+const markdown = window.AgentMarkdown;
+const chatInteractions = window.AgentChatInteractions;
+const runTrace = window.AgentRunTrace;
+const knowledgeLibrary = window.AgentKnowledgeLibrary;
+const spaceWorkspace = window.AgentSpaceWorkspace;
+const resourceViews = window.AgentResourceViews;
+const capabilityViews = window.AgentCapabilityViews;
+const settingsView = window.AgentSettingsView;
+const auditView = window.AgentAuditView;
+const executionMode = window.AgentExecutionMode({ state, els, api: window.AgentApi, getChatContent });
 
-const UI_STATE_KEY = "agent_platform_workspace_state";
-const VALID_VIEWS = new Set(["chat", "skills", "settings", "knowledge", "memories", "artifacts", "space"]);
-
-const els = {
-  loginView: document.querySelector("#loginView"),
-  workspaceView: document.querySelector("#workspaceView"),
-  loginForm: document.querySelector("#loginForm"),
-  loginError: document.querySelector("#loginError"),
-  emailInput: document.querySelector("#emailInput"),
-  passwordInput: document.querySelector("#passwordInput"),
-  threadList: document.querySelector("#threadList"),
-  threadSearch: document.querySelector("#threadSearch"),
-  newThreadButton: document.querySelector("#newThreadButton"),
-  chatPage: document.querySelector("#chatPage"),
-  spacePage: document.querySelector("#spacePage"),
-  spaceTitle: document.querySelector("#spaceTitle"),
-  spaceDetail: document.querySelector("#spaceDetail"),
-  skillsPage: document.querySelector("#skillsPage"),
-  settingsPage: document.querySelector("#settingsPage"),
-  knowledgePage: document.querySelector("#knowledgePage"),
-  memoriesPage: document.querySelector("#memoriesPage"),
-  messages: document.querySelector("#messages"),
-  threadTitle: document.querySelector("#threadTitle"),
-  modelStatus: document.querySelector("#modelStatus"),
-  runDetailsButton: document.querySelector("#runDetailsButton"),
-  runDrawer: document.querySelector("#runDrawer"),
-  closeRunDrawer: document.querySelector("#closeRunDrawer"),
-  runList: document.querySelector("#runList"),
-  viewAllRunsButton: document.querySelector("#viewAllRunsButton"),
-  runFilters: document.querySelector("#runFilters"),
-  runStatusFilter: document.querySelector("#runStatusFilter"),
-  runTierFilter: document.querySelector("#runTierFilter"),
-  runKnowledgeFilter: document.querySelector("#runKnowledgeFilter"),
-  runDetail: document.querySelector("#runDetail"),
-  chatForm: document.querySelector("#chatForm"),
-  chatInput: document.querySelector("#chatInput"),
-  taskModeSelect: document.querySelector("#taskModeSelect"),
-  modelSelect: document.querySelector("#modelSelect"),
-  modelConfigHint: document.querySelector("#modelConfigHint"),
-  sourceModeSelect: document.querySelector("#sourceModeSelect"),
-  knowledgeModeSelect: document.querySelector("#knowledgeModeSelect"),
-  webModeSelect: document.querySelector("#webModeSelect"),
-  fileModeSelect: document.querySelector("#fileModeSelect"),
-  executionModeHint: document.querySelector("#executionModeHint"),
-  skillPickerButton: document.querySelector("#skillPickerButton"),
-  skillPickerMenu: document.querySelector("#skillPickerMenu"),
-  sendButton: document.querySelector("#sendButton"),
-  skillsGrid: document.querySelector("#skillsGrid"),
-  appsGrid: document.querySelector("#appsGrid"),
-  skillFileInput: document.querySelector("#skillFileInput"),
-  skillFileName: document.querySelector("#skillFileName"),
-  skillDropZone: document.querySelector("#skillDropZone"),
-  nameInput: document.querySelector("#nameInput"),
-  settingsEmail: document.querySelector("#settingsEmail"),
-  settingsForm: document.querySelector("#settingsForm"),
-  settingsNotice: document.querySelector("#settingsNotice"),
-  logoutButton: document.querySelector("#logoutButton"),
-  logoutAllButton: document.querySelector("#logoutAllButton"),
-  uploadKnowledgeButton: document.querySelector("#uploadKnowledgeButton"),
-  knowledgeFileInput: document.querySelector("#knowledgeFileInput"),
-  knowledgeSearch: document.querySelector("#knowledgeSearch"),
-  knowledgeScopeSelect: document.querySelector("#knowledgeScopeSelect"),
-  knowledgeProjectSelect: document.querySelector("#knowledgeProjectSelect"),
-  knowledgeList: document.querySelector("#knowledgeList"),
-  knowledgeResults: document.querySelector("#knowledgeResults"),
-  memoryForm: document.querySelector("#memoryForm"),
-  memoryKind: document.querySelector("#memoryKind"),
-  memoryScope: document.querySelector("#memoryScope"),
-  memoryContent: document.querySelector("#memoryContent"),
-  memorySearch: document.querySelector("#memorySearch"),
-  memoryNotice: document.querySelector("#memoryNotice"),
-  memoryList: document.querySelector("#memoryList"),
-  artifactsPage: document.querySelector("#artifactsPage"),
-  artifactsGrid: document.querySelector("#artifactsGrid"),
-  threadContextPanel: document.querySelector("#threadContextPanel"),
-  threadContextCount: document.querySelector("#threadContextCount"),
-  threadSources: document.querySelector("#threadSources"),
-  threadOutputs: document.querySelector("#threadOutputs"),
-  viewKnowledgeButton: document.querySelector("#viewKnowledgeButton"),
-  viewArtifactsButton: document.querySelector("#viewArtifactsButton"),
-};
-
-function api(path, options = {}) {
-  const headers = {
-    "Content-Type": "application/json",
-    ...(options.headers || {}),
-  };
-  if (state.token) {
-    headers.Authorization = `Bearer ${state.token}`;
-  }
-  return fetch(path, {
-    ...options,
-    headers,
-  }).then(async (response) => {
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const error = new Error(data.error || "请求失败");
-      error.status = response.status;
-      throw error;
-    }
-    return data;
-  });
-}
+const api = window.AgentApi;
 
 async function boot() {
   if (!state.token) {
@@ -150,7 +37,7 @@ async function boot() {
     }
   } catch (error) {
     if (error.status === 401) {
-      localStorage.removeItem("agent_platform_token");
+      storage.clearToken();
       state.token = "";
       showLogin();
       return;
@@ -212,19 +99,14 @@ async function refreshAll() {
 }
 
 function persistWorkspaceState() {
-  localStorage.setItem(UI_STATE_KEY, JSON.stringify({
+  storage.saveWorkspace(UI_STATE_KEY, {
     view: state.activeView,
     threadId: state.currentThreadId,
-  }));
+  });
 }
 
 async function restoreWorkspaceState() {
-  let saved = {};
-  try {
-    saved = JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}");
-  } catch (_error) {
-    localStorage.removeItem(UI_STATE_KEY);
-  }
+  const saved = storage.loadWorkspace(UI_STATE_KEY);
   const view = VALID_VIEWS.has(saved.view) ? saved.view : "chat";
   const thread = state.threads.find((item) => item.id === saved.threadId);
   if (thread) {
@@ -252,18 +134,12 @@ async function loadFolders() {
 }
 
 function renderKnowledgeProjectOptions() {
-  const spaces = state.folders.filter((folder) => folder.section === "project");
-  const previous = els.knowledgeProjectSelect.value;
-  els.knowledgeProjectSelect.innerHTML = `<option value="">全部项目</option>${spaces.map((space) => `<option value="${escapeHtml(space.id)}">${escapeHtml(space.name)}</option>`).join("")}`;
-  els.knowledgeProjectSelect.value = spaces.some((space) => space.id === previous) ? previous : "";
-  els.knowledgeProjectSelect.disabled = !spaces.length;
+  knowledgeLibrary.renderProjectOptions(state, els, escapeHtml);
   syncKnowledgeScopeControls();
 }
 
 function syncKnowledgeScopeControls() {
-  const project = els.knowledgeScopeSelect.value === "project";
-  els.knowledgeProjectSelect.classList.toggle("hidden", !project);
-  els.knowledgeProjectSelect.required = false;
+  knowledgeLibrary.syncScope(els);
   renderKnowledge(state.knowledgeDocuments);
 }
 
@@ -309,10 +185,7 @@ async function loadModels() {
 }
 
 function renderModelConfigHint() {
-  const modeLabels = { auto: "深度自动", quick: "快速", standard: "标准", deep: "深度" };
-  const model = state.models.find((item) => item.id === els.modelSelect.value);
-  const modelLabel = model?.id === "auto" || !model ? "自动选模型" : model.name;
-  els.modelConfigHint.textContent = `${modelLabel} · ${modeLabels[els.taskModeSelect.value] || "深度自动"}`;
+  executionMode.renderModelConfigHint();
 }
 
 function renderSkillContext() {
@@ -322,79 +195,30 @@ function renderSkillContext() {
 }
 
 function getPromptText() {
-  return [...els.chatInput.childNodes]
-    .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.classList.contains("skill-tag")))
-    .map((node) => node.textContent)
-    .join("")
-    .trim();
+  return composer.getPromptText(els);
 }
 
 function getChatContent() {
-  const selected = state.skills.filter((skill) => state.selectedSkillIds.includes(skill.id) && skill.enabled);
-  const tags = selected.map((skill) => `@${skill.name}`).join(" ");
-  return [tags, getPromptText()].filter(Boolean).join(" ");
+  return composer.getChatContent(state, els);
 }
 
 function focusChatInput() {
-  els.chatInput.focus();
-  const range = document.createRange();
-  range.selectNodeContents(els.chatInput);
-  range.collapse(false);
-  const selection = window.getSelection();
-  selection.removeAllRanges();
-  selection.addRange(range);
+  composer.focus(els);
 }
 
 function renderComposerSkills() {
-  const prompt = getPromptText();
-  const selected = state.skills.filter((skill) => state.selectedSkillIds.includes(skill.id) && skill.enabled);
-  els.chatInput.innerHTML = "";
-  selected.forEach((skill) => {
-    const tag = document.createElement("span");
-    tag.className = "skill-tag";
-    tag.dataset.skillId = skill.id;
-    tag.setAttribute("contenteditable", "false");
-    tag.textContent = `@${skill.name}`;
-    els.chatInput.appendChild(tag);
-  });
-  if (prompt) els.chatInput.appendChild(document.createTextNode(prompt));
-  const availableCount = state.skills.filter((skill) => skill.enabled).length;
-  els.skillPickerButton.textContent = selected.length
-    ? `已选 ${selected.length} · ${availableCount} 项可用`
-    : `选择技能 · ${availableCount} 项可用`;
+  composer.renderSkills(state, els);
 }
 
 function renderSkillPicker() {
-  const enabledSkills = state.skills.filter((skill) => skill.enabled);
-  els.skillPickerMenu.innerHTML = "";
-  if (!enabledSkills.length) {
-    const empty = document.createElement("div");
-    empty.className = "skill-picker-empty";
-    empty.textContent = "暂无已启用技能";
-    els.skillPickerMenu.appendChild(empty);
-    return;
-  }
-  enabledSkills.forEach((skill) => {
-    const item = document.createElement("label");
-    item.className = "skill-picker-item";
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = state.selectedSkillIds.includes(skill.id);
-    input.addEventListener("change", () => {
-      toggleSelectedSkill(skill.id);
-      focusChatInput();
-    });
-    const text = document.createElement("span");
-    text.textContent = skill.name;
-    item.append(input, text);
-    els.skillPickerMenu.appendChild(item);
+  composer.renderPicker(state, els, (skillId) => {
+    toggleSelectedSkill(skillId);
+    focusChatInput();
   });
 }
 
 function toggleSelectedSkill(skillId) {
-  state.selectedSkillIds = state.selectedSkillIds.includes(skillId)
-    ? state.selectedSkillIds.filter((id) => id !== skillId)
-    : [...state.selectedSkillIds, skillId];
+  composer.toggleSkill(state, skillId);
   renderComposerSkills();
   renderSkillPicker();
 }
@@ -433,45 +257,17 @@ function renderMemoryScopes() {
 }
 
 function renderMemories() {
-  els.memoryList.innerHTML = "";
-  if (!state.memories.length) {
-    els.memoryList.innerHTML = '<div class="empty-state"><h2>暂无长期记忆</h2><p>明确确认保存的偏好、项目事实和决策会显示在这里。</p></div>';
-    return;
-  }
-  const labels = { preference: "个人偏好", project_fact: "项目事实", decision: "已确认决策" };
-  state.memories.forEach((memory) => {
-    const card = document.createElement("article");
-    card.className = "capability-card memory-card";
-    const scope = memory.scope_type === "project"
-      ? `项目：${state.folders.find((folder) => folder.id === memory.scope_id)?.name || "已删除项目"}`
-      : "所有对话";
-    const status = memory.effective_status === "expired" ? "已过期" : memory.status === "active" ? "使用中" : "已停用";
-    card.innerHTML = `
-      <div><span class="status-pill">${labels[memory.kind] || "长期记忆"}</span></div>
-      <h3>${escapeHtml(memory.content)}</h3>
-      <p>${escapeHtml(scope)} · 已使用 ${memory.use_count} 次 · ${status}</p>
-      <div class="card-footer memory-actions">
-        <label class="switch" title="启用或停用"><input type="checkbox" ${memory.status === "active" ? "checked" : ""} ${memory.effective_status === "expired" ? "disabled" : ""} /><span></span></label>
-        <div><button class="skill-action" type="button">修改</button> <button class="skill-action danger" type="button">删除</button></div>
-      </div>`;
-    const toggle = card.querySelector("input");
-    const [editButton, deleteButton] = card.querySelectorAll("button");
-    toggle.addEventListener("change", async () => {
-      await api(`/api/memories/${memory.id}`, { method: "PATCH", body: JSON.stringify({ status: toggle.checked ? "active" : "disabled" }) });
+  resourceViews.renderMemories(state, els, escapeHtml, {
+    onUpdate: async (memory, update) => {
+      if (update.prompt) {
+        const content = window.prompt("修改长期记忆", memory.content)?.trim();
+        if (!content || content === memory.content) return;
+        update = { content };
+      }
+      await api(`/api/memories/${memory.id}`, { method: "PATCH", body: JSON.stringify(update) });
       await loadMemories();
-    });
-    editButton.addEventListener("click", async () => {
-      const content = window.prompt("修改长期记忆", memory.content)?.trim();
-      if (!content || content === memory.content) return;
-      await api(`/api/memories/${memory.id}`, { method: "PATCH", body: JSON.stringify({ content }) });
-      await loadMemories();
-    });
-    deleteButton.addEventListener("click", async () => {
-      if (!window.confirm("删除这条长期记忆？删除后不会再用于任何对话。")) return;
-      await api(`/api/memories/${memory.id}`, { method: "DELETE" });
-      await loadMemories();
-    });
-    els.memoryList.appendChild(card);
+    },
+    onDelete: async (memory) => { if (window.confirm("删除这条长期记忆？删除后不会再用于任何对话。")) { await api(`/api/memories/${memory.id}`, { method: "DELETE" }); await loadMemories(); } },
   });
 }
 
@@ -486,49 +282,7 @@ async function loadArtifacts() {
 }
 
 function renderArtifacts() {
-  els.artifactsGrid.innerHTML = "";
-  els.artifactsGrid.classList.add("artifacts-grid");
-  if (!state.artifacts.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.innerHTML = "<h2>暂无产物</h2><p>在对话中启用文件生成技能后，确认生成的文件会出现在这里。</p>";
-    els.artifactsGrid.appendChild(empty);
-    return;
-  }
-  state.artifacts.forEach((artifact) => {
-    const card = document.createElement("article");
-    card.className = "capability-card artifact-card";
-    const isExcel = artifact.kind === "xlsx";
-    const kindLabel = isExcel ? "Excel 文件" : "Markdown 文件";
-    const extension = isExcel ? ".xlsx" : ".md";
-    const icon = isExcel ? "▦" : "≡";
-    const date = new Date(artifact.created_at / 1e6).toLocaleString("zh-CN");
-    const generatedName = artifact.filename.startsWith("artifact_");
-    const title = generatedName ? `${kindLabel} · ${date}` : artifact.filename;
-    const summary = artifact.summary || "由对话确认后生成，可随时下载或删除。";
-    card.innerHTML = `
-      <div class="artifact-card-header">
-        <span class="artifact-type-icon ${isExcel ? "excel" : "markdown"}" aria-hidden="true">${icon}</span>
-        <div class="artifact-heading">
-          <h3 title="${escapeHtml(artifact.filename)}">${escapeHtml(title)}</h3>
-          <p class="artifact-file-name" title="${escapeHtml(artifact.filename)}">${escapeHtml(artifact.filename)}</p>
-        </div>
-      </div>
-      <p class="artifact-summary">${escapeHtml(summary)}</p>
-      <div class="artifact-meta"><span>创建于 ${date}</span><span>已确认生成</span></div>
-      <div class="card-footer artifact-footer">
-        <span class="artifact-kind-tag">${escapeHtml(extension.toUpperCase().slice(1))}</span>
-        <div class="artifact-actions">
-          <button class="skill-action" type="button">下载</button>
-          <button class="skill-action danger" type="button">删除</button>
-        </div>
-      </div>
-    `;
-    const [downloadButton, deleteButton] = card.querySelectorAll(".skill-action");
-    downloadButton.addEventListener("click", () => downloadArtifact(artifact));
-    deleteButton.addEventListener("click", () => deleteArtifact(artifact));
-    els.artifactsGrid.appendChild(card);
-  });
+  resourceViews.renderArtifacts(state, els, escapeHtml, { onDownload: downloadArtifact, onDelete: deleteArtifact });
 }
 
 async function downloadArtifact(artifact) {
@@ -560,34 +314,16 @@ async function deleteArtifact(artifact) {
 }
 
 function renderKnowledge(documents) {
-  els.knowledgeList.innerHTML = "";
-  const scope = els.knowledgeScopeSelect.value;
-  const projectId = els.knowledgeProjectSelect.value;
-  const filtered = documents.filter((document) => document.scope === scope && (scope !== "project" || !projectId || document.project_space_id === projectId));
-  filtered.forEach((knowledgeDocument) => {
-    const card = document.createElement("article");
-    card.className = "capability-card knowledge-card";
-    const size = knowledgeDocument.size_bytes < 1024 * 1024 ? `${Math.ceil(knowledgeDocument.size_bytes / 1024)} KB` : `${(knowledgeDocument.size_bytes / 1024 / 1024).toFixed(1)} MB`;
-    card.innerHTML = `
-      <h3>${escapeHtml(knowledgeDocument.filename)}</h3>
-      <p>${knowledgeDocument.chunk_count} 个检索片段 · ${size}</p>
-      <div class="card-footer">
-        <span class="status-pill">${knowledgeDocument.scope === "project" ? `项目专属 · ${escapeHtml(knowledgeDocument.project_space_name || "项目空间")}` : "通用知识库"}</span>
-        <span class="status-pill">来源：${knowledgeDocument.upload_origin === "project_space" ? "项目空间" : "知识库"}</span>
-        <button class="skill-action knowledge-edit" type="button">编辑</button>
-        <button class="skill-action danger" type="button">删除</button>
-      </div>
-    `;
-    card.querySelector(".knowledge-edit").addEventListener("click", () => editKnowledge(knowledgeDocument));
-    card.querySelector(".danger").addEventListener("click", async () => {
-      if (!window.confirm(`删除资料“${knowledgeDocument.filename}”？`)) return;
-      await api(`/api/knowledge/${knowledgeDocument.id}`, { method: "DELETE" });
-      await loadKnowledge();
+  state.knowledgeDocuments = documents;
+  knowledgeLibrary.renderDocuments(state, els, escapeHtml, {
+    onEdit: editKnowledge,
+    onDelete: async (document) => {
+      if (!window.confirm(`删除资料“${document.filename}”？`)) return;
+      await api(`/api/knowledge/${document.id}`, { method: "DELETE" });
+      await refreshKnowledgeViews();
       await searchKnowledge();
-    });
-    els.knowledgeList.appendChild(card);
+    },
   });
-  if (!filtered.length) els.knowledgeList.innerHTML = '<div class="empty-state"><h2>没有符合当前筛选条件的资料</h2><p>可切换资料类型或所属项目查看。</p></div>';
 }
 
 async function refreshKnowledgeViews() {
@@ -624,15 +360,7 @@ async function searchKnowledge() {
     return;
   }
   const data = await api(`/api/knowledge/search?query=${encodeURIComponent(query)}`);
-  els.knowledgeResults.innerHTML = "";
-  els.knowledgeResults.classList.remove("hidden");
-  data.results.forEach((result) => {
-    const item = document.createElement("article");
-    item.className = "knowledge-result";
-    item.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><p>${escapeHtml(result.excerpt)}</p>`;
-    els.knowledgeResults.appendChild(item);
-  });
-  if (!data.results.length) els.knowledgeResults.textContent = "没有匹配资料。";
+  knowledgeLibrary.renderSearchResults(els, data.results, escapeHtml);
 }
 
 function renderThreads() {
@@ -834,23 +562,7 @@ async function openSpace(spaceId) {
   state.currentSpaceId = spaceId;
   const data = await api(`/api/folders/${spaceId}`);
   els.spaceTitle.textContent = data.space.name;
-  const empty = (text) => `<p class="space-empty">${text}</p>`;
-  const tasks = data.tasks.map((item) => `<button class="space-list-item space-task-link" data-thread-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>创建者：${escapeHtml(item.author_name || "成员")} · ${item.user_id === state.user?.id ? "可编辑" : "仅查看"}</small></button>`).join("") || empty("该项目空间暂时没有对话");
-  const artifacts = data.artifacts.map((item) => `<button class="space-list-item space-artifact-link" data-artifact-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${escapeHtml(item.kind.toUpperCase())} · ${escapeHtml(item.author_name || "成员")} · 关联对话：${escapeHtml(item.task_title || "未命名对话")}</small></button>`).join("") || empty("该空间暂时没有产物");
-  const knowledgeDocuments = (data.knowledge_documents || []).map((item) => `<div class="space-list-item space-knowledge-item" data-knowledge-id="${escapeHtml(item.id)}"><span>${escapeHtml(item.filename)}</span><small>${item.chunk_count} 个检索片段 · 上传者：${escapeHtml(item.author_name || "成员")}</small>${data.can_manage_members ? `<button class="space-knowledge-edit" type="button">编辑</button><button class="space-knowledge-delete" type="button" aria-label="删除资料 ${escapeHtml(item.filename)}">删除</button>` : ""}</div>`).join("") || empty("该项目空间暂未上传知识资料");
-  const sources = data.sources.map((item) => `<div class="space-list-item space-source"><span>${escapeHtml(item.title)}</span><small>${item.kind === "web" ? "网页" : "本地资料"} · 关联任务：${escapeHtml(item.task_title)}</small>${item.excerpt ? `<em>${escapeHtml(item.excerpt)}</em>` : ""}</div>`).join("") || empty("空间内任务尚未引用资料或网页来源");
-  if (!state.demoMembersBySpace[spaceId]) state.demoMembersBySpace[spaceId] = [{ id: "demo-linran", name: "林然", role: "member", demo: true }, { id: "demo-zhouning", name: "周宁", role: "member", demo: true }];
-  const demoMembers = data.members.length <= 1 ? state.demoMembersBySpace[spaceId] : [];
-  const members = [...data.members, ...demoMembers].map((item) => {
-    const name = item.name || item.email;
-    const initial = escapeHtml(name.slice(0, 1).toUpperCase());
-    const removable = data.can_manage_members && item.role !== "owner";
-    return `<div class="space-member"><span class="member-avatar" aria-hidden="true">${initial}</span><span class="member-name">${escapeHtml(name)}${item.demo ? '<small>演示成员</small>' : ""}</span><span class="member-role">${escapeHtml(item.role === "owner" ? "所有者" : "成员")}</span>${removable ? `<button class="remove-space-member" data-member-id="${escapeHtml(item.id)}" data-demo="${item.demo ? "true" : "false"}" type="button" aria-label="移除 ${escapeHtml(name)}">×</button>` : '<span class="member-lock" title="空间所有者不可移除">•</span>'}</div>`;
-  }).join("") || empty("暂未添加成员");
-  const pending = data.invitations.filter((item) => item.status === "pending").map((item) => `<div class="space-invitation">已邀请 ${escapeHtml(item.email)} · 待加入</div>`).join("");
-  const inviteButton = data.can_manage_members ? '<button id="inviteSpaceMember" type="button">邀请成员</button>' : '';
-  const knowledgeUploadButton = '<button id="uploadSpaceKnowledge" type="button">上传资料</button>';
-  els.spaceDetail.innerHTML = `<div class="space-workbench"><section class="space-conversation-panel"><div class="space-conversation-empty"><h1>在 ${escapeHtml(data.space.name)} 中开始协作</h1><p>选择成员或 Agent 发起对话，记录会保留在当前项目空间。</p></div><div id="spaceComposerMount"></div></section><aside class="space-side-panel"><section class="space-card space-members-panel"><div class="space-card-heading"><h3>成员</h3>${inviteButton}</div>${members}${pending}</section><section class="space-card"><div class="space-card-heading"><h3>知识库</h3>${knowledgeUploadButton}</div><input id="spaceKnowledgeSearch" class="space-knowledge-search" type="search" placeholder="检索项目资料" /><div class="space-side-list">${knowledgeDocuments}</div></section><section class="space-card"><div class="space-card-heading"><h3>对话</h3><span>${data.tasks.length}</span></div><div class="space-side-list">${tasks}</div></section><section class="space-card"><div class="space-card-heading"><h3>产物</h3><span>${data.artifacts.length}</span></div><div class="space-side-list">${artifacts}</div></section></aside></div>`;
+  spaceWorkspace.render({ data, state, spaceId, userId: state.user?.id, escape: escapeHtml, detail: els.spaceDetail });
   mountSpaceComposer(data.space);
   els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
   els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
@@ -1108,24 +820,30 @@ async function restorePendingConfirmation() {
 }
 
 function renderRuns() {
-  els.runList.innerHTML = "";
-  state.runs.forEach((run) => {
-    const button = document.createElement("button");
-    button.className = `run-item ${run.status}`;
-    const statusLabel = run.status === "completed" ? "已完成"
-      : run.status === "failed" ? "失败"
-        : run.status === "cancelled" ? "已取消"
-          : run.status === "awaiting_confirmation" ? "待确认"
-            : "运行中";
-    button.textContent = `${statusLabel} · ${run.model}`;
-    button.addEventListener("click", () => loadRunDetail(run.id));
-    els.runList.appendChild(button);
-  });
-  if (!state.runs.length) els.runDetail.textContent = "当前对话还没有运行记录。";
+  auditView.renderRunList(state, els, loadRunDetail);
 }
 
 async function loadRunDetail(runId) {
   const data = await api(`/api/runs/${runId}`);
+  auditView.renderDetail(els, data, {
+    onDownload: async (artifact, link) => {
+      link.disabled = true;
+      try { await downloadArtifact(artifact); } finally { link.disabled = false; }
+    },
+    onFeedback: async (id, citationCorrect, feedback, button) => {
+      button.disabled = true;
+      try {
+        await api(`/api/runs/${id}/feedback`, { method: "POST", body: JSON.stringify({ rating: citationCorrect ? 1 : -1, citation_correct: citationCorrect }) });
+        feedback.replaceChildren(Object.assign(document.createElement("span"), { textContent: "已记录引用评价" }));
+      } catch (error) { button.disabled = false; button.textContent = error.message || "提交失败"; }
+    },
+    onCancel: async (id, button) => {
+      button.disabled = true;
+      try { await api(`/api/runs/${id}/cancel`, { method: "POST", body: "{}" }); await loadRuns(); await loadRunDetail(id); }
+      catch (error) { button.disabled = false; button.textContent = error.message || "取消失败"; }
+    },
+  });
+  return;
   const { run, events, steps, artifact } = data;
   const elapsed = run.completed_at ? `${Math.max(0, Math.round((run.completed_at - run.started_at) / 1e9 * 10) / 10)} 秒` : "运行中";
   const skills = JSON.parse(run.skill_snapshot || "[]").map((skill) => skill.name).join("、") || "无";
@@ -1312,273 +1030,38 @@ function renderMessageContent(element, content, role = "assistant") {
 }
 
 function renderMarkdown(markdown) {
-  const root = document.createElement("div");
-  root.className = "markdown-body";
-  const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    if (line.startsWith("```")) {
-      const language = line.slice(3).trim();
-      const codeLines = [];
-      index += 1;
-      while (index < lines.length && !lines[index].startsWith("```")) {
-        codeLines.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      if (language) code.dataset.language = language;
-      code.textContent = codeLines.join("\n");
-      pre.appendChild(code);
-      root.appendChild(pre);
-      continue;
-    }
-
-    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
-    if (heading) {
-      const level = String(heading[1].length + 2);
-      const title = document.createElement(`h${level}`);
-      renderInline(title, heading[2].trim());
-      root.appendChild(title);
-      index += 1;
-      continue;
-    }
-
-    if (/^>\s?/.test(line)) {
-      const quote = document.createElement("blockquote");
-      const quoteLines = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^>\s?/, ""));
-        index += 1;
-      }
-      renderInline(quote, quoteLines.join("\n"));
-      root.appendChild(quote);
-      continue;
-    }
-
-    const listMatch = /^(\s*)([-*]|\d+\.)\s+(.+)$/.exec(line);
-    if (listMatch) {
-      const ordered = /\d+\./.test(listMatch[2]);
-      const list = document.createElement(ordered ? "ol" : "ul");
-      while (index < lines.length) {
-        const itemMatch = /^(\s*)([-*]|\d+\.)\s+(.+)$/.exec(lines[index]);
-        if (!itemMatch || (/\d+\./.test(itemMatch[2]) !== ordered)) break;
-        const item = document.createElement("li");
-        renderInline(item, itemMatch[3].trim());
-        list.appendChild(item);
-        index += 1;
-      }
-      root.appendChild(list);
-      continue;
-    }
-
-    const paragraphLines = [line.trim()];
-    index += 1;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !lines[index].startsWith("```") &&
-      !/^(#{1,3})\s+/.test(lines[index]) &&
-      !/^>\s?/.test(lines[index]) &&
-      !/^(\s*)([-*]|\d+\.)\s+/.test(lines[index])
-    ) {
-      paragraphLines.push(lines[index].trim());
-      index += 1;
-    }
-    const paragraph = document.createElement("p");
-    renderInline(paragraph, paragraphLines.join("\n"));
-    root.appendChild(paragraph);
-  }
-
-  return root;
+  return window.AgentMarkdown.render(markdown);
 }
 
 function renderInline(element, text) {
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
-  let lastIndex = 0;
-  for (const match of String(text).matchAll(pattern)) {
-    if (match.index > lastIndex) {
-      element.append(document.createTextNode(text.slice(lastIndex, match.index)));
-    }
-    const token = match[0];
-    if (token.startsWith("`")) {
-      const code = document.createElement("code");
-      code.textContent = token.slice(1, -1);
-      element.appendChild(code);
-    } else if (token.startsWith("**")) {
-      const strong = document.createElement("strong");
-      strong.textContent = token.slice(2, -2);
-      element.appendChild(strong);
-    } else if (token.startsWith("*")) {
-      const emphasis = document.createElement("em");
-      emphasis.textContent = token.slice(1, -1);
-      element.appendChild(emphasis);
-    } else {
-      const linkMatch = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(token);
-      const link = document.createElement("a");
-      link.href = linkMatch[2];
-      link.target = "_blank";
-      link.rel = "noreferrer";
-      link.textContent = linkMatch[1];
-      element.appendChild(link);
-    }
-    lastIndex = match.index + token.length;
-  }
-  if (lastIndex < text.length) {
-    element.append(document.createTextNode(text.slice(lastIndex)));
-  }
+  return markdown.renderInline(element, text);
 }
 
 function appendAssistantMessage() {
-  const wrapper = document.createElement("article");
-  wrapper.className = "message assistant";
-  wrapper.innerHTML = `
-    <div class="message-role">Agent_Platform</div>
-    <section class="reasoning-summary hidden">
-      <button class="reasoning-summary-toggle" type="button" aria-expanded="false"><span>推理摘要</span><span class="reasoning-summary-chevron">⌄</span></button>
-      <div class="reasoning-summary-body hidden"><ul></ul></div>
-    </section>
-    <section class="execution-trace">
-      <button class="execution-trace-toggle" type="button" aria-expanded="true"><span class="execution-trace-title">执行过程</span><span class="execution-trace-time">预计剩余 30 秒</span><span class="execution-trace-chevron">⌃</span></button>
-      <div class="execution-trace-body"><ol class="execution-trace-list"><li>正在准备运行</li></ol></div>
-    </section>
-    <div class="answer-label">最终回答</div>
-    <div class="message-content"></div>
-  `;
-  els.messages.appendChild(wrapper);
-  els.messages.scrollTop = els.messages.scrollHeight;
-  const traceToggle = wrapper.querySelector(".execution-trace-toggle");
-  const traceBody = wrapper.querySelector(".execution-trace-body");
-  traceToggle.addEventListener("click", () => {
-    const expanded = traceToggle.getAttribute("aria-expanded") === "true";
-    traceToggle.setAttribute("aria-expanded", String(!expanded));
-    traceBody.classList.toggle("hidden", expanded);
-  });
-  const reasoning = wrapper.querySelector(".reasoning-summary");
-  const reasoningToggle = wrapper.querySelector(".reasoning-summary-toggle");
-  const reasoningBody = wrapper.querySelector(".reasoning-summary-body");
-  reasoningToggle.addEventListener("click", () => {
-    const expanded = reasoningToggle.getAttribute("aria-expanded") === "true";
-    reasoningToggle.setAttribute("aria-expanded", String(!expanded));
-    reasoningBody.classList.toggle("hidden", expanded);
-  });
-  return {
-    wrapper,
-    traceToggle,
-    traceTitle: wrapper.querySelector(".execution-trace-title"),
-    traceTime: wrapper.querySelector(".execution-trace-time"),
-    traceList: wrapper.querySelector(".execution-trace-list"),
-    reasoning,
-    reasoningToggle,
-    reasoningBody,
-    reasoningList: reasoning.querySelector("ul"),
-    content: wrapper.querySelector(".message-content"),
-  };
+  return runTrace.appendAssistantMessage(els);
 }
 
 function renderReasoningSummary(assistant, items) {
-  if (!Array.isArray(items) || !items.length) return;
-  assistant.reasoningList.replaceChildren();
-  items.slice(0, 5).forEach((text) => {
-    const item = document.createElement("li");
-    item.textContent = text;
-    assistant.reasoningList.appendChild(item);
-  });
-  assistant.reasoning.classList.remove("hidden");
+  runTrace.renderReasoningSummary(assistant, items);
 }
 
 function appendExecutionTrace(assistant, summary) {
-  const last = assistant.traceList.lastElementChild;
-  if (last?.textContent === summary) return;
-  const item = document.createElement("li");
-  item.textContent = summary;
-  assistant.traceList.appendChild(item);
-  assistant.traceTitle.textContent = `执行过程 · ${assistant.traceList.children.length} 步`;
-  els.messages.scrollTop = els.messages.scrollHeight;
+  runTrace.appendExecutionTrace(els, assistant, summary);
 }
 
 function startExecutionCountdown(assistant) {
-  const startedAt = Date.now();
-  const update = () => {
-    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-    const remaining = Math.max(0, 30 - elapsed);
-    assistant.traceTime.textContent = remaining ? `预计剩余 ${remaining} 秒 · 已用 ${elapsed} 秒` : `正在继续处理 · 已用 ${elapsed} 秒`;
-  };
-  update();
-  const timer = window.setInterval(update, 1000);
-  return {
-    stop(label = "已完成") {
-      window.clearInterval(timer);
-      const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-      assistant.traceTime.textContent = `${label} · 用时 ${elapsed} 秒`;
-    },
-    timer,
-  };
+  return runTrace.startCountdown(assistant);
 }
 
 function renderSkills(skills) {
-  els.skillsGrid.innerHTML = "";
-  skills.forEach((skill) => {
-    const card = document.createElement("article");
-    card.className = "capability-card";
-    card.innerHTML = `
-      <h3>${escapeHtml(skill.name)}</h3>
-      <p class="skill-description" title="${escapeHtml(skill.description || skill.prompt || "")}">${escapeHtml(skillSummary(skill))}</p>
-      <div class="card-footer">
-        <div class="skill-state">
-          <span class="status-pill">${skill.enabled ? "已启用" : "未启用"}</span>
-          <label class="switch" title="启用或禁用技能">
-            <input type="checkbox" ${skill.enabled ? "checked" : ""} />
-            <span></span>
-          </label>
-        </div>
-        <div class="skill-actions">
-          <button class="skill-action" type="button" title="编辑技能">编辑</button>
-          <button class="skill-action" type="button" title="查看或回滚历史版本">版本</button>
-          <button class="skill-action danger" type="button" title="删除技能">删除</button>
-        </div>
-      </div>
-    `;
-    const input = card.querySelector("input");
-    const pill = card.querySelector(".status-pill");
-    input.addEventListener("change", async () => {
-      try {
-        await api(`/api/skills/${skill.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ enabled: input.checked }),
-        });
-        pill.textContent = input.checked ? "已启用" : "未启用";
-        skill.enabled = input.checked;
-        renderSkillContext();
-      } catch (error) {
-        input.checked = !input.checked;
-        window.alert(error.message);
-      }
-    });
-    const [editButton, versionButton, deleteButton] = card.querySelectorAll(".skill-action");
-    editButton.addEventListener("click", () => editSkill(skill));
-    versionButton.addEventListener("click", () => restoreSkillVersion(skill));
-    deleteButton.addEventListener("click", () => deleteSkill(skill));
-    els.skillsGrid.appendChild(card);
+  capabilityViews.renderSkills(els, skills, escapeHtml, {
+    onToggle: async (skill, enabled) => { await api(`/api/skills/${skill.id}`, { method: "PATCH", body: JSON.stringify({ enabled }) }); skill.enabled = enabled; renderSkillContext(); },
+    onEdit: editSkill, onVersion: restoreSkillVersion, onDelete: deleteSkill,
   });
 }
 
 function skillSummary(skill) {
-  const source = String(skill.description || skill.prompt || "暂无技能说明");
-  const normalized = source
-    .replace(/^#{1,6}\s*/gm, "")
-    .replace(/[`*_]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  return normalized.length > 150 ? `${normalized.slice(0, 147).trimEnd()}…` : normalized;
+  return capabilityViews.skillSummary(skill);
 }
 
 async function editSkill(skill) {
@@ -1616,71 +1099,8 @@ async function restoreSkillVersion(skill) {
 }
 
 function renderApps(apps, tools = []) {
-  els.appsGrid.innerHTML = "";
-  apps.forEach((app) => {
-    const card = document.createElement("article");
-    card.className = "capability-card";
-    card.innerHTML = `
-      <h3>${escapeHtml(app.name)}</h3>
-      <p>${escapeHtml(app.description)}</p>
-      <div class="card-footer">
-        <span class="status-pill">${escapeHtml(app.status)}</span>
-      </div>
-    `;
-    els.appsGrid.appendChild(card);
-  });
-  tools.forEach((tool) => {
-    const card = document.createElement("article");
-    card.className = "capability-card tool-card";
-    const heading = document.createElement("h3");
-    heading.textContent = tool.name;
-    const description = document.createElement("p");
-    description.textContent = tool.description;
-    const form = document.createElement("form");
-    form.className = "tool-form";
-    const properties = tool.input_schema?.properties || {};
-    Object.entries(properties).forEach(([key, definition]) => {
-      const label = document.createElement("label");
-      label.textContent = definition.description || key;
-      const input = document.createElement("input");
-      input.name = key;
-      input.type = definition.type === "integer" ? "number" : "text";
-      input.required = (tool.input_schema?.required || []).includes(key);
-      if (definition.type === "integer") input.min = key === "limit" ? "1" : "";
-      label.appendChild(input);
-      form.appendChild(label);
-    });
-    const submit = document.createElement("button");
-    submit.type = "submit";
-    submit.textContent = tool.enabled ? "执行" : "未启用";
-    submit.disabled = !tool.enabled;
-    const result = document.createElement("pre");
-    result.className = "tool-result hidden";
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const argumentsValue = {};
-      Object.entries(properties).forEach(([key, definition]) => {
-        const raw = form.elements[key]?.value.trim();
-        if (raw !== "") argumentsValue[key] = definition.type === "integer" ? Number(raw) : raw;
-      });
-      submit.disabled = true;
-      result.classList.remove("hidden");
-      result.textContent = "正在执行…";
-      try {
-        const response = await api(`/api/tools/${tool.id}/execute`, { method: "POST", body: JSON.stringify({ arguments: argumentsValue }) });
-        result.textContent = JSON.stringify(response.result, null, 2);
-      } catch (error) {
-        result.textContent = `执行失败：${error.message}\n修改参数后可再次执行。`;
-      } finally {
-        submit.disabled = !tool.enabled;
-      }
-    });
-    form.append(submit, result);
-    const footer = document.createElement("div");
-    footer.className = "card-footer";
-    footer.innerHTML = `<span class="status-pill">${tool.enabled ? "本地只读工具" : "未启用"}</span>`;
-    card.append(heading, description, form, footer);
-    els.appsGrid.appendChild(card);
+  capabilityViews.renderApps(els, apps, tools, escapeHtml, {
+    onExecute: async (tool, args) => (await api(`/api/tools/${tool.id}/execute`, { method: "POST", body: JSON.stringify({ arguments: args }) })).result,
   });
 }
 
@@ -1742,44 +1162,9 @@ async function sendMessage(content, { retry = false } = {}) {
     assistant = appendAssistantMessage();
     executionTimer = startExecutionCountdown(assistant);
 
-    const chatPayload = {
-      thread_id: state.currentThreadId,
-      content,
-      retry,
-      model: els.modelSelect.value,
-      task_mode: els.taskModeSelect.value,
-      source_mode: els.sourceModeSelect.value,
-      knowledge_mode: els.knowledgeModeSelect.value,
-      web_mode: els.webModeSelect.value,
-      file_mode: els.fileModeSelect.value,
-    };
-    if (!state.currentThreadId && state.pendingFolderId) chatPayload.folder_id = state.pendingFolderId;
-    if (state.selectedSkillIds.length) chatPayload.skill_ids = state.selectedSkillIds;
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${state.token}`,
-      },
-      body: JSON.stringify(chatPayload),
-    });
-
-    if (!response.ok || !response.body) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.error || "发送失败");
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-      for (const eventText of events) {
-        const event = parseSse(eventText);
+    const chatPayload = chatStream.buildPayload(state, els, content, retry);
+    const response = await chatStream.open(state, chatPayload);
+    await chatStream.consume(response, (event) => {
         if (event.event === "meta") {
           state.currentThreadId = event.data.thread_id;
           state.pendingFolderId = "";
@@ -1813,8 +1198,7 @@ async function sendMessage(content, { retry = false } = {}) {
         if (event.event === "error") {
           throw new Error(event.data.error || "运行失败");
         }
-      }
-    }
+    });
     if (cancelled || awaitingConfirmation) return;
     if (!assistantContent && !awaitingConfirmation) {
       throw new Error("模型未返回内容");
@@ -1844,59 +1228,14 @@ async function sendMessage(content, { retry = false } = {}) {
 }
 
 function appendConfirmationActions(assistant, confirmation, sourceContent) {
-  if (assistant.wrapper.querySelector(".confirmation-actions")) return;
-  const actions = document.createElement("div");
-  actions.className = "confirmation-actions";
-  const approveButton = document.createElement("button");
-  approveButton.type = "button";
-  approveButton.textContent = "确认执行";
-  const rejectButton = document.createElement("button");
-  rejectButton.type = "button";
-  rejectButton.className = "secondary";
-  rejectButton.textContent = "取消";
-  const setBusy = (busy) => {
-    approveButton.disabled = busy;
-    rejectButton.disabled = busy;
-  };
-  approveButton.addEventListener("click", async () => {
-    setBusy(true);
-    appendExecutionTrace(assistant, "正在继续执行已确认操作");
-    try {
-      const result = await api(`/api/runs/${confirmation.run_id}/confirmation`, {
-        method: "POST",
-        body: JSON.stringify({ approved: true }),
-      });
-      appendExecutionTrace(assistant, "已完成已确认操作");
-      renderMessageContent(assistant.content, result.content || "");
-      if (result.content) state.messages.push({ role: "assistant", content: result.content });
-      actions.remove();
-      if (result.artifact) appendArtifactLink(assistant.wrapper, result.artifact);
-      await Promise.all([refreshThreadList(), loadRuns()]);
-    } catch (error) {
-      appendExecutionTrace(assistant, "已确认操作执行失败");
-      assistant.content.textContent = error.message || "文件生成失败";
-      setBusy(false);
-    }
+  chatInteractions.appendConfirmationActions({
+    assistant, confirmation, api, state,
+    appendTrace: appendExecutionTrace,
+    renderContent: renderMessageContent,
+    appendArtifact: appendArtifactLink,
+    refreshThreads: refreshThreadList,
+    loadRuns,
   });
-  rejectButton.addEventListener("click", async () => {
-    setBusy(true);
-    try {
-      await api(`/api/runs/${confirmation.run_id}/confirmation`, {
-        method: "POST",
-        body: JSON.stringify({ approved: false }),
-      });
-      appendExecutionTrace(assistant, "已取消待确认操作");
-      assistant.content.textContent = "已取消本次文件生成，未创建任何文件。";
-      actions.remove();
-      await loadRuns();
-    } catch (error) {
-      appendExecutionTrace(assistant, "取消待确认操作失败");
-      assistant.content.textContent = error.message || "取消失败";
-      setBusy(false);
-    }
-  });
-  actions.append(approveButton, rejectButton);
-  assistant.wrapper.appendChild(actions);
 }
 
 function appendArtifactLink(wrapper, artifact) {
@@ -1938,13 +1277,7 @@ function appendArtifactLink(wrapper, artifact) {
 }
 
 function appendRetryButton(wrapper, content) {
-  if (wrapper.querySelector(".retry-button")) return;
-  const retryButton = document.createElement("button");
-  retryButton.className = "retry-button";
-  retryButton.type = "button";
-  retryButton.textContent = "重试";
-  retryButton.addEventListener("click", () => sendMessage(content, { retry: true }));
-  wrapper.appendChild(retryButton);
+  chatInteractions.appendRetryButton(wrapper, content, (retryContent) => sendMessage(retryContent, { retry: true }));
 }
 
 async function refreshThreadList() {
@@ -1958,16 +1291,6 @@ async function refreshThreadList() {
   }
 }
 
-function parseSse(text) {
-  const lines = text.split("\n");
-  const eventLine = lines.find((line) => line.startsWith("event: "));
-  const dataLine = lines.find((line) => line.startsWith("data: "));
-  return {
-    event: eventLine ? eventLine.slice(7) : "message",
-    data: dataLine ? JSON.parse(dataLine.slice(6)) : {},
-  };
-}
-
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -1977,67 +1300,12 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function syncEvidenceModeControls() {
-  const source = els.sourceModeSelect.value;
-  const overrides = {
-    local_only: { knowledge: "required", web: "off" },
-    web_only: { knowledge: "off", web: "required" },
-    mixed: { knowledge: "required", web: "required" },
-  };
-  const override = overrides[source];
-  if (override) {
-    els.knowledgeModeSelect.value = override.knowledge;
-    els.webModeSelect.value = override.web;
-  }
-  els.knowledgeModeSelect.disabled = Boolean(override);
-  els.webModeSelect.disabled = Boolean(override);
-}
-
-let routePreviewTimer;
-let routePreviewSequence = 0;
-
 function renderExecutionModeHint() {
-  syncEvidenceModeControls();
-  const labels = { off: "关闭", auto: "自动", required: "必须" };
-  const sourceLabels = { general: "智能选择", local_only: "仅知识库", web_only: "仅网络", mixed: "知识库 + 网络" };
-  const advanced = els.sourceModeSelect.value === "general" && (els.knowledgeModeSelect.value !== "auto" || els.webModeSelect.value !== "auto")
-    ? ` · 高级已设定` : "";
-  els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · 文件${labels[els.fileModeSelect.value]}${advanced}`;
+  executionMode.renderExecutionModeHint();
 }
 
 function scheduleRoutePreview() {
-  window.clearTimeout(routePreviewTimer);
-  syncEvidenceModeControls();
-  const content = getChatContent();
-  if (!content || !state.token) {
-    renderExecutionModeHint();
-    return;
-  }
-  const sequence = ++routePreviewSequence;
-  routePreviewTimer = window.setTimeout(async () => {
-    try {
-      const preview = await api("/api/route-preview", {
-        method: "POST",
-        body: JSON.stringify({
-          content,
-          thread_id: state.currentThreadId,
-          model: els.modelSelect.value,
-          task_mode: els.taskModeSelect.value,
-          source_mode: els.sourceModeSelect.value,
-          knowledge_mode: els.knowledgeModeSelect.value,
-          web_mode: els.webModeSelect.value,
-          file_mode: els.fileModeSelect.value,
-          skill_ids: state.selectedSkillIds.length ? state.selectedSkillIds : undefined,
-        }),
-      });
-      if (sequence !== routePreviewSequence || !preview.ready) return;
-      const tools = preview.allowed_tools?.map((tool) => tool.name).join("、") || "无工具";
-      const errors = preview.required_errors?.length ? `；${preview.required_errors.join("；")}` : "";
-      els.executionModeHint.textContent = `${preview.task_tier} · 资料 ${preview.knowledge_matches} 条 · ${tools}${errors}`;
-    } catch (_error) {
-      if (sequence === routePreviewSequence) renderExecutionModeHint();
-    }
-  }, 260);
+  executionMode.scheduleRoutePreview();
 }
 
 els.loginForm.addEventListener("submit", async (event) => {
@@ -2053,7 +1321,7 @@ els.loginForm.addEventListener("submit", async (event) => {
     });
     state.token = data.token;
     state.user = data.user;
-    localStorage.setItem("agent_platform_token", state.token);
+    storage.setToken(state.token);
     showWorkspace(false);
     try {
       await refreshAll();
@@ -2116,22 +1384,7 @@ els.chatInput.addEventListener("keydown", (event) => {
 });
 
 function removeSkillBeforeCaret() {
-  const selection = window.getSelection();
-  if (!selection.rangeCount || !selection.isCollapsed) return false;
-  const range = selection.getRangeAt(0);
-  const container = range.startContainer;
-  const offset = range.startOffset;
-  let previous = null;
-
-  if (container === els.chatInput && offset > 0) {
-    previous = els.chatInput.childNodes[offset - 1];
-  } else if (container.nodeType === Node.TEXT_NODE && offset === 0) {
-    previous = container.previousSibling;
-  }
-  if (previous?.nodeType === Node.TEXT_NODE && !previous.textContent) previous = previous.previousSibling;
-  if (!(previous instanceof HTMLElement) || !previous.classList.contains("skill-tag")) return false;
-
-  state.selectedSkillIds = state.selectedSkillIds.filter((skillId) => skillId !== previous.dataset.skillId);
+  if (!composer.removeSkillBeforeCaret(state, els)) return false;
   renderComposerSkills();
   renderSkillPicker();
   focusChatInput();
@@ -2360,17 +1613,14 @@ document.querySelectorAll(".tab").forEach((button) => {
 els.settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.settingsNotice.textContent = "";
-  const data = await api("/api/me", {
-    method: "PATCH",
-    body: JSON.stringify({ name: els.nameInput.value }),
-  });
+  const data = await settingsView.save(api, els.nameInput.value);
   state.user = data.user;
   els.settingsNotice.textContent = "已保存";
 });
 
 els.logoutButton.addEventListener("click", async () => {
-  await api("/api/logout", { method: "POST" }).catch(() => {});
-  localStorage.removeItem("agent_platform_token");
+  await settingsView.logout(api);
+  storage.clearToken();
   state.token = "";
   state.user = null;
   showLogin();
@@ -2378,8 +1628,8 @@ els.logoutButton.addEventListener("click", async () => {
 
 els.logoutAllButton.addEventListener("click", async () => {
   if (!window.confirm("将退出所有已登录设备，是否继续？")) return;
-  await api("/api/logout-all", { method: "POST" });
-  localStorage.removeItem("agent_platform_token");
+  await settingsView.logout(api, true);
+  storage.clearToken();
   state.token = "";
   state.user = null;
   showLogin();

@@ -90,6 +90,18 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(health["database"], "sqlite")
         self.assertEqual(health["environment"], "development")
 
+    def test_auth_service_login_logout_and_logout_all_sessions(self):
+        second = self.request_json("/api/login", {"email": "admin@example.com", "password": "admin123"})["token"]
+        self.request_json("/api/logout-all", {}, self.token)
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request_json("/api/me", token=second)
+        self.assertEqual(failure.exception.code, 401)
+        fresh = self.request_json("/api/login", {"email": "admin@example.com", "password": "admin123"})["token"]
+        self.request_json("/api/logout", {}, fresh)
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request_json("/api/me", token=fresh)
+        self.assertEqual(failure.exception.code, 401)
+
     def test_models_expose_provider_neutral_capabilities(self):
         result = self.request_json("/api/models", token=self.token)
         model = next(item for item in result["models"] if item["id"] == "deepseek-v4-flash")
@@ -368,7 +380,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         event_types = [event["type"] for event in run_detail["events"]]
         self.assertEqual(
             [event_type for event_type in event_types if event_type != "phase_changed"],
-            ["started", "execution_context", "skill_routed", "knowledge_not_needed", "plan_created", "model_request", "completed"],
+            ["started", "execution_context", "skill_routed", "reasoning_summary", "knowledge_not_needed", "plan_created", "model_request", "completed"],
         )
         self.assertEqual(
             [json.loads(event["payload"])["to"] for event in run_detail["events"] if event["type"] == "phase_changed"],
@@ -601,6 +613,52 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.request_json(f"/api/threads/{member_thread['id']}", {"title": "越权编辑"}, self.token, method="PATCH")
         self.assertEqual(failure.exception.code, 404)
 
+    def test_space_invitation_auto_join_and_member_management_permissions(self):
+        owner_id = self.request_json("/api/me", token=self.token)["user"]["id"]
+        space = self.request_json("/api/folders", {"name": "成员协作", "section": "project"}, self.token)["folder"]
+        invitation = self.request_json(
+            f"/api/folders/{space['id']}/invitations", {"email": "pending-member@example.com"}, self.token
+        )["invitation"]
+        self.assertEqual(invitation["status"], "pending")
+        with self.assertRaises(urllib.error.HTTPError) as duplicate:
+            self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "pending-member@example.com"}, self.token)
+        self.assertEqual(duplicate.exception.code, 409)
+
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("pending_member", "pending-member@example.com", app.hash_password("member123"), "待加入成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "pending-member@example.com", "password": "member123"})["token"]
+        detail = self.request_json(f"/api/folders/{space['id']}", token=member_token)
+        self.assertIn("pending_member", [member["id"] for member in detail["members"]])
+        self.assertEqual(detail["invitations"][0]["status"], "accepted")
+
+        with self.assertRaises(urllib.error.HTTPError) as non_owner_invite:
+            self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "other@example.com"}, member_token)
+        self.assertEqual(non_owner_invite.exception.code, 404)
+        with self.assertRaises(urllib.error.HTTPError) as owner_removal:
+            self.request_json(f"/api/folders/{space['id']}/members/{owner_id}", token=self.token, method="DELETE")
+        self.assertEqual(owner_removal.exception.code, 409)
+        self.assertTrue(self.request_json(f"/api/folders/{space['id']}/members/pending_member", token=self.token, method="DELETE")["ok"])
+        detail = self.request_json(f"/api/folders/{space['id']}", token=self.token)
+        self.assertNotIn("pending_member", [member["id"] for member in detail["members"]])
+
+    def test_project_spaces_are_isolated_except_for_explicit_membership(self):
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("isolated_user", "isolated@example.com", app.hash_password("member123"), "隔离用户", app.now()))
+        member_token = self.request_json("/api/login", {"email": "isolated@example.com", "password": "member123"})["token"]
+        owner_space = self.request_json("/api/folders", {"name": "所有者空间", "section": "project"}, self.token)["folder"]
+        member_space = self.request_json("/api/folders", {"name": "成员私有空间", "section": "project"}, member_token)["folder"]
+
+        self.request_json(f"/api/folders/{owner_space['id']}/invitations", {"email": "isolated@example.com"}, self.token)
+        member_folders = self.request_json("/api/folders", token=member_token)["folders"]
+        self.assertEqual({folder["id"] for folder in member_folders}, {owner_space["id"], member_space["id"]})
+        self.assertEqual(self.request_json(f"/api/folders/{owner_space['id']}", token=member_token)["space"]["id"], owner_space["id"])
+        with self.assertRaises(urllib.error.HTTPError) as foreign_space:
+            self.request_json(f"/api/folders/{member_space['id']}", token=self.token)
+        self.assertEqual(foreign_space.exception.code, 404)
+        with self.assertRaises(urllib.error.HTTPError) as foreign_task:
+            self.request_json("/api/threads", {"title": "跨空间任务", "folder_id": member_space["id"]}, self.token)
+        self.assertEqual(foreign_task.exception.code, 400)
+
     def test_project_knowledge_is_shared_in_its_space_and_not_in_general_search(self):
         with app.db() as conn:
             conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("knowledge_member", "knowledge-member@example.com", app.hash_password("member123"), "资料成员", app.now()))
@@ -702,14 +760,27 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.request_json("/api/folders", {"name": "日常任务", "section": "conversation"}, self.token)
         self.assertEqual(rejected.exception.code, 400)
 
+        renamed = self.request_json(
+            f"/api/folders/{project_a['id']}", {"name": "项目 A（重命名）"}, self.token, method="PATCH"
+        )["folder"]
+        self.assertEqual(renamed["name"], "项目 A（重命名）")
+
         self.request_json(
             f"/api/folders/{project_b['id']}", {"position": 0}, self.token, method="PATCH"
         )
         folders = self.request_json("/api/folders", token=self.token)["folders"]
         self.assertEqual([(folder["section"], folder["name"]) for folder in folders], [
             ("project", "项目 B"),
-            ("project", "项目 A"),
+            ("project", "项目 A（重命名）"),
         ])
+
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("space_member", "space-member@example.com", app.hash_password("member123"), "空间成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "space-member@example.com", "password": "member123"})["token"]
+        self.request_json(f"/api/folders/{project_a['id']}/invitations", {"email": "space-member@example.com"}, self.token)
+        with self.assertRaises(urllib.error.HTTPError) as forbidden_delete:
+            self.request_json(f"/api/folders/{project_a['id']}", token=member_token, method="DELETE")
+        self.assertEqual(forbidden_delete.exception.code, 404)
 
         thread = self.request_json(
             "/api/threads", {"title": "项目会议纪要", "folder_id": project_a["id"]}, self.token

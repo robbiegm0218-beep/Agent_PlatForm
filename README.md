@@ -30,6 +30,23 @@ Python HTTP 服务 ── Agent Loop ── DeepSeek Provider
 
 每次对话都会建立一个 Run。对外状态使用 `running → awaiting_confirmation → running → completed / failed / cancelled` 的受限流转；内部阶段另行记录 `planning / retrieving / generating / executing_tool / reflecting` 等节点。每个步骤保留序列化输入输出、幂等键、超时、重试和恢复策略；事件带有稳定递增序号与版本，便于前端回放和问题排查。服务重启后，遗留的 `running` Run 会标记为可重试失败，待确认任务会保留。
 
+## 前端结构与本地验证
+
+前端保持原生 HTML/CSS/JavaScript，不依赖构建工具；`web/static/app.js` 负责页面入口与跨模块协调，具体能力按领域拆分：
+
+- `core/`：共享状态、DOM 查询、请求封装与本地存储。
+- `chat/`：输入区、流式 SSE、模型与执行方式、Markdown、运行过程及确认/重试。
+- `knowledge/`、`space/`：资料库、项目空间成员、资料、对话与产物视图。
+- `views/`：技能与应用、长期记忆、产物、设置及运行审计。
+
+修改前端后可运行：
+
+```bash
+scripts/check-frontend.sh
+```
+
+该检查会校验所有前端模块语法，并验证令牌恢复、工作区状态、请求鉴权、SSE 解析与关键模块入口契约。
+
 ## 快速开始（开发）
 
 ### 前置条件
@@ -49,8 +66,10 @@ npm install
 启动服务：
 
 ```bash
-python3 server/app.py
-# 端口被占用时，例如：PORT=8766 python3 server/app.py
+python3 -m server
+# 端口被占用时，例如：PORT=8766 python3 -m server
+
+# 由系统服务启动时使用 scripts/start-server.sh；它会切换到项目根目录后执行同一入口。
 ```
 
 打开 `http://localhost:8765`。开发环境默认账号：
@@ -159,7 +178,7 @@ export ADMIN_EMAIL="owner@example.com"
 export ADMIN_PASSWORD="请使用高强度且唯一的密码"
 export ADMIN_NAME="平台管理员" # 可选
 export PORT="8765"             # 可选
-python3 server/app.py
+python3 -m server
 ```
 
 服务默认仅监听 `127.0.0.1`。对外部署时应通过反向代理提供 HTTPS、访问控制、进程守护和标准输出日志收集；不要直接暴露开发进程。

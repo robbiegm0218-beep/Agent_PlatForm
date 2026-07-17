@@ -12,6 +12,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -29,44 +30,27 @@ try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
-try:
-    from server.local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
-    from server.agent_runtime import AgentRuntimeStore, RuntimeDependencies
-    from server.agent_loop import AgentLoopDependencies, SingleAgentLoop
-    from server.model_provider import DeepSeekConfig, DeepSeekProvider
-    from server.model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
-    from server.provider_config import ProviderConfig, parse_provider_configs
-    from server.web_search import WebSearchClient, WebSearchConfig
-    from server.mcp_client import McpServerConfig, McpToolManager
-    from server.tool_policy import ToolPolicy
-    from server.task_router import TaskRouter, classify_knowledge_intent
-    from server.knowledge_retrieval import KnowledgeRetriever, query_terms
-    from server.structured_context import StructuredContextBuilder
-    from server.memory_policy import (
-        MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content,
-    )
-    from server.safe_web_reader import SafeWebPageReader
-    from server.skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
-    from server.intent_planner import IntentPlanner
-except ModuleNotFoundError:
-    from local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
-    from agent_runtime import AgentRuntimeStore, RuntimeDependencies
-    from agent_loop import AgentLoopDependencies, SingleAgentLoop
-    from model_provider import DeepSeekConfig, DeepSeekProvider
-    from model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
-    from provider_config import ProviderConfig, parse_provider_configs
-    from web_search import WebSearchClient, WebSearchConfig
-    from mcp_client import McpServerConfig, McpToolManager
-    from tool_policy import ToolPolicy
-    from task_router import TaskRouter, classify_knowledge_intent
-    from knowledge_retrieval import KnowledgeRetriever, query_terms
-    from structured_context import StructuredContextBuilder
-    from memory_policy import (
-        MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content,
-    )
-    from safe_web_reader import SafeWebPageReader
-    from skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
-    from intent_planner import IntentPlanner
+from server.local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
+from server.agent_runtime import AgentRuntimeStore, RuntimeDependencies
+from server.agent_loop import AgentLoopDependencies, SingleAgentLoop
+from server.model_provider import DeepSeekConfig, DeepSeekProvider
+from server.model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
+from server.provider_config import ProviderConfig, parse_provider_configs
+from server.web_search import WebSearchClient, WebSearchConfig
+from server.mcp_client import McpServerConfig, McpToolManager
+from server.tool_policy import ToolPolicy
+from server.task_router import TaskRouter, classify_knowledge_intent
+from server.knowledge_retrieval import KnowledgeRetriever, query_terms
+from server.structured_context import StructuredContextBuilder
+from server.memory_policy import MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content
+from server.safe_web_reader import SafeWebPageReader
+from server.skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
+from server.intent_planner import IntentPlanner
+from server.auth_service import AuthService
+from server.knowledge_service import KnowledgeService
+from server.space_service import SpaceService
+from server.chat_service import ChatService
+from server.http_routes import API_ROUTES
 
 try:
     import certifi
@@ -146,6 +130,9 @@ MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
 REQUEST_WINDOW_NS = 60 * 1_000_000_000
 REQUESTS_BY_USER: dict[str, list[int]] = {}
+REQUESTS_LOCK = threading.RLock()
+SKILLS_LOCK = threading.RLock()
+MAX_RATE_LIMIT_USERS = int(os.environ.get("MAX_RATE_LIMIT_USERS", "10000"))
 LOG_FILE = os.environ.get("AGENT_LOG_FILE", "").strip()
 LOG_MAX_BYTES = int(os.environ.get("AGENT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.environ.get("AGENT_LOG_BACKUP_COUNT", "5"))
@@ -300,6 +287,18 @@ def load_skills() -> list[dict]:
     return [validate_skill(json.loads(path.read_text(encoding="utf-8"))) for path in sorted(SKILLS_DIR.glob("*.json"))]
 
 
+def skill_snapshot() -> tuple[dict, ...]:
+    with SKILLS_LOCK:
+        return tuple(dict(skill) for skill in SKILLS)
+
+
+def reload_skills() -> None:
+    global SKILLS
+    loaded = load_skills()
+    with SKILLS_LOCK:
+        SKILLS = loaded
+
+
 def validate_skill(skill: dict) -> dict:
     skill = normalize_skill_contract(skill)
     required = ("id", "name", "description", "version", "prompt", "input_limit", "default_enabled", "status")
@@ -366,8 +365,7 @@ def save_skill(skill: dict, resources: list[tuple[str, bytes]] | None = None) ->
             destination = package_dir / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
-    global SKILLS
-    SKILLS = load_skills()
+    reload_skills()
     return skill
 
 
@@ -724,6 +722,12 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+SPACE_SERVICE = SpaceService(db, now, new_id)
+AUTH_SERVICE = AuthService(db, now, new_id, verify_password, hash_password, SESSION_TTL_SECONDS, SPACE_SERVICE)
+KNOWLEDGE_SERVICE = KnowledgeService(db)
+CHAT_SERVICE = ChatService(db, now, new_id)
+
+
 def init_db() -> None:
     # Fail before touching the database when production bootstrap is incomplete.
     admin_email, admin_password, admin_name = bootstrap_admin_credentials()
@@ -1003,7 +1007,7 @@ def init_db() -> None:
                 "INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)",
                 (user_id, admin_email, hash_password(admin_password), admin_name, now()),
             )
-            for skill in SKILLS:
+            for skill in skill_snapshot():
                 conn.execute(
                     "INSERT INTO user_enabled_skills (user_id, skill_id, enabled, updated_at) VALUES (?, ?, ?, ?)",
                     (user_id, skill["id"], 1 if skill["default_enabled"] else 0, now()),
@@ -1034,13 +1038,21 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
 
 def allow_request(user_id: str) -> bool:
     current = now()
-    recent = [stamp for stamp in REQUESTS_BY_USER.get(user_id, []) if current - stamp < REQUEST_WINDOW_NS]
-    if len(recent) >= RATE_LIMIT_PER_MINUTE:
+    with REQUESTS_LOCK:
+        if len(REQUESTS_BY_USER) >= MAX_RATE_LIMIT_USERS:
+            for key, stamps in list(REQUESTS_BY_USER.items()):
+                active = [stamp for stamp in stamps if current - stamp < REQUEST_WINDOW_NS]
+                if active:
+                    REQUESTS_BY_USER[key] = active
+                else:
+                    REQUESTS_BY_USER.pop(key, None)
+        recent = [stamp for stamp in REQUESTS_BY_USER.get(user_id, []) if current - stamp < REQUEST_WINDOW_NS]
+        if len(recent) >= RATE_LIMIT_PER_MINUTE:
+            REQUESTS_BY_USER[user_id] = recent
+            return False
+        recent.append(current)
         REQUESTS_BY_USER[user_id] = recent
-        return False
-    recent.append(current)
-    REQUESTS_BY_USER[user_id] = recent
-    return True
+        return True
 
 
 def infer_task_profile(content: str, requested_model: str = "auto", requested_task_mode: str = "auto") -> dict:
@@ -1160,22 +1172,7 @@ def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list
 
 
 def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "") -> list[dict]:
-    with db() as conn:
-        if project_space_id:
-            rows = conn.execute(
-                """SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
-                   FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
-                   WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
-                     AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = ? AND space_members.user_id = ?)""",
-                (project_space_id, project_space_id, user_id),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
-                   FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
-                   WHERE knowledge_documents.user_id = ? AND knowledge_documents.scope = 'general'""",
-                (user_id,),
-            ).fetchall()
+    rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id)
     retriever = KNOWLEDGE_RETRIEVER
     if limit != retriever.config.limit:
         retriever = KnowledgeRetriever(replace(retriever.config, limit=min(max(limit, 1), 20)))
@@ -1354,6 +1351,25 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def end_headers(self) -> None:
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        super().end_headers()
+
+    def require_same_origin_for_write(self) -> bool:
+        """Bearer auth prevents classic CSRF; reject cross-origin browser writes as defense in depth."""
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return True
+        host = self.headers.get("Host", "").strip()
+        if origin in {f"http://{host}", f"https://{host}"}:
+            return True
+        self.send_error_json("跨来源写入请求被拒绝", HTTPStatus.FORBIDDEN)
+        return False
+
     def do_GET(self):
         if self.path.startswith("/api/"):
             self.handle_api_get()
@@ -1363,12 +1379,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        if not self.require_same_origin_for_write():
+            return
         self.handle_api_post()
 
     def do_PATCH(self):
+        if not self.require_same_origin_for_write():
+            return
         self.handle_api_patch()
 
     def do_DELETE(self):
+        if not self.require_same_origin_for_write():
+            return
         self.handle_api_delete()
 
     def read_json(self, max_bytes: int = MAX_REQUEST_BYTES) -> dict:
@@ -1398,19 +1420,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         return ""
 
     def current_user(self):
-        token = self.bearer_token()
-        if not token:
-            return None
-        with db() as conn:
-            row = conn.execute(
-                """
-                SELECT users.* FROM users
-                JOIN sessions ON sessions.user_id = users.id
-                WHERE sessions.token = ? AND (sessions.expires_at = 0 OR sessions.expires_at > ?)
-                """,
-                (token, now()),
-            ).fetchone()
-            return row_to_dict(row) if row else None
+        row = AUTH_SERVICE.current_user(self.bearer_token())
+        return row_to_dict(row) if row else None
 
     def require_user(self):
         user = self.current_user()
@@ -1420,6 +1431,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         return user
 
     def handle_api_get(self) -> None:
+        if not API_ROUTES.matches("GET", self.path):
+            self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
+            return
         user = self.require_user() if self.path != "/api/health" else None
         if self.path == "/api/health":
             try:
@@ -1528,7 +1542,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/apps":
             self.send_json({"apps": [
                 {**APPS[0], "status": "已连接" if DEEPSEEK_API_KEY else "未配置"},
-                {**APPS[1], "status": f"已启用 · {len(SKILLS)} 项 · v1"},
+                {**APPS[1], "status": f"已启用 · {len(skill_snapshot())} 项 · v1"},
                 {**APPS[2], "status": "已启用 · 创建前需确认"},
             ]})
             return
@@ -1541,6 +1555,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
     def handle_api_post(self) -> None:
+        if not API_ROUTES.matches("POST", self.path):
+            self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
+            return
         if self.path == "/api/login":
             self.login()
             return
@@ -1610,6 +1627,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
     def handle_api_patch(self) -> None:
+        if not API_ROUTES.matches("PATCH", self.path):
+            self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
+            return
         user = self.require_user()
         if not user:
             return
@@ -1640,6 +1660,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
 
     def handle_api_delete(self) -> None:
+        if not API_ROUTES.matches("DELETE", self.path):
+            self.send_error_json("接口不存在", HTTPStatus.NOT_FOUND)
+            return
         user = self.require_user()
         if not user:
             return
@@ -1681,29 +1704,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         payload = self.read_json()
         email = payload.get("email", "").strip().lower()
         password = payload.get("password", "")
-        with db() as conn:
-            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-            if not user or not verify_password(password, user["password_hash"]):
-                self.send_error_json("邮箱或密码错误", HTTPStatus.UNAUTHORIZED)
-                return
-            conn.execute("""INSERT OR IGNORE INTO space_members (space_id, user_id, role, created_at)
-                SELECT space_id, ?, role, ? FROM space_invitations WHERE email = ? AND status = 'pending'""", (user["id"], now(), email))
-            conn.execute("UPDATE space_invitations SET status = 'accepted' WHERE email = ? AND status = 'pending'", (email,))
-            token = new_id("session")
-            if not user["password_hash"].startswith("pbkdf2_sha256$"):
-                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(password), user["id"]))
-            conn.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", (token, user["id"], now(), now() + SESSION_TTL_SECONDS * 1_000_000_000))
+        user, token = AUTH_SERVICE.login(email, password)
+        if not user:
+            self.send_error_json("邮箱或密码错误", HTTPStatus.UNAUTHORIZED)
+            return
         self.send_json({"token": token, "user": public_user(row_to_dict(user))})
 
     def logout(self) -> None:
-        token = self.bearer_token()
-        with db() as conn:
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        AUTH_SERVICE.logout(self.bearer_token())
         self.send_json({"ok": True})
 
     def logout_all(self, user: dict) -> None:
-        with db() as conn:
-            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+        AUTH_SERVICE.logout_all(user["id"])
         self.send_json({"ok": True})
 
     def update_me(self, user: dict) -> None:
@@ -1729,67 +1741,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_json({"threads": [row_to_dict(row) for row in rows]})
 
     def list_folders(self, user: dict) -> None:
-        with db() as conn:
-            rows = conn.execute(
-                """SELECT thread_folders.*, space_members.role AS member_role FROM thread_folders
-                   LEFT JOIN space_members ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
-                   WHERE thread_folders.user_id = ? OR space_members.user_id = ?
-                   ORDER BY CASE section WHEN 'project' THEN 0 ELSE 1 END, sort_order ASC, created_at ASC, id ASC""",
-                (user["id"], user["id"], user["id"]),
-            ).fetchall()
+        rows = SPACE_SERVICE.list_accessible_spaces(user["id"])
         self.send_json({"folders": [row_to_dict(row) for row in rows]})
 
     def get_space(self, user: dict) -> None:
         space_id = self.path.split("?")[0].split("/")[-1]
-        with db() as conn:
-            space = conn.execute("""SELECT thread_folders.*, space_members.role AS member_role FROM thread_folders
-                LEFT JOIN space_members ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
-                WHERE thread_folders.id = ? AND thread_folders.section = 'project'
-                  AND (thread_folders.user_id = ? OR space_members.user_id = ?)""", (user["id"], space_id, user["id"], user["id"])).fetchone()
-            if not space:
-                self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
-                return
-            tasks = conn.execute("""SELECT threads.*, users.name AS author_name FROM threads JOIN users ON users.id = threads.user_id
-                WHERE folder_id = ? ORDER BY updated_at DESC, id DESC""", (space_id,)).fetchall()
-            artifacts = conn.execute("""SELECT artifacts.*, threads.title AS task_title, users.name AS author_name FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id JOIN users ON users.id = threads.user_id
-                WHERE threads.folder_id = ? ORDER BY artifacts.created_at DESC, artifacts.id DESC""", (space_id,)).fetchall()
-            runs = conn.execute("""SELECT runs.id, runs.execution_context, threads.title FROM runs JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.folder_id = ? ORDER BY runs.started_at DESC, runs.id DESC""", (space_id,)).fetchall()
-            web_events = conn.execute("""SELECT run_events.run_id, run_events.payload, threads.title FROM run_events JOIN runs ON runs.id = run_events.run_id JOIN threads ON threads.id = runs.thread_id
-                WHERE threads.folder_id = ? AND run_events.type = 'tool_result' ORDER BY run_events.created_at DESC""", (space_id,)).fetchall()
-            members = conn.execute("""SELECT users.id, users.name, users.email, space_members.role, space_members.created_at FROM space_members JOIN users ON users.id = space_members.user_id
-                WHERE space_members.space_id = ? ORDER BY space_members.created_at ASC""", (space_id,)).fetchall()
-            invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
-            knowledge_documents = conn.execute("""SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
-                knowledge_documents.size_bytes, knowledge_documents.chunk_count, knowledge_documents.created_at,
-                knowledge_documents.upload_origin, users.name AS author_name
-                FROM knowledge_documents JOIN users ON users.id = knowledge_documents.created_by_user_id
-                WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
-                ORDER BY knowledge_documents.created_at DESC""", (space_id,)).fetchall()
-        sources: list[dict] = []
-        seen_sources: set[tuple[str, str]] = set()
-        for run in runs:
-            context = safe_json_object(run["execution_context"])
-            for reference in context.get("knowledge_refs", []):
-                if not isinstance(reference, dict):
-                    continue
-                key = ("knowledge", f"{reference.get('document_id', '')}:{reference.get('position', '')}")
-                if key in seen_sources:
-                    continue
-                seen_sources.add(key)
-                sources.append({"kind": "knowledge", "title": str(reference.get("filename", "本地资料"))[:255], "excerpt": str(reference.get("excerpt", ""))[:320], "task_title": run["title"]})
-        for event in web_events:
-            payload = safe_json_object(event["payload"])
-            for source in payload.get("sources", []):
-                if not isinstance(source, dict) or source.get("kind") != "web":
-                    continue
-                url = str(source.get("url", ""))
-                key = ("web", url)
-                if not url or key in seen_sources:
-                    continue
-                seen_sources.add(key)
-                sources.append({"kind": "web", "title": str(source.get("title", "网页来源"))[:255], "url": url[:2048], "excerpt": str(source.get("excerpt", ""))[:320], "task_title": event["title"]})
-        self.send_json({"space": row_to_dict(space), "tasks": [row_to_dict(item) for item in tasks], "artifacts": [row_to_dict(item) for item in artifacts], "sources": sources, "knowledge_documents": [row_to_dict(item) for item in knowledge_documents], "members": [row_to_dict(item) for item in members], "invitations": [row_to_dict(item) for item in invitations], "can_manage_members": space["user_id"] == user["id"]})
+        detail = SPACE_SERVICE.get_space_detail(space_id, user["id"], safe_json_object)
+        if not detail:
+            self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
+            return
+        self.send_json({"space": row_to_dict(detail["space"]), "tasks": [row_to_dict(item) for item in detail["tasks"]], "artifacts": [row_to_dict(item) for item in detail["artifacts"]], "sources": detail["sources"], "knowledge_documents": [row_to_dict(item) for item in detail["knowledge_documents"]], "members": [row_to_dict(item) for item in detail["members"]], "invitations": [row_to_dict(item) for item in detail["invitations"]], "can_manage_members": SPACE_SERVICE.can_manage_members(detail["space"], user["id"])})
 
     def invite_space_member(self, user: dict) -> None:
         space_id = self.path.split("/")[-2]
@@ -1798,36 +1759,28 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
             self.send_error_json("邀请邮箱无效")
             return
-        with db() as conn:
-            space = conn.execute("SELECT id FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
-            if not space:
-                self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
-                return
-            existing = conn.execute("SELECT id FROM space_invitations WHERE space_id = ? AND email = ? AND status = 'pending'", (space_id, email)).fetchone()
-            if existing:
-                self.send_error_json("该邮箱已有待处理邀请", HTTPStatus.CONFLICT)
-                return
-            invitation_id = new_id("invite")
-            invited_user = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
-            status = "accepted" if invited_user else "pending"
-            conn.execute("INSERT INTO space_invitations (id, space_id, email, role, status, invited_by, created_at) VALUES (?, ?, ?, 'member', ?, ?, ?)", (invitation_id, space_id, email, status, user["id"], now()))
-            if invited_user:
-                conn.execute("INSERT OR IGNORE INTO space_members (space_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)", (space_id, invited_user["id"], now()))
-        self.send_json({"invitation": {"id": invitation_id, "email": email, "status": status, "role": "member"}}, HTTPStatus.CREATED)
+        invitation, error = SPACE_SERVICE.invite_member(space_id, user["id"], email, str(payload.get("role", "member")))
+        if error == "space_not_found":
+            self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
+            return
+        if error == "pending_exists":
+            self.send_error_json("该邮箱已有待处理邀请", HTTPStatus.CONFLICT)
+            return
+        if error == "invalid_role":
+            self.send_error_json("空间成员角色无效")
+            return
+        self.send_json({"invitation": invitation}, HTTPStatus.CREATED)
 
     def remove_space_member(self, user: dict) -> None:
         parts = self.path.split("?")[0].split("/")
         space_id, member_id = parts[-3], parts[-1]
-        with db() as conn:
-            space = conn.execute("SELECT id FROM thread_folders WHERE id = ? AND user_id = ? AND section = 'project'", (space_id, user["id"])).fetchone()
-            member = conn.execute("SELECT role FROM space_members WHERE space_id = ? AND user_id = ?", (space_id, member_id)).fetchone()
-            if not space or not member:
-                self.send_error_json("空间成员不存在", HTTPStatus.NOT_FOUND)
-                return
-            if member["role"] == "owner":
-                self.send_error_json("不能移除空间所有者", HTTPStatus.CONFLICT)
-                return
-            conn.execute("DELETE FROM space_members WHERE space_id = ? AND user_id = ?", (space_id, member_id))
+        result = SPACE_SERVICE.remove_member(space_id, user["id"], member_id)
+        if result == "not_found":
+            self.send_error_json("空间成员不存在", HTTPStatus.NOT_FOUND)
+            return
+        if result == "owner":
+            self.send_error_json("不能移除空间所有者", HTTPStatus.CONFLICT)
+            return
         self.send_json({"ok": True})
 
     def get_thread(self, user: dict) -> None:
@@ -2057,7 +2010,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def create_thread(self, user: dict) -> None:
         payload = self.read_json()
         title = payload.get("title", "新对话").strip() or "新对话"
-        folder_id = self.validate_folder_id(user["id"], payload.get("folder_id", ""))
+        try:
+            folder_id = self.validate_folder_id(user["id"], payload.get("folder_id", ""))
+        except ValueError as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
         thread_id = new_id("thread")
         with db() as conn:
             conn.execute(
@@ -2071,14 +2028,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         folder_id = str(folder_id or "")
         if not folder_id:
             return ""
-        with db() as conn:
-            folder = conn.execute(
-                """SELECT thread_folders.id FROM thread_folders LEFT JOIN space_members
-                   ON space_members.space_id = thread_folders.id AND space_members.user_id = ?
-                   WHERE thread_folders.id = ? AND (thread_folders.user_id = ? OR space_members.user_id = ?)""",
-                (user_id, folder_id, user_id, user_id),
-            ).fetchone()
-        if not folder:
+        if not SPACE_SERVICE.can_access_space(folder_id, user_id):
             raise ValueError("文件夹不存在")
         return folder_id
 
@@ -2093,19 +2043,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         except ValueError as exc:
             self.send_error_json(str(exc))
             return
-        folder_id = new_id("folder")
-        with db() as conn:
-            next_order = conn.execute(
-                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM thread_folders WHERE user_id = ? AND section = ?",
-                (user["id"], section),
-            ).fetchone()[0]
-            conn.execute(
-                """INSERT INTO thread_folders (id, user_id, name, section, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (folder_id, user["id"], name[:80], section, next_order, now(), now()),
-            )
-            conn.execute("INSERT INTO space_members (space_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)", (folder_id, user["id"], now()))
-            folder = conn.execute("SELECT * FROM thread_folders WHERE id = ?", (folder_id,)).fetchone()
+        folder = SPACE_SERVICE.create_space(user["id"], name)
         self.send_json({"folder": row_to_dict(folder)})
 
     def validate_folder_section(self, value: object) -> str:
@@ -2117,65 +2055,34 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def update_folder(self, user: dict) -> None:
         folder_id = self.path.split("/")[-1]
         payload = self.read_json()
-        with db() as conn:
-            folder = conn.execute(
-                "SELECT * FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
-            ).fetchone()
-            if not folder:
-                self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
-                return
-            if "name" in payload:
-                name = str(payload.get("name", "")).strip()
-                if not name:
-                    self.send_error_json("文件夹名称不能为空")
-                    return
-                conn.execute(
-                    "UPDATE thread_folders SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-                    (name[:80], now(), folder_id, user["id"]),
-                )
-            elif "position" in payload:
-                try:
-                    position = int(payload["position"])
-                except (TypeError, ValueError):
-                    self.send_error_json("文件夹位置无效")
-                    return
-                siblings = conn.execute(
-                    """SELECT id FROM thread_folders WHERE user_id = ? AND section = ?
-                       ORDER BY sort_order ASC, created_at ASC, id ASC""",
-                    (user["id"], folder["section"]),
-                ).fetchall()
-                ordered_ids = [row["id"] for row in siblings if row["id"] != folder_id]
-                ordered_ids.insert(max(0, min(position, len(ordered_ids))), folder_id)
-                for sort_order, sibling_id in enumerate(ordered_ids):
-                    conn.execute(
-                        "UPDATE thread_folders SET sort_order = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-                        (sort_order, now(), sibling_id, user["id"]),
-                    )
-            else:
-                self.send_error_json("没有可更新的文件夹信息")
-                return
-            folder = conn.execute(
-                "SELECT * FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
-            ).fetchone()
+        if "name" in payload:
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                self.send_error_json("文件夹名称不能为空"); return
+            folder = SPACE_SERVICE.update_space(folder_id, user["id"], name=name)
+        elif "position" in payload:
+            try: position = int(payload["position"])
+            except (TypeError, ValueError): self.send_error_json("文件夹位置无效"); return
+            folder = SPACE_SERVICE.update_space(folder_id, user["id"], position=position)
+        else:
+            self.send_error_json("没有可更新的文件夹信息"); return
+        if not folder:
+            self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND); return
         self.send_json({"folder": row_to_dict(folder)})
 
     def delete_folder(self, user: dict) -> None:
         folder_id = self.path.split("/")[-1]
+        folder = SPACE_SERVICE.get_owned_space(folder_id, user["id"])
+        if not folder:
+            self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
+            return
+        documents = KNOWLEDGE_SERVICE.delete_space_documents(folder_id)
         with db() as conn:
-            folder = conn.execute(
-                "SELECT id FROM thread_folders WHERE id = ? AND user_id = ?", (folder_id, user["id"])
-            ).fetchone()
-            if not folder:
-                self.send_error_json("文件夹不存在", HTTPStatus.NOT_FOUND)
-                return
-            documents = conn.execute("SELECT storage_path FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?", (folder_id,)).fetchall()
-            conn.execute("DELETE FROM knowledge_chunks WHERE document_id IN (SELECT id FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?)", (folder_id,))
-            conn.execute("DELETE FROM knowledge_documents WHERE scope = 'project' AND project_space_id = ?", (folder_id,))
             conn.execute("UPDATE threads SET folder_id = '' WHERE folder_id = ?", (folder_id,))
             conn.execute("DELETE FROM space_members WHERE space_id = ?", (folder_id,))
             conn.execute("DELETE FROM thread_folders WHERE id = ?", (folder_id,))
         for document in documents:
-            Path(document["storage_path"]).unlink(missing_ok=True)
+            Path(document).unlink(missing_ok=True)
         self.send_json({"ok": True})
 
     def update_thread(self, user: dict) -> None:
@@ -2304,44 +2211,21 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not isinstance(approved, bool):
             self.send_error_json("确认结果无效")
             return
-        with db() as conn:
-            run = conn.execute("SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
-            approvals = conn.execute("SELECT * FROM run_approval_requests WHERE run_id = ? ORDER BY position ASC", (run_id,)).fetchall()
-            confirmation = next((item for item in approvals if item["status"] == "pending"), None) or (approvals[-1] if approvals else None)
-            legacy_confirmation = conn.execute("SELECT * FROM run_confirmations WHERE run_id = ?", (run_id,)).fetchone()
-            confirmation = confirmation or legacy_confirmation
-            if not run or not confirmation:
-                self.send_error_json("待确认运行不存在", HTTPStatus.NOT_FOUND)
-                return
-            if confirmation["status"] != "pending" or run["status"] != "awaiting_confirmation":
-                self.send_error_json("该运行已处理", HTTPStatus.CONFLICT)
-                return
-            status = "approved" if approved else "rejected"
-            if "id" in confirmation.keys():
-                conn.execute("UPDATE run_approval_requests SET status = ?, decision = ?, resolved_at = ? WHERE id = ?", (status, "用户批准" if approved else "用户拒绝", now(), confirmation["id"]))
-            else:
-                conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ?", (status, "用户批准" if approved else "用户拒绝", now(), run_id))
-            if not approved:
-                RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
-                RUNTIME_STORE.transition_phase(conn, run_id, "cancelled", detail={"reason": "confirmation_rejected"})
-                conn.execute(
-                    "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status = 'awaiting_confirmation'",
-                    ("cancelled", now(), run_id),
-                )
-            append_run_event(conn, run_id, "confirmation_resolved", {"approved": approved})
-        if not approved:
+        outcome, next_approval = CHAT_SERVICE.resolve_confirmation(run_id, user["id"], approved, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
+        if outcome == "not_found":
+            self.send_error_json("待确认运行不存在", HTTPStatus.NOT_FOUND)
+            return
+        if outcome == "handled":
+            self.send_error_json("该运行已处理", HTTPStatus.CONFLICT)
+            return
+        if outcome == "rejected":
             self.send_json({"ok": True, "approved": False, "run_id": run_id})
             return
-
-        with db() as conn:
-            next_approval = conn.execute("SELECT * FROM run_approval_requests WHERE run_id = ? AND status = 'pending' ORDER BY position ASC LIMIT 1", (run_id,)).fetchone()
-        if next_approval:
-            with db() as conn:
-                append_run_event(conn, run_id, "confirmation_requested", {"position": next_approval["position"], "tool_id": next_approval["tool_id"]})
+        if outcome == "next":
             self.send_json({"ok": True, "approved": True, "run_id": run_id, "next_confirmation": row_to_dict(next_approval)})
             return
         try:
-            result = complete_confirmed_artifact_run(run_id, user["id"])
+            result = CHAT_SERVICE.resume_confirmed_artifact(run_id, user["id"], complete_confirmed_artifact_run)
         except Exception as exc:
             LOGGER.warning("confirmed_run_failed run_id=%s error=%s", run_id, str(exc)[:160])
             self.send_error_json(str(exc), HTTPStatus.BAD_GATEWAY)
@@ -2350,33 +2234,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def cancel_run(self, user: dict) -> None:
         run_id = self.path.split("/")[-2]
-        with db() as conn:
-            run = conn.execute(
-                "SELECT runs.* FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?",
-                (run_id, user["id"]),
-            ).fetchone()
-            if not run:
-                self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
-                return
-            if run["status"] not in {"running", "awaiting_confirmation"}:
-                self.send_error_json("该运行无法取消", HTTPStatus.CONFLICT)
-                return
-            context = json.loads(run["execution_context"] or "{}")
-            if run["status"] == "running" and context.get("artifact_request"):
-                self.send_error_json("文件产物正在执行，无法安全中断", HTTPStatus.CONFLICT)
-                return
-            if run["status"] == "awaiting_confirmation":
-                conn.execute("UPDATE run_confirmations SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'", ("cancelled", "用户取消", now(), run_id))
-                conn.execute("UPDATE run_approval_requests SET status = ?, decision = ?, resolved_at = ? WHERE run_id = ? AND status = 'pending'", ("cancelled", "用户取消", now(), run_id))
-            RUNTIME_STORE.transition_run(conn, run_id, "cancelled")
-            phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
-            if phase and phase["run_phase"] not in {"cancelled", "completed", "failed"}:
-                RUNTIME_STORE.transition_phase(conn, run_id, "cancelled", detail={"reason": "user_cancelled"})
-            conn.execute(
-                "UPDATE run_steps SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running', 'awaiting_confirmation')",
-                ("cancelled", now(), run_id),
-            )
-            append_run_event(conn, run_id, "cancelled", {"source": "user"})
+        result = CHAT_SERVICE.cancel_run(run_id, user["id"], {"json": json, "runtime": RUNTIME_STORE, "append_event": append_run_event})
+        if result == "not_found":
+            self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
+            return
+        if result == "not_cancellable":
+            self.send_error_json("该运行无法取消", HTTPStatus.CONFLICT)
+            return
+        if result == "unsafe":
+            self.send_error_json("文件产物正在执行，无法安全中断", HTTPStatus.CONFLICT)
+            return
         self.send_json({"ok": True, "run_id": run_id, "status": "cancelled"})
 
     def create_run_feedback(self, user: dict) -> None:
@@ -2519,19 +2386,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "feedback": feedback_metrics})
 
     def list_knowledge(self, user: dict) -> None:
-        with db() as conn:
-            rows = conn.execute(
-                """SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
-                          knowledge_documents.size_bytes, knowledge_documents.chunk_count, knowledge_documents.created_at,
-                          knowledge_documents.scope, knowledge_documents.project_space_id, knowledge_documents.upload_origin,
-                          knowledge_documents.created_by_user_id, thread_folders.name AS project_space_name
-                   FROM knowledge_documents LEFT JOIN thread_folders ON thread_folders.id = knowledge_documents.project_space_id
-                   WHERE (knowledge_documents.user_id = ? AND knowledge_documents.scope = 'general')
-                      OR (knowledge_documents.scope = 'project' AND EXISTS
-                         (SELECT 1 FROM space_members WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))
-                   ORDER BY knowledge_documents.created_at DESC""",
-                (user["id"], user["id"]),
-            ).fetchall()
+        rows = KNOWLEDGE_SERVICE.list_visible(user["id"])
         self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader)})
 
     def list_artifacts(self, user: dict) -> None:
@@ -2618,40 +2473,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 self.send_error_json("没有该项目空间的资料上传权限", HTTPStatus.FORBIDDEN)
                 return
         document_id = new_id("knowledge")
-        storage_dir = KNOWLEDGE_DIR / user["id"]
-        storage_dir.mkdir(parents=True, exist_ok=True)
-        storage_path = storage_dir / f"{document_id}{Path(filename).suffix.lower()}"
-        storage_path.write_bytes(raw)
+        storage_path = KNOWLEDGE_DIR / user["id"] / f"{document_id}{Path(filename).suffix.lower()}"
         mime_type = payload.get("mime_type", "application/octet-stream")[:120]
-        with db() as conn:
-            conn.execute(
-                """
-                INSERT INTO knowledge_documents (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at, scope, project_space_id, upload_origin, created_by_user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (document_id, user["id"], filename, str(storage_path), mime_type, hashlib.sha256(raw).hexdigest(), len(raw), len(chunks), now(), scope, project_space_id, origin, user["id"]),
-            )
-            conn.executemany(
-                "INSERT INTO knowledge_chunks (id, document_id, position, content) VALUES (?, ?, ?, ?)",
-                [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)],
-            )
+        KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": now(), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "raw": raw}, [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)])
         self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin}}, HTTPStatus.CREATED)
 
     def delete_knowledge(self, user: dict) -> None:
         document_id = self.path.split("?")[0].split("/")[-1]
-        with db() as conn:
-            row = conn.execute("""SELECT knowledge_documents.storage_path FROM knowledge_documents WHERE knowledge_documents.id = ? AND
-                (knowledge_documents.user_id = ? OR (knowledge_documents.scope = 'project' AND EXISTS
-                (SELECT 1 FROM thread_folders WHERE thread_folders.id = knowledge_documents.project_space_id AND thread_folders.user_id = ?)))""",
-                (document_id, user["id"], user["id"])).fetchone()
-            if not row:
-                self.send_error_json("资料不存在", HTTPStatus.NOT_FOUND)
-                return
-            conn.execute("DELETE FROM knowledge_chunks WHERE document_id = ?", (document_id,))
-            conn.execute("DELETE FROM knowledge_documents WHERE id = ?", (document_id,))
-        path = Path(row["storage_path"])
-        if path.exists():
-            path.unlink()
+        storage_path = KNOWLEDGE_SERVICE.delete_document(document_id, user["id"])
+        if not storage_path:
+            self.send_error_json("资料不存在", HTTPStatus.NOT_FOUND)
+            return
+        Path(storage_path).unlink(missing_ok=True)
         self.send_json({"ok": True})
 
     def update_knowledge(self, user: dict) -> None:
@@ -2666,23 +2499,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if scope == "project" and not project_space_id:
             self.send_error_json("项目专属资料必须选择项目空间")
             return
-        with db() as conn:
-            document = conn.execute("""SELECT * FROM knowledge_documents WHERE id = ? AND
-                (user_id = ? OR (scope = 'project' AND EXISTS (SELECT 1 FROM thread_folders WHERE thread_folders.id = knowledge_documents.project_space_id AND thread_folders.user_id = ?)))""",
-                (document_id, user["id"], user["id"])).fetchone()
-            if not document:
-                self.send_error_json("资料不存在或没有编辑权限", HTTPStatus.NOT_FOUND)
-                return
-            if project_space_id:
-                target = conn.execute("""SELECT id FROM thread_folders WHERE id = ? AND section = 'project' AND EXISTS
-                    (SELECT 1 FROM space_members WHERE space_members.space_id = thread_folders.id AND space_members.user_id = ?)""", (project_space_id, user["id"])).fetchone()
-                if not target:
-                    self.send_error_json("没有目标项目空间的资料管理权限", HTTPStatus.FORBIDDEN)
-                    return
-            updated_name = filename or document["filename"]
-            conn.execute("""UPDATE knowledge_documents SET filename = ?, scope = ?, project_space_id = ?, user_id = ? WHERE id = ?""",
-                (updated_name, scope, project_space_id if scope == "project" else "", user["id"] if scope == "general" else document["user_id"], document_id))
-            updated = conn.execute("SELECT * FROM knowledge_documents WHERE id = ?", (document_id,)).fetchone()
+        try:
+            updated = KNOWLEDGE_SERVICE.update_document(document_id, user["id"], filename, scope, project_space_id)
+        except PermissionError as exc:
+            self.send_error_json(str(exc), HTTPStatus.FORBIDDEN)
+            return
+        if not updated:
+            self.send_error_json("资料不存在或没有编辑权限", HTTPStatus.NOT_FOUND)
+            return
         self.send_json({"document": row_to_dict(updated)})
 
     def list_skills(self, user: dict) -> None:
@@ -2693,7 +2517,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
         enabled_map = {row["skill_id"]: bool(row["enabled"]) for row in rows}
         skills = []
-        for skill in SKILLS:
+        for skill in skill_snapshot():
             item = dict(skill)
             item["enabled"] = enabled_map.get(skill["id"], skill["default_enabled"])
             skills.append(item)
@@ -2701,7 +2525,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def get_skill(self, user: dict) -> None:
         skill_id = self.path.split("/")[-1]
-        skill = next((item for item in SKILLS if item["id"] == skill_id), None)
+        skill = next((item for item in skill_snapshot() if item["id"] == skill_id), None)
         if not skill:
             self.send_error_json("技能不存在", HTTPStatus.NOT_FOUND)
             return
@@ -2721,7 +2545,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def update_thread_skills(self, user: dict) -> None:
         thread_id = self.path.split("/")[-2]
         skill_ids = set(self.read_json().get("skill_ids", []))
-        valid_ids = {skill["id"] for skill in SKILLS}
+        valid_ids = {skill["id"] for skill in skill_snapshot()}
         if not skill_ids.issubset(valid_ids):
             self.send_error_json("包含不存在的技能")
             return
@@ -2735,7 +2559,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
             enabled = {row["skill_id"]: bool(row["enabled"]) for row in rows}
             disabled_ids = [skill_id for skill_id in skill_ids if not enabled.get(
-                skill_id, next(skill["default_enabled"] for skill in SKILLS if skill["id"] == skill_id)
+                skill_id, next(skill["default_enabled"] for skill in skill_snapshot() if skill["id"] == skill_id)
             )]
             if disabled_ids:
                 self.send_error_json("已关闭的技能不能用于本次对话")
@@ -2746,7 +2570,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def update_skill(self, user: dict) -> None:
         skill_id = self.path.split("/")[-1]
-        if skill_id not in [skill["id"] for skill in SKILLS]:
+        if skill_id not in [skill["id"] for skill in skill_snapshot()]:
             self.send_error_json("技能不存在", HTTPStatus.NOT_FOUND)
             return
         payload = self.read_json()
@@ -2842,8 +2666,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("技能不存在", HTTPStatus.NOT_FOUND)
             return
         path.unlink()
-        global SKILLS
-        SKILLS = load_skills()
+        reload_skills()
         with db() as conn:
             conn.execute("DELETE FROM user_enabled_skills WHERE skill_id = ?", (skill_id,))
             conn.execute("DELETE FROM thread_selected_skills WHERE skill_id = ?", (skill_id,))
@@ -2892,32 +2715,19 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("请求过于频繁，请稍后再试", HTTPStatus.TOO_MANY_REQUESTS)
             return
         payload = self.read_json()
-        thread_id = payload.get("thread_id", "")
-        requested_folder_id = payload.get("folder_id", "")
-        content = payload.get("content", "").strip()
-        retry = bool(payload.get("retry"))
-        requested_model = payload.get("model", "auto")
-        requested_task_mode = payload.get("task_mode", "auto")
-        requested_skill_ids = payload.get("skill_ids")
-        if not content:
-            self.send_error_json("消息不能为空")
-            return
-        if requested_model not in {"auto", *MODEL_CATALOG}:
-            self.send_error_json("模型不可用")
-            return
-        if requested_task_mode not in {"auto", "quick", "standard", "deep"}:
-            self.send_error_json("任务档位无效")
-            return
-        if requested_skill_ids is not None and (
-            not isinstance(requested_skill_ids, list) or not all(isinstance(skill_id, str) for skill_id in requested_skill_ids)
-        ):
-            self.send_error_json("技能参数无效")
-            return
         try:
-            execution_modes = resolve_execution_modes(payload)
+            request = CHAT_SERVICE.validate_request(payload, MODEL_CATALOG, resolve_execution_modes)
         except ValueError as exc:
             self.send_error_json(str(exc))
             return
+        thread_id = request["thread_id"]
+        requested_folder_id = request["folder_id"]
+        content = request["content"]
+        retry = request["retry"]
+        requested_model = request["requested_model"]
+        requested_task_mode = request["requested_task_mode"]
+        requested_skill_ids = request["requested_skill_ids"]
+        execution_modes = request["execution_modes"]
         task_profile = infer_task_profile(content, requested_model, requested_task_mode)
         requested_active_skills = None
         if requested_skill_ids is not None:
@@ -2927,13 +2737,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 return
 
         with db() as conn:
-            thread = conn.execute(
-                "SELECT * FROM threads WHERE id = ? AND user_id = ?",
-                (thread_id, user["id"]),
-            ).fetchone()
+            thread, shared_thread = CHAT_SERVICE.get_editable_thread(conn, thread_id, user["id"])
             if not thread:
-                shared_thread = conn.execute("""SELECT threads.id FROM threads WHERE threads.id = ? AND threads.folder_id != ''
-                    AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = threads.folder_id AND space_members.user_id = ?)""", (thread_id, user["id"])).fetchone() if thread_id else None
                 if shared_thread:
                     self.send_error_json("这是项目空间成员的对话，你可以查看，但只有创建者可以继续编辑", HTTPStatus.FORBIDDEN)
                     return
@@ -2999,24 +2804,20 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
                     (new_id("msg"), thread_id, "user", content, now()),
                 )
-            structured_context = refresh_structured_context(conn, thread_id)
-            active_skills = requested_active_skills if requested_active_skills is not None else enabled_skills(user["id"], thread_id)
-            intent_plan = plan_intent(content, task_profile)
-            needs_knowledge = execution_modes["knowledge"] == "required" or (
-                execution_modes["knowledge"] == "auto" and intent_plan["knowledge_needed"]
+            execution_context, active_skills, intent_plan, knowledge_refs, retrieval_trace, memories = CHAT_SERVICE.freeze_execution_context(
+                conn, user_id=user["id"], thread_id=thread_id, content=content, task_profile=task_profile,
+                execution_modes=execution_modes, requested_skill_ids=requested_skill_ids,
+                requested_active_skills=requested_active_skills, dependencies={
+                    "refresh_structured_context": refresh_structured_context,
+                    "enabled_skills": enabled_skills,
+                    "plan_intent": plan_intent,
+                    "retrieve_knowledge": retrieve_knowledge_with_fallback,
+                    "load_memories": load_relevant_memories,
+                    "build_execution_context": build_execution_context,
+                    "select_structured_context": STRUCTURED_CONTEXT.select,
+                    "load_space_context": load_space_context,
+                },
             )
-            project_row = conn.execute("SELECT folder_id FROM threads WHERE id = ?", (thread_id,)).fetchone()
-            project_space_id = project_row["folder_id"] if project_row else ""
-            knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan, project_space_id) if needs_knowledge else ([], {})
-            memories = load_relevant_memories(conn, user["id"], thread_id, content)
-            execution_context = build_execution_context(
-                user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes, intent_plan,
-            )
-            execution_context["structured_context"] = STRUCTURED_CONTEXT.select(structured_context, content)
-            execution_context["memories"] = memories
-            execution_context["space_context"] = load_space_context(conn, user["id"], thread_id)
-            execution_context["retrieval_trace"] = retrieval_trace
-            execution_context["route_summary"]["memory_count"] = len(memories)
             if handoff_from:
                 execution_context["handoff"] = {
                     "from_thread_id": handoff_from,
@@ -3034,107 +2835,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if artifact_kind:
                 execution_plan[0]["requires_confirmation"] = True
                 execution_plan[0]["phase"] = "awaiting_confirmation"
-            run_id = new_id("run")
-            conn.execute(
-                """
-                INSERT INTO runs (id, thread_id, status, model, started_at, skill_snapshot, execution_context, plan_snapshot)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    thread_id,
-                    "running",
-                    actual_model,
-                    now(),
-                    json.dumps(active_skills, ensure_ascii=False),
-                    json.dumps(execution_context, ensure_ascii=False),
-                    json.dumps(execution_plan, ensure_ascii=False),
-                ),
+            run_id, knowledge_event = CHAT_SERVICE.create_run_record(
+                conn, thread_id=thread_id, content=content, execution_context=execution_context,
+                active_skills=active_skills, memories=memories, knowledge_refs=knowledge_refs,
+                retrieval_trace=retrieval_trace, task_profile=task_profile, artifact_kind=artifact_kind,
+                execution_plan=execution_plan, dependencies={
+                    "now": now, "new_id": new_id, "append_event": append_run_event,
+                    "runtime": RUNTIME_STORE, "json": json, "reasoning_summary": build_reasoning_summary,
+                    "artifact_confirmation_text": artifact_confirmation_text,
+                },
             )
-            conn.executemany(
-                "INSERT INTO memory_usage (run_id, memory_id, used_at) VALUES (?, ?, ?)",
-                [(run_id, memory["id"], now()) for memory in memories],
-            )
-            append_run_event(conn, run_id, "started")
-            append_run_event(conn, run_id, "execution_context", {
-                "model": actual_model,
-                "task_tier": execution_context["task_tier"],
-                "tool_ids": execution_context["allowed_tool_ids"],
-                "tool_route_confidence": execution_context["tool_route_confidence"],
-                "tool_route_reason": execution_context["tool_route_reason"],
-                "execution_modes": execution_context["execution_modes"],
-                "knowledge_matches": len(knowledge_refs),
-                "memory_count": len(memories),
-                "intent_plan": execution_context["intent_plan"],
-            })
-            append_run_event(conn, run_id, "skill_routed", {
-                "route": execution_context["skill_route"],
-                "skills": [skill["name"] for skill in active_skills],
-            })
-            append_run_event(conn, run_id, "reasoning_summary", {"items": build_reasoning_summary(execution_context)})
-            knowledge_event = "knowledge_retrieved" if knowledge_refs else (
-                "knowledge_no_match" if task_profile["needs_knowledge"] else "knowledge_not_needed"
-            )
-            append_run_event(conn, run_id, knowledge_event, {
-                "count": len(knowledge_refs),
-                "intent": task_profile["knowledge_intent"]["reason"],
-            })
-            if retrieval_trace:
-                append_run_event(conn, run_id, "knowledge_retrieval_assessed", retrieval_trace)
-                if retrieval_trace.get("retry_query"):
-                    append_run_event(conn, run_id, "knowledge_retrieval_retried", {
-                        "query": retrieval_trace["retry_query"], "matches": retrieval_trace["retry_matches"],
-                    })
-            append_run_event(conn, run_id, "plan_created", {"steps": execution_plan})
-            conn.executemany(
-                """
-                INSERT INTO run_steps
-                    (id, run_id, position, title, status, requires_confirmation, input_json, output_json,
-                     idempotency_key, timeout_seconds, max_retries, retry_count, resume_policy, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                """,
-                [
-                    (
-                        new_id("step"), run_id, index, step["title"],
-                        "awaiting_confirmation" if artifact_kind and index == 1 else "pending",
-                        1 if step.get("requires_confirmation") else 0,
-                        json.dumps({"task_preview": content[:160], "phase": step.get("phase", "generating")}, ensure_ascii=False),
-                        "{}",
-                        f"{run_id}:{step['id']}",
-                        step.get("timeout_seconds", 30),
-                        step.get("max_retries", 0),
-                        step.get("resume_policy", "resume_from_contract"),
-                        now(),
-                    )
-                    for index, step in enumerate(execution_plan, start=1)
-                ],
-            )
-            if artifact_kind:
-                RUNTIME_STORE.transition_run(conn, run_id, "awaiting_confirmation")
-                RUNTIME_STORE.transition_phase(conn, run_id, "awaiting_confirmation", detail={"step": "confirmation"})
-                request = artifact_confirmation_text(artifact_kind)
-                conn.execute(
-                    """INSERT INTO run_approval_requests
-                       (id, run_id, position, step_id, request, status, created_at, operation_id, risk_level, tool_id, arguments_json, effect_summary, rollback_summary, idempotency_key)
-                       VALUES (?, ?, 1, 'step_1', ?, ?, ?, ?, 'local_write', 'create_artifact', ?, ?, ?, ?)""",
-                    (
-                        new_id("approval"), run_id, request, "pending", now(), f"operation_{run_id}",
-                        json.dumps({"kind": artifact_kind}, ensure_ascii=False),
-                        f"在本机受控产物目录创建一个 {artifact_kind} 文件",
-                        "可在产物列表中删除该文件；删除不会影响原始对话和运行记录",
-                        f"artifact:{run_id}:{artifact_kind}",
-                    ),
-                )
-                append_run_event(conn, run_id, "confirmation_requested", {
-                    "kind": artifact_kind,
-                    "target": "data/artifacts",
-                    "risk_level": "local_write",
-                    "tool_id": "create_artifact",
-                    "rollback_summary": "可在产物列表中删除该文件；删除不会影响原始对话和运行记录",
-                    "idempotency_key": f"artifact:{run_id}:{artifact_kind}",
-                })
-            elif knowledge_refs or execution_context["knowledge_route"] == "required_no_match":
-                RUNTIME_STORE.transition_phase(conn, run_id, "retrieving", detail={"knowledge_matches": len(knowledge_refs)})
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -3175,14 +2885,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
             def emit_runtime_event(event_type: str, payload: dict) -> None:
                 ensure_run_active(run_id)
-                with db() as event_conn:
-                    phase = event_conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
-                    current_phase = phase["run_phase"] if phase else ""
-                    if event_type == "tool_call" and current_phase in {"planning", "retrieving", "generating"}:
-                        RUNTIME_STORE.transition_phase(event_conn, run_id, "executing_tool", detail={"tool_id": payload.get("tool_id", "")})
-                    elif event_type == "reflection_started" and current_phase in {"generating", "executing_tool"}:
-                        RUNTIME_STORE.transition_phase(event_conn, run_id, "reflecting")
-                    append_run_event(event_conn, run_id, event_type, payload)
+                CHAT_SERVICE.record_runtime_event(run_id, event_type, payload, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
                 self.write_event("status", {"summary": event_summary(event_type, payload)})
 
             draft_parts = []
@@ -3198,57 +2901,20 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             for chunk in chunk_text(final_answer, 12):
                 answer += chunk
                 self.write_event("delta", {"content": chunk})
-            with db() as conn:
-                conn.execute(
-                    "INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (new_id("msg"), thread_id, "assistant", answer, now()),
-                )
-                refresh_structured_context(conn, thread_id)
-                RUNTIME_STORE.transition_run(conn, run_id, "completed")
-                phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
-                if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
-                    RUNTIME_STORE.transition_phase(conn, run_id, "completed")
-                conn.execute(
-                    """
-                    UPDATE runs
-                    SET execution_context = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        json.dumps(execution_context, ensure_ascii=False),
-                        json.dumps(reflection, ensure_ascii=False),
-                        estimate_tokens(content),
-                        estimate_tokens(answer),
-                        conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"],
-                        run_id,
-                    ),
-                )
-                conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now(), thread_id))
-                conn.execute(
-                    "UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')",
-                    ("completed", json.dumps({"answer_chars": len(answer), "status": "completed"}), now(), run_id),
-                )
-                append_run_event(conn, run_id, "completed", {"length": len(answer)})
+            CHAT_SERVICE.finalize_run(run_id, thread_id, content, answer, execution_context, reflection, {
+                "runtime": RUNTIME_STORE, "refresh_context": refresh_structured_context,
+                "json": json, "estimate_tokens": estimate_tokens, "append_event": append_run_event,
+            })
             self.write_event("done", {"content": answer})
             LOGGER.info("run_completed run_id=%s thread_id=%s model=%s", run_id, thread_id, actual_model)
         except RunCancelled:
             self.write_event("cancelled", {"run_id": run_id})
             LOGGER.info("run_cancelled run_id=%s thread_id=%s", run_id, thread_id)
         except Exception as exc:
-            with db() as conn:
-                status = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
-                if status and status["status"] == "cancelled":
-                    self.write_event("cancelled", {"run_id": run_id})
-                    return
-                RUNTIME_STORE.transition_run(conn, run_id, "failed", error=str(exc))
-                phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
-                if phase and phase["run_phase"] not in {"completed", "failed", "cancelled"}:
-                    RUNTIME_STORE.transition_phase(conn, run_id, "failed", detail={"reason": "runtime_error"})
-                append_run_event(conn, run_id, "failed", {"error": str(exc)})
-                conn.execute(
-                    "UPDATE run_steps SET status = ?, error = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
-                    ("failed", str(exc), json.dumps({"error": str(exc)[:500], "status": "failed"}), now(), run_id),
-                )
+            failed = CHAT_SERVICE.fail_run(run_id, str(exc), {"runtime": RUNTIME_STORE, "append_event": append_run_event, "json": json})
+            if not failed:
+                self.write_event("cancelled", {"run_id": run_id})
+                return
             self.write_event("error", {"error": str(exc)})
             LOGGER.warning("run_failed run_id=%s thread_id=%s error=%s", run_id, thread_id, str(exc)[:160])
         finally:
@@ -3284,7 +2950,7 @@ def enabled_skills(user_id: str, thread_id: str = "", requested_skill_ids: list[
         if thread_rows:
             selected = {row["skill_id"] for row in thread_rows}
     skills = []
-    for skill in SKILLS:
+    for skill in skill_snapshot():
         globally_enabled = enabled.get(skill["id"], skill["default_enabled"])
         selected_for_thread = skill["id"] in selected if selected is not None else True
         is_enabled = globally_enabled and selected_for_thread
