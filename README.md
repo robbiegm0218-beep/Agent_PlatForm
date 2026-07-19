@@ -38,6 +38,7 @@ Python HTTP 服务 ── Agent Loop ── DeepSeek Provider
 - `chat/`：输入区、流式 SSE、模型与执行方式、Markdown、运行过程及确认/重试。
 - `knowledge/`、`space/`：资料库、项目空间成员、资料、对话与产物视图。
 - `views/`：技能与应用、长期记忆、产物、设置及运行审计。
+- `styles/`：按基础令牌、布局、组件、对话、项目空间、知识库和响应式规则分层；`styles.css` 仅负责按既有优先级加载这些层。
 
 修改前端后可运行：
 
@@ -251,6 +252,8 @@ python3 -m server.evaluate_skill_contracts
 ```
 
 回归测试使用临时数据库与本地模型替身，覆盖流式响应、工具边界、审批与取消、运行审计、重启恢复、生产凭据、健康检查和数据库恢复演练。评测集位于 `server/evals/personal_baseline.json`，不会记录 API Key 或私有资料正文。
+
+决策质量评测位于 [`docs/decision-quality.md`](docs/decision-quality.md)，用于固定评测 Planner、检索、澄清和项目空间边界；策略版本会冻结到每个 Run 的执行上下文中。
 
 ## 当前限制与下一步
 

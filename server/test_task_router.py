@@ -60,6 +60,10 @@ class TaskRouterTests(unittest.TestCase):
     def test_knowledge_classifier_keeps_operational_question_offline(self):
         self.assertFalse(classify_knowledge_intent("这个平台有哪些模型")['needed'])
 
+    def test_knowledge_classifier_avoids_generic_explanation_over_retrieval(self):
+        self.assertFalse(classify_knowledge_intent("解释幂等性是什么")['needed'])
+        self.assertTrue(classify_knowledge_intent("比较 AP 与 CP 并说明关键取舍")['needed'])
+
 
 if __name__ == "__main__":
     unittest.main()

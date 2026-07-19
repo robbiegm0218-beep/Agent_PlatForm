@@ -1,0 +1,166 @@
+:root {
+  color-scheme: light;
+  --bg: #f7f7f4;
+  --panel: #ffffff;
+  --panel-soft: #f2f2ee;
+  --line: #deded8;
+  --text: #20201d;
+  --muted: #6d6b63;
+  --accent: #0f766e;
+  --accent-dark: #115e59;
+  --danger: #b42318;
+  --shadow: 0 18px 60px rgba(22, 22, 18, 0.08);
+  --conversation-width: 860px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+body.booting #loginView,
+body.booting #workspaceView {
+  visibility: hidden;
+}
+
+.direct-open-notice {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background: #f7f7f5;
+}
+
+.direct-open-notice section {
+  width: min(440px, 100%);
+  padding: 28px;
+  border: 1px solid #deded8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.direct-open-notice h1 { margin: 18px 0 8px; font-size: 22px; }
+.direct-open-notice p { margin: 0 0 22px; color: #5e625c; line-height: 1.6; }
+.direct-open-notice a {
+  display: inline-block;
+  padding: 9px 14px;
+  border-radius: 6px;
+  background: #0f766e;
+  color: #ffffff;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-panel {
+  width: min(420px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 32px;
+  box-shadow: var(--shadow);
+}
+
+.brand-mark,
+.logo {
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.login-panel h1 {
+  margin: 28px 0 8px;
+  font-size: 28px;
+}
+
+.login-panel p,
+.page-header span,
+.empty-state p,
+.notice,
+.form-error {
+  color: var(--muted);
+}
+
+form label {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  outline: none;
+}
+
+input {
+  height: 42px;
+  padding: 0 12px;
+}
+
+textarea {
+  min-height: 48px;
+  max-height: 180px;
+  resize: none;
+  padding: 14px;
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.13);
+}
+
+form button,
+.composer button,
+.settings-actions button {
+  height: 42px;
+  padding: 0 16px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+}
+
+form button:hover,
+.composer button:hover,
+.settings-actions button:hover {
+  background: var(--accent-dark);
+}
+
+.form-error {
+  min-height: 20px;
+  margin-top: 14px;
+  color: var(--danger);
+}

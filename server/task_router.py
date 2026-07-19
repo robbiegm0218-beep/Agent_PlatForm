@@ -25,10 +25,15 @@ def classify_knowledge_intent(content: str) -> dict:
         return {"needed": True, "reason": "explicit_local_source"}
 
     operational_markers = ("平台", "技能", "模型", "版本", "接口", "服务", "对话", "文件夹", "改动范围", "今天", "星期", "代码")
-    factual_markers = ("什么是", "是什么", "定义", "含义", "说明", "介绍", "多少", "数据", "指标", "事实")
+    # Broad suffixes such as “是什么” and “说明” often describe a general
+    # explanation, not a request for private knowledge.  Keep local retrieval
+    # for explicit definitions and factual comparisons, where evidence is more
+    # likely to improve the answer.
+    factual_markers = ("什么是", "定义", "含义", "介绍", "多少", "数据", "指标", "事实")
+    factual_comparison = "说明" in normalized and "比较" in normalized
     if (
         len(normalized) >= 5
-        and any(marker in normalized for marker in factual_markers)
+        and (any(marker in normalized for marker in factual_markers) or factual_comparison)
         and not any(marker in normalized for marker in operational_markers)
     ):
         return {"needed": True, "reason": "factual_query"}

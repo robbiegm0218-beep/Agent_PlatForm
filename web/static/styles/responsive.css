@@ -1,0 +1,51 @@
+@media (max-width: 720px) {
+  .artifacts-grid { grid-template-columns: 1fr; }
+  .artifact-card { min-height: 232px; }
+}
+@media (max-width: 760px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    height: auto;
+    min-height: 0;
+  }
+
+  .thread-list {
+    display: none;
+  }
+
+  .page {
+    height: calc(100vh - 194px);
+  }
+
+  .thread-context-panel { display: none; }
+
+  .composer {
+    width: calc(100% - 24px);
+  }
+
+
+  .messages {
+    padding: 24px 16px;
+  }
+
+  .skill-drop-zone {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .skill-file-control {
+    min-width: 0;
+  }
+
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-form {
+    grid-template-columns: 1fr;
+    margin: 18px 16px 0;
+  }
+}

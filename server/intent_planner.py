@@ -32,7 +32,7 @@ class IntentPlanner:
         "这份", "这套", "该项目", "当前项目", "当前空间", "空间里", "已有资料", "内部资料",
         "公司制度", "公司流程", "项目方案", "项目里", "已有材料", "已有文档", "之前的", "上述", "上面的", "刚才的文档",
     )
-    _QUESTION_MARKERS = ("哪些", "什么", "如何", "怎么", "总结", "归纳", "分析", "风险", "差异", "是否")
+    _QUESTION_MARKERS = ("哪些", "什么", "如何", "怎么", "说明", "总结", "归纳", "分析", "风险", "差异", "是否")
 
     def plan(self, content: str, task_profile: dict) -> IntentPlan:
         normalized = "".join(content.lower().split())

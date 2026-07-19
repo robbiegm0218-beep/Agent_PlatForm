@@ -1,0 +1,41 @@
+.knowledge-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 20px 28px 0;
+}
+
+.knowledge-toolbar input {
+  width: min(520px, 100%);
+}
+.knowledge-toolbar select { height: 32px; max-width: 150px; }
+
+.knowledge-results {
+  margin: 18px 28px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: auto;
+}
+
+.knowledge-result + .knowledge-result {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.knowledge-result strong {
+  font-size: 13px;
+}
+
+.knowledge-result p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.knowledge-card { min-height: 190px; align-self: start; }
+.knowledge-card .card-footer { justify-content: flex-start; gap: 7px; }
+.knowledge-card .status-pill { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

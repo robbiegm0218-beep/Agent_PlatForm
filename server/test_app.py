@@ -391,6 +391,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         context = json.loads(run_detail["run"]["execution_context"])
         self.assertEqual(context["model"], app.DEEPSEEK_MODEL)
         self.assertEqual(context["allowed_tool_ids"], [])
+        self.assertEqual(context["decision_policy"]["version"], "decision-quality-v1")
         self.assertEqual(run_detail["steps"][0]["status"], "completed")
 
         renamed = self.request_json(f"/api/threads/{thread_id}", {"title": "已重命名"}, self.token, method="PATCH")

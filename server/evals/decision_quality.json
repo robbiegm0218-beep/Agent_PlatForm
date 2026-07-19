@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "Agent_Platform 决策质量固定基线",
+  "cases": [
+    {"id":"general_greeting","prompt":"你好","expected":{"retrieve":false,"clarify":false,"scope":"general","task_tier":"quick"}},
+    {"id":"general_explain","prompt":"解释幂等性是什么","expected":{"retrieve":false,"clarify":false,"scope":"general","task_tier":"quick"}},
+    {"id":"explicit_knowledge","prompt":"请根据知识库中的资料总结结论","expected":{"retrieve":true,"clarify":false,"scope":"general","task_tier":"quick"}},
+    {"id":"explicit_reference","prompt":"基于本地资料说明北极星指标","expected":{"retrieve":true,"clarify":false,"scope":"general","task_tier":"quick"}},
+    {"id":"project_material","prompt":"总结当前空间里已有资料的风险","project_space_id":"space-a","expected":{"retrieve":true,"clarify":false,"scope":"project","task_tier":"quick"}},
+    {"id":"project_document","prompt":"当前项目已有材料有哪些待确认问题","project_space_id":"space-a","expected":{"retrieve":true,"clarify":false,"scope":"project","task_tier":"quick"}},
+    {"id":"company_policy","prompt":"请说明公司制度中的报销规范","expected":{"retrieve":true,"clarify":false,"scope":"general","task_tier":"quick"}},
+    {"id":"ambiguous_context","prompt":"请整理这份内容当前的具体情况和后续建议，但没有提供资料范围","expected":{"retrieve":false,"clarify":true,"scope":"general","task_tier":"quick"}},
+    {"id":"ambiguous_records","prompt":"请分析这些记录的具体内容和差异，但是没有说明具体资料来源","expected":{"retrieve":false,"clarify":true,"scope":"general","task_tier":"standard"}},
+    {"id":"standard_analysis","prompt":"分析这段代码的潜在问题","expected":{"retrieve":false,"clarify":false,"scope":"general","task_tier":"standard"}},
+    {"id":"deep_plan","prompt":"制定产品竞品调研方案并说明关键取舍","expected":{"retrieve":false,"clarify":false,"scope":"general","task_tier":"deep"}},
+    {"id":"deep_project","prompt":"设计高可用系统架构方案","expected":{"retrieve":false,"clarify":false,"scope":"general","task_tier":"deep"}}
+  ]
+}

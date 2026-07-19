@@ -181,10 +181,6 @@ async function loadModels() {
     els.modelSelect.appendChild(option);
   });
   els.modelSelect.value = state.models.some((model) => model.id === previous) ? previous : state.models[0]?.id || "";
-  renderModelConfigHint();
-}
-
-function renderModelConfigHint() {
   executionMode.renderModelConfigHint();
 }
 
@@ -192,10 +188,6 @@ function renderSkillContext() {
   state.selectedSkillIds = state.selectedSkillIds.filter((skillId) => state.skills.some((skill) => skill.id === skillId && skill.enabled));
   renderComposerSkills();
   renderSkillPicker();
-}
-
-function getPromptText() {
-  return composer.getPromptText(els);
 }
 
 function getChatContent() {
@@ -811,7 +803,12 @@ async function restorePendingConfirmation() {
   const assistant = appendAssistantMessage();
   appendExecutionTrace(assistant, "等待你的确认");
   assistant.content.textContent = detail.confirmation.request;
-  const context = safeJson(detail.run.execution_context, {});
+  let context = {};
+  try {
+    context = JSON.parse(detail.run.execution_context || "{}");
+  } catch (_error) {
+    // Older runs may not have a structured execution context.
+  }
   appendConfirmationActions(assistant, {
     run_id: pending.id,
     request: detail.confirmation.request,
@@ -843,125 +840,6 @@ async function loadRunDetail(runId) {
       catch (error) { button.disabled = false; button.textContent = error.message || "取消失败"; }
     },
   });
-  return;
-  const { run, events, steps, artifact } = data;
-  const elapsed = run.completed_at ? `${Math.max(0, Math.round((run.completed_at - run.started_at) / 1e9 * 10) / 10)} 秒` : "运行中";
-  const skills = JSON.parse(run.skill_snapshot || "[]").map((skill) => skill.name).join("、") || "无";
-  const plan = steps?.length ? steps : safeJson(run.plan_snapshot, []);
-  const context = safeJson(run.execution_context, {});
-  const reflection = safeJson(run.reflection_snapshot, {});
-  const toolEvents = events.filter((event) => ["tool_call", "tool_result", "tool_error"].includes(event.type));
-  const planText = plan.length ? plan.map((step) => `${step.title}（${step.status}）`).join(" → ") : "无";
-  const tools = context.tools?.map((tool) => tool.name).join("、") || "无";
-  const toolRoute = context.tool_route_reason || "未记录";
-  const route = context.model_route_reason || "未记录";
-  const tier = context.task_tier || "standard";
-  const toolTrace = toolEvents.length ? toolEvents.map((event) => event.type).join(" → ") : "未调用工具";
-  const reflectionText = reflection.applied
-    ? `${reflection.summary || "已完成"}${reflection.revision_count ? `，已修订 ${reflection.revision_count} 次` : ""}`
-    : "未触发";
-  const modes = context.execution_modes || {};
-  const routeSummary = context.route_summary || {};
-  const modesText = `资料：${modes.source || "general"}｜知识库：${modes.knowledge || "auto"}（${routeSummary.knowledge_matches ?? context.knowledge_match_count ?? 0} 条）｜网络：${modes.web || "auto"}｜文件：${modes.file || "auto"}｜记忆：${routeSummary.memory_count ?? context.memories?.length ?? 0} 条`;
-  const requiredErrors = context.required_tool_errors?.length ? `\n必需能力：${context.required_tool_errors.join("；")}` : "";
-  els.runDetail.textContent = `模型：${run.model}\n任务档位：${tier}\n路由：${route}\n执行方式：${modesText}\n输出预算：${context.max_output_tokens || "未记录"}\n状态：${run.status}\n执行阶段：${run.run_phase || "未记录"}\n耗时：${elapsed}\n技能：${skills}\n计划：${planText}\n允许工具：${tools}\n工具判断：${toolRoute}\n工具执行：${toolTrace}\n质量检查：${reflectionText}${requiredErrors}${run.error ? `\n错误：${run.error}` : ""}`;
-
-  if (artifact) {
-    const artifactBlock = document.createElement("div");
-    artifactBlock.style.cssText = "margin-top:14px;padding-top:14px;border-top:1px solid var(--line)";
-    const link = document.createElement("a");
-    link.className = "artifact-link";
-    link.href = "#";
-    link.textContent = `下载文件：${artifact.filename}`;
-    link.title = artifact.summary || "下载生成的文件";
-    link.addEventListener("click", async (event) => {
-      event.preventDefault();
-      link.setAttribute("aria-busy", "true");
-      const originalText = link.textContent;
-      link.textContent = "正在下载文件...";
-      try {
-        const response = await fetch(`/api/artifacts/${artifact.id}/download`, {
-          headers: { Authorization: `Bearer ${state.token}` },
-        });
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || "文件下载失败");
-        }
-        const url = URL.createObjectURL(await response.blob());
-        const download = document.createElement("a");
-        download.href = url;
-        download.download = artifact.filename;
-        document.body.appendChild(download);
-        download.click();
-        download.remove();
-        URL.revokeObjectURL(url);
-        link.textContent = originalText;
-      } catch (error) {
-        link.textContent = error.message || "文件下载失败";
-        window.setTimeout(() => { link.textContent = originalText; }, 2500);
-      } finally {
-        link.removeAttribute("aria-busy");
-      }
-    });
-    artifactBlock.appendChild(link);
-    els.runDetail.appendChild(artifactBlock);
-  }
-
-  if (context.knowledge_refs?.length) {
-    const feedback = document.createElement("div");
-    feedback.className = "confirmation-actions run-feedback";
-    const label = document.createElement("span");
-    label.textContent = "本次引用是否准确？";
-    feedback.append(label);
-    [[true, "引用准确"], [false, "引用有误"]].forEach(([citationCorrect, text]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "secondary";
-      button.textContent = text;
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        try {
-          await api(`/api/runs/${run.id}/feedback`, { method: "POST", body: JSON.stringify({ rating: citationCorrect ? 1 : -1, citation_correct: citationCorrect }) });
-          feedback.replaceChildren(Object.assign(document.createElement("span"), { textContent: "已记录引用评价" }));
-        } catch (error) {
-          button.disabled = false;
-          button.textContent = error.message || "提交失败";
-        }
-      });
-      feedback.append(button);
-    });
-    els.runDetail.appendChild(feedback);
-  }
-
-  if (["running", "awaiting_confirmation"].includes(run.status)) {
-    const actions = document.createElement("div");
-    actions.className = "confirmation-actions";
-    const cancelButton = document.createElement("button");
-    cancelButton.type = "button";
-    cancelButton.className = "secondary";
-    cancelButton.textContent = run.status === "awaiting_confirmation" ? "取消待确认任务" : "取消运行";
-    cancelButton.addEventListener("click", async () => {
-      cancelButton.disabled = true;
-      try {
-        await api(`/api/runs/${run.id}/cancel`, { method: "POST", body: "{}" });
-        await loadRuns();
-        await loadRunDetail(run.id);
-      } catch (error) {
-        cancelButton.disabled = false;
-        cancelButton.textContent = error.message || "取消失败";
-      }
-    });
-    actions.appendChild(cancelButton);
-    els.runDetail.appendChild(actions);
-  }
-}
-
-function safeJson(value, fallback) {
-  try {
-    return JSON.parse(value || "");
-  } catch (error) {
-    return fallback;
-  }
 }
 
 function renderMessages() {
@@ -1003,7 +881,7 @@ function renderMessageContent(element, content, role = "assistant") {
   const marker = "\n\n参考资料：";
   const markerIndex = content.lastIndexOf(marker);
   const answer = markerIndex === -1 ? content : content.slice(0, markerIndex);
-  element.appendChild(renderMarkdown(answer));
+  element.appendChild(markdown.render(answer));
   if (markerIndex === -1) return;
 
   const references = document.createElement("div");
@@ -1029,14 +907,6 @@ function renderMessageContent(element, content, role = "assistant") {
   element.append(references);
 }
 
-function renderMarkdown(markdown) {
-  return window.AgentMarkdown.render(markdown);
-}
-
-function renderInline(element, text) {
-  return markdown.renderInline(element, text);
-}
-
 function appendAssistantMessage() {
   return runTrace.appendAssistantMessage(els);
 }
@@ -1058,10 +928,6 @@ function renderSkills(skills) {
     onToggle: async (skill, enabled) => { await api(`/api/skills/${skill.id}`, { method: "PATCH", body: JSON.stringify({ enabled }) }); skill.enabled = enabled; renderSkillContext(); },
     onEdit: editSkill, onVersion: restoreSkillVersion, onDelete: deleteSkill,
   });
-}
-
-function skillSummary(skill) {
-  return capabilityViews.skillSummary(skill);
 }
 
 async function editSkill(skill) {
@@ -1300,14 +1166,6 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function renderExecutionModeHint() {
-  executionMode.renderExecutionModeHint();
-}
-
-function scheduleRoutePreview() {
-  executionMode.scheduleRoutePreview();
-}
-
 els.loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.loginError.textContent = "";
@@ -1337,7 +1195,7 @@ els.loginForm.addEventListener("submit", async (event) => {
 
 els.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const content = getChatContent();
+  const content = composer.getChatContent(state, els);
   if (!content) return;
   const space = state.activeView === "space" ? state.spaceComposerFolder : null;
   els.chatInput.innerHTML = "";
@@ -1352,11 +1210,11 @@ els.chatForm.addEventListener("submit", async (event) => {
 });
 
 [els.sourceModeSelect, els.knowledgeModeSelect, els.webModeSelect, els.fileModeSelect]
-  .forEach((select) => select.addEventListener("change", scheduleRoutePreview));
+  .forEach((select) => select.addEventListener("change", executionMode.scheduleRoutePreview));
 
 [els.modelSelect, els.taskModeSelect].forEach((select) => select.addEventListener("change", () => {
-  renderModelConfigHint();
-  scheduleRoutePreview();
+  executionMode.renderModelConfigHint();
+  executionMode.scheduleRoutePreview();
 }));
 
 const modelConfigPicker = document.querySelector(".model-config-picker");
@@ -1366,10 +1224,10 @@ const executionModePicker = document.querySelector(".execution-mode-picker");
   [modelConfigPicker, executionModePicker].filter((other) => other && other !== picker).forEach((other) => { other.open = false; });
 }));
 
-renderExecutionModeHint();
+executionMode.renderExecutionModeHint();
 
 els.chatInput.addEventListener("input", () => {
-  scheduleRoutePreview();
+  executionMode.scheduleRoutePreview();
 });
 
 els.chatInput.addEventListener("keydown", (event) => {

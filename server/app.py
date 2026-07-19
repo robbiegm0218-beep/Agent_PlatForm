@@ -46,6 +46,7 @@ from server.memory_policy import MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, e
 from server.safe_web_reader import SafeWebPageReader
 from server.skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
 from server.intent_planner import IntentPlanner
+from server.decision_quality import policy_snapshot
 from server.auth_service import AuthService
 from server.knowledge_service import KnowledgeService
 from server.space_service import SpaceService
@@ -1258,6 +1259,7 @@ def build_execution_context(
     skill_resources = [resource for skill in active_skills for resource in load_skill_resources(skill, content)]
     return {
         "version": 1,
+        "decision_policy": policy_snapshot(),
         "user_id": user_id,
         "model": task_profile["model"],
         "task_tier": task_profile["task_tier"],
