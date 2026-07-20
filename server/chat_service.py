@@ -126,7 +126,7 @@ class ChatService:
 
     def finalize_run(self, run_id: str, thread_id: str, content: str, answer: str, execution_context: dict, reflection: dict, dependencies: dict) -> None:
         with self.db_factory() as conn:
-            conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", (self.new_id("msg"), thread_id, "assistant", answer, self.now()))
+            conn.execute("INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)", (self.new_id("msg"), thread_id, run_id, "assistant", answer, self.now()))
             dependencies["refresh_context"](conn, thread_id)
             runtime = dependencies["runtime"]
             runtime.transition_run(conn, run_id, "completed")

@@ -21,13 +21,27 @@
 .skill-drop-zone {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin: 16px 28px 0;
-  padding: 14px 16px;
-  border: 1px dashed #b9c6bf;
+  gap: 12px;
+  width: min(680px, calc(100% - 56px));
+  margin: 14px 28px 0;
+  padding: 14px;
+  border: 1px solid #d9e7e4;
   border-radius: 10px;
-  background: #fbfdfb;
+  background: #f7fbfa;
+  box-sizing: border-box;
+}
+
+.skill-drop-icon {
+  display: grid;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 8px;
+  background: #dff0ec;
+  color: var(--accent-dark);
+  font-size: 23px;
+  font-weight: 400;
 }
 
 .skill-drop-copy {
@@ -56,7 +70,8 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: min(330px, 100%);
+  min-width: 0;
+  margin-left: auto;
 }
 
 .skill-file-action {
@@ -224,6 +239,23 @@
   color: var(--muted);
   line-height: 1.5;
 }
+
+.apps-capability-layout {
+  display: block;
+  overflow: auto;
+}
+
+.capability-group { padding: 20px 28px 0; }
+.capability-group + .capability-group { padding-top: 28px; padding-bottom: 32px; }
+.capability-group-heading { display: grid; gap: 4px; margin-bottom: 12px; }
+.capability-group-heading h3, .capability-group-heading p { margin: 0; }
+.capability-group-heading h3 { font-size: 15px; }
+.capability-group-heading p { color: var(--muted); font-size: 13px; }
+.capability-app-grid, .capability-tool-grid { display: grid; gap: 14px; align-items: start; }
+.capability-app-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 320px)); }
+.capability-tool-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 360px)); }
+.capability-app-grid .capability-card { min-height: 190px; }
+.capability-tool-grid .capability-card { min-height: 0; }
 
 .skill-description {
   display: -webkit-box;

@@ -13,9 +13,10 @@ window.AgentExecutionMode = function createExecutionMode({ state, els, api, getC
     if (override) {
       els.knowledgeModeSelect.value = override.knowledge;
       els.webModeSelect.value = override.web;
+    } else {
+      els.knowledgeModeSelect.value = "auto";
+      els.webModeSelect.value = "auto";
     }
-    els.knowledgeModeSelect.disabled = Boolean(override);
-    els.webModeSelect.disabled = Boolean(override);
   }
 
   function renderModelConfigHint() {
@@ -27,11 +28,9 @@ window.AgentExecutionMode = function createExecutionMode({ state, els, api, getC
 
   function renderExecutionModeHint() {
     syncEvidenceModeControls();
-    const labels = { off: "关闭", auto: "自动", required: "必须" };
-    const sourceLabels = { general: "智能选择", local_only: "仅知识库", web_only: "仅网络", mixed: "知识库 + 网络" };
-    const advanced = els.sourceModeSelect.value === "general" && (els.knowledgeModeSelect.value !== "auto" || els.webModeSelect.value !== "auto")
-      ? " · 高级已设定" : "";
-    els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · 文件${labels[els.fileModeSelect.value]}${advanced}`;
+    const fileLabels = { off: "不查文件", auto: "按需查找", required: "优先查找" };
+    const sourceLabels = { general: "自动判断", local_only: "只查知识库", web_only: "只查网络", mixed: "知识库和网络" };
+    els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · ${fileLabels[els.fileModeSelect.value]}`;
   }
 
   function scheduleRoutePreview() {

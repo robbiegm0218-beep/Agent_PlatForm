@@ -34,18 +34,28 @@
   .skill-drop-zone {
     align-items: stretch;
     flex-direction: column;
+    width: calc(100% - 32px);
+    margin-left: 16px;
+    margin-right: 16px;
   }
 
   .skill-file-control {
     min-width: 0;
+    margin-left: 0;
   }
 
   .card-grid {
     grid-template-columns: 1fr;
   }
 
+  .capability-group { padding-left: 16px; padding-right: 16px; }
+  .capability-app-grid, .capability-tool-grid { grid-template-columns: 1fr; }
+
   .memory-form {
     grid-template-columns: 1fr;
     margin: 18px 16px 0;
   }
+
+  .run-drawer { width: min(380px, 100vw); padding: 14px; }
+  .run-drawer-tab { font-size: 11px; }
 }

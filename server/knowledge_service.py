@@ -31,9 +31,10 @@ class KnowledgeService:
             if project_space_id:
                 return conn.execute("""SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
                     FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
-                    WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ? AND
-                    EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = ? AND space_members.user_id = ?)""",
-                    (project_space_id, project_space_id, user_id)).fetchall()
+                    WHERE (knowledge_documents.scope = 'general' AND knowledge_documents.user_id = ?) OR
+                    (knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ? AND
+                    EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = ? AND space_members.user_id = ?))""",
+                    (user_id, project_space_id, project_space_id, user_id)).fetchall()
             return conn.execute("""SELECT knowledge_chunks.*, knowledge_documents.filename, knowledge_documents.scope, knowledge_documents.project_space_id
                 FROM knowledge_chunks JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
                 WHERE knowledge_documents.user_id = ? AND knowledge_documents.scope = 'general'""", (user_id,)).fetchall()

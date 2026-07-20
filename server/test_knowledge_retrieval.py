@@ -1,6 +1,6 @@
 import unittest
 
-from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig
+from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, retrieval_policy_snapshot
 
 
 def row(identifier, document, filename, position, content):
@@ -47,6 +47,12 @@ class KnowledgeRetrieverTests(unittest.TestCase):
     def test_unrelated_query_returns_no_results(self):
         rows = [row("a", "d1", "材料.md", 0, "产品碳足迹与功能单位。")]
         self.assertEqual(KnowledgeRetriever().search("员工考勤制度", rows), [])
+
+    def test_policy_snapshot_records_active_retrieval_settings(self):
+        snapshot = retrieval_policy_snapshot(RetrievalConfig(limit=2, neighbor_radius=0))
+        self.assertEqual(snapshot["version"], "lexical-retrieval-v1")
+        self.assertEqual(snapshot["config"]["limit"], 2)
+        self.assertEqual(snapshot["config"]["neighbor_radius"], 0)
 
 
 if __name__ == "__main__":

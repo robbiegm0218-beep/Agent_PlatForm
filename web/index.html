@@ -90,36 +90,23 @@
                 <details class="execution-mode-picker">
                   <summary><span>执行方式</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">自动</span></summary>
                   <div class="execution-mode-menu">
-                    <label>回答依据
+                    <label>信息来源
                       <select id="sourceModeSelect" aria-label="选择回答依据">
-                        <option value="general">智能选择</option>
-                        <option value="local_only">仅知识库</option>
-                        <option value="web_only">仅网络</option>
-                        <option value="mixed">知识库 + 网络</option>
+                        <option value="general">自动判断</option>
+                        <option value="local_only">只查知识库</option>
+                        <option value="web_only">只查网络</option>
+                        <option value="mixed">知识库和网络</option>
                       </select>
                     </label>
                     <label>工作区文件
                       <select id="fileModeSelect" aria-label="选择文件模式">
-                        <option value="auto">自动</option>
-                        <option value="off">关闭</option>
-                        <option value="required">必须使用</option>
+                        <option value="auto">按需查找</option>
+                        <option value="off">不查文件</option>
+                        <option value="required">优先查找</option>
                       </select>
                     </label>
-                    <details class="execution-advanced">
-                      <summary>高级控制</summary>
-                      <div class="execution-advanced-fields">
-                        <label>知识库
-                          <select id="knowledgeModeSelect" aria-label="选择知识库模式">
-                            <option value="auto">自动</option><option value="off">关闭</option><option value="required">必须使用</option>
-                          </select>
-                        </label>
-                        <label>网络
-                          <select id="webModeSelect" aria-label="选择网络模式">
-                            <option value="auto">自动</option><option value="off">关闭</option><option value="required">必须使用</option>
-                          </select>
-                        </label>
-                      </div>
-                    </details>
+                    <input id="knowledgeModeSelect" type="hidden" value="auto" />
+                    <input id="webModeSelect" type="hidden" value="auto" />
                   </div>
                 </details>
               </div>
@@ -154,7 +141,14 @@
         </aside>
 
         <aside id="runDrawer" class="run-drawer hidden" aria-label="运行详情">
-          <div class="drawer-header"><h2>运行详情</h2><button id="viewAllRunsButton" class="context-all-button" type="button">全部审计</button><button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button></div>
+          <div class="drawer-header">
+            <div class="run-drawer-tabs" role="tablist" aria-label="运行记录视图">
+              <button id="threadRunsTab" class="run-drawer-tab active" type="button" role="tab" aria-selected="true">运行详情</button>
+              <button id="retrievalDiagnosticsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">检索质量</button>
+              <button id="viewAllRunsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">全部审计</button>
+            </div>
+            <button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button>
+          </div>
           <div id="runFilters" class="run-filters hidden"><select id="runStatusFilter"><option value="">全部状态</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="awaiting_confirmation">待确认</option></select><select id="runTierFilter"><option value="">全部档位</option><option value="quick">快速</option><option value="standard">标准</option><option value="deep">深度</option></select><select id="runKnowledgeFilter"><option value="">资料使用不限</option><option value="used">使用了资料</option><option value="none">未使用资料</option></select></div>
           <div id="runList" class="run-list"></div>
           <div id="runDetail" class="run-detail">选择一条运行记录查看详情。</div>
@@ -167,20 +161,21 @@
               <span>管理当前 Agent 可使用的本地能力</span>
             </div>
           </header>
+          <div class="tabs">
+            <button class="tab active" data-tab="skills">技能</button>
+            <button class="tab" data-tab="apps">应用与工具</button>
+          </div>
           <div id="skillDropZone" class="skill-drop-zone">
+            <div class="skill-drop-icon" aria-hidden="true">＋</div>
             <div class="skill-drop-copy">
               <strong>导入技能包</strong>
-              <span>支持 JSON、Markdown、ZIP Skill 包；可直接选择或拖入文件</span>
+              <span>支持 JSON、Markdown 和 ZIP 格式；可拖入文件或从本机选择</span>
             </div>
             <div class="skill-file-control">
               <input id="skillFileInput" class="skill-file-input" type="file" aria-label="选择本地技能包" />
-              <label class="skill-file-action" for="skillFileInput">选择技能包</label>
+              <label class="skill-file-action" for="skillFileInput">选择文件</label>
               <span id="skillFileName" class="skill-file-name" aria-live="polite">未选择文件</span>
             </div>
-          </div>
-          <div class="tabs">
-            <button class="tab active" data-tab="skills">技能</button>
-            <button class="tab" data-tab="apps">应用</button>
           </div>
           <div id="skillsGrid" class="card-grid"></div>
           <div id="appsGrid" class="card-grid hidden"></div>

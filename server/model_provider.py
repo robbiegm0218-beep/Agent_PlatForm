@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from typing import Iterator
 
 
+class ProviderError(RuntimeError):
+    """Stable provider failure contract for runtime, UI and tests."""
+
+    def __init__(self, provider: str, kind: str, message: str, status_code: int | None = None):
+        self.provider = provider
+        self.kind = kind
+        self.status_code = status_code
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class DeepSeekConfig:
     api_key: str
@@ -48,14 +58,18 @@ class DeepSeekProvider:
     ) -> Iterator[dict]:
         with self._open_stream(messages, tools, model, max_output_tokens) as response:
             content_parts: list[str] = []
+            reasoning_parts: list[str] = []
             tool_calls = _ToolCallAccumulator()
             for delta in _iter_sse_deltas(response):
                 content = delta.get("content")
                 if content:
                     content_parts.append(content)
                     yield {"type": "content", "text": content}
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    reasoning_parts.append(reasoning)
                 tool_calls.add(delta.get("tool_calls") or [])
-            yield {
+            message = {
                 "type": "done",
                 "message": {
                     "role": "assistant",
@@ -63,6 +77,10 @@ class DeepSeekProvider:
                     "tool_calls": tool_calls.value(),
                 },
             }
+            reasoning_characters = len("".join(reasoning_parts))
+            if reasoning_characters:
+                message["message"]["provider_reasoning_characters"] = reasoning_characters
+            yield message
 
     def _open_stream(self, messages: list[dict], tools: list[dict], model: str, max_output_tokens: int):
         payload = {
@@ -92,16 +110,19 @@ class DeepSeekProvider:
             )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"{self._config.provider_name} 请求失败：{exc.code} {detail}") from exc
+            kind = "authentication" if exc.code in {401, 403} else "rate_limited" if exc.code == 429 else "upstream"
+            safe_detail = detail[:600] if detail else "上游服务未返回错误详情"
+            raise ProviderError(self._config.provider_name, kind, f"{self._config.provider_name} 请求失败：{exc.code} {safe_detail}", exc.code) from exc
         except urllib.error.URLError as exc:
             reason = str(exc.reason)
             if "CERTIFICATE_VERIFY_FAILED" in reason:
-                raise RuntimeError(
+                raise ProviderError(
+                    self._config.provider_name, "certificate",
                     f"{self._config.provider_name} 请求失败：本机 HTTPS 证书校验失败。"
                     "本地开发可在 .env 中设置 DEEPSEEK_SSL_VERIFY=false；"
                     "生产环境建议安装正确 CA 证书后保持校验开启。"
                 ) from exc
-            raise RuntimeError(f"{self._config.provider_name} 请求失败：{reason}") from exc
+            raise ProviderError(self._config.provider_name, "network", f"{self._config.provider_name} 请求失败：{reason}") from exc
 
     def _ssl_context(self):
         if not self._config.ssl_verify:
@@ -154,13 +175,21 @@ def _iter_sse_deltas(response) -> Iterator[dict]:
 
 def _read_sse_message(response) -> dict:
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls = _ToolCallAccumulator()
     for delta in _iter_sse_deltas(response):
         if delta.get("content"):
             content_parts.append(delta["content"])
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            reasoning_parts.append(reasoning)
         tool_calls.add(delta.get("tool_calls") or [])
-    return {
+    message = {
         "role": "assistant",
         "content": "".join(content_parts),
         "tool_calls": tool_calls.value(),
     }
+    reasoning_characters = len("".join(reasoning_parts))
+    if reasoning_characters:
+        message["provider_reasoning_characters"] = reasoning_characters
+    return message

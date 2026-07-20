@@ -46,6 +46,9 @@ class SingleAgentLoop:
 
         for _step in range(execution_context["max_tool_steps"]):
             message = yield from self._run_model(messages, tool_definitions, execution_context)
+            reasoning_characters = int(message.get("provider_reasoning_characters") or 0)
+            if reasoning_characters:
+                on_event("provider_reasoning_available", {"characters": reasoning_characters})
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 for tool_id in sorted(allowed_tool_ids - called_tool_ids):
@@ -72,6 +75,9 @@ class SingleAgentLoop:
 
         messages.append({"role": "system", "content": "工具调用已达到上限。请基于已获得的信息直接给出最终回答，不要再调用工具。"})
         message = yield from self._run_model(messages, [], execution_context)
+        reasoning_characters = int(message.get("provider_reasoning_characters") or 0)
+        if reasoning_characters:
+            on_event("provider_reasoning_available", {"characters": reasoning_characters})
         content = (message.get("content") or "").strip()
         if not content:
             raise RuntimeError("工具调用达到上限且模型未返回最终回答")

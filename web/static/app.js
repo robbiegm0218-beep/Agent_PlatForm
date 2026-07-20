@@ -827,11 +827,11 @@ async function loadRunDetail(runId) {
       link.disabled = true;
       try { await downloadArtifact(artifact); } finally { link.disabled = false; }
     },
-    onFeedback: async (id, citationCorrect, feedback, button) => {
+    onFeedback: async (id, payload, feedback, button) => {
       button.disabled = true;
       try {
-        await api(`/api/runs/${id}/feedback`, { method: "POST", body: JSON.stringify({ rating: citationCorrect ? 1 : -1, citation_correct: citationCorrect }) });
-        feedback.replaceChildren(Object.assign(document.createElement("span"), { textContent: "已记录引用评价" }));
+        await api(`/api/runs/${id}/feedback`, { method: "POST", body: JSON.stringify(payload) });
+        await loadRunDetail(id);
       } catch (error) { button.disabled = false; button.textContent = error.message || "提交失败"; }
     },
     onCancel: async (id, button) => {
@@ -840,6 +840,33 @@ async function loadRunDetail(runId) {
       catch (error) { button.disabled = false; button.textContent = error.message || "取消失败"; }
     },
   });
+}
+
+async function loadRetrievalDiagnostics() {
+  // Diagnostics own the detail area. Do not leave the previous thread/audit run
+  // list visible while this tab is active.
+  els.runList.innerHTML = "";
+  const data = await api("/api/retrieval-diagnostics");
+  let governance;
+  try {
+    const [suggestionData, policyData] = await Promise.all([api("/api/retrieval-suggestions"), api("/api/retrieval-policies")]);
+    const reload = async (request, button) => {
+      button.disabled = true;
+      try { await request(); await loadRetrievalDiagnostics(); }
+      catch (error) { button.disabled = false; button.textContent = error.message || "操作失败"; }
+    };
+    governance = {
+      suggestions: suggestionData.suggestions,
+      policies: policyData.policies,
+      onCreateCandidate: (id, button) => reload(() => api(`/api/retrieval-suggestions/${id}/candidate`, { method: "POST", body: "{}" }), button),
+      onEvaluate: (version, button) => reload(() => api(`/api/retrieval-policies/${version}/evaluate`, { method: "POST", body: "{}" }), button),
+      onPublish: (version, button) => reload(() => api(`/api/retrieval-policies/${version}/publish`, { method: "POST", body: "{}" }), button),
+      onRollback: (button) => reload(() => api("/api/retrieval-policies/rollback", { method: "POST", body: "{}" }), button),
+    };
+  } catch (_error) {
+    // Policy controls are deliberately hidden from non-administrators.
+  }
+  auditView.renderRetrievalDiagnostics(els, data, { onSelectRun: loadRunDetail, governance });
 }
 
 function renderMessages() {
@@ -853,11 +880,11 @@ function renderMessages() {
     return;
   }
   state.messages.forEach((message) => {
-    appendMessage(message.role, message.content);
+    appendMessage(message.role, message.content, message.run_id);
   });
 }
 
-function appendMessage(role, content) {
+function appendMessage(role, content, runId = "") {
   const wrapper = document.createElement("article");
   wrapper.className = `message ${role}`;
   const label = role === "user" ? "你" : "Agent_Platform";
@@ -868,8 +895,106 @@ function appendMessage(role, content) {
   `;
   renderMessageContent(wrapper.querySelector(".message-content"), content, role);
   els.messages.appendChild(wrapper);
+  if (role === "assistant" && runId) {
+    appendSavedConversationRun(wrapper, runId).catch(() => {
+      // A legacy or unavailable run must not prevent its answer from being read.
+    });
+  }
   els.messages.scrollTop = els.messages.scrollHeight;
   return wrapper.querySelector(".message-content");
+}
+
+async function appendSavedConversationRun(wrapper, runId) {
+  const data = await api(`/api/runs/${runId}`);
+  runTrace.appendSavedRunTrace(wrapper, data);
+  appendChatAnswerFeedback(wrapper, runId, data);
+  await appendChatCitationFeedback(wrapper, runId, data);
+}
+
+function appendChatAnswerFeedback(wrapper, runId, detail) {
+  if (wrapper.querySelector(".answer-feedback")) return;
+  const feedback = document.createElement("div"); feedback.className = "answer-feedback";
+  const label = document.createElement("span"); label.textContent = "这次回答有帮助吗？";
+  const helpful = document.createElement("button"); helpful.type = "button"; helpful.className = "secondary"; helpful.textContent = "👍 有帮助";
+  const unhelpful = document.createElement("button"); unhelpful.type = "button"; unhelpful.className = "secondary"; unhelpful.textContent = "👎 没帮助";
+  const savedRating = detail.feedback?.rating;
+  const setSelected = (rating) => {
+    helpful.classList.toggle("active", rating === 1);
+    unhelpful.classList.toggle("active", rating === -1);
+  };
+  const save = async (rating, button) => {
+    helpful.disabled = true; unhelpful.disabled = true;
+    try {
+      await api(`/api/runs/${runId}/feedback`, { method: "POST", body: JSON.stringify({ rating }) });
+      setSelected(rating);
+    } catch (error) {
+      button.textContent = error.message || "保存失败";
+    } finally {
+      helpful.disabled = false; unhelpful.disabled = false;
+    }
+  };
+  helpful.addEventListener("click", () => save(1, helpful));
+  unhelpful.addEventListener("click", () => save(-1, unhelpful));
+  setSelected(savedRating);
+  feedback.append(label, helpful, unhelpful);
+  wrapper.append(feedback);
+}
+
+async function appendChatCitationFeedback(wrapper, runId, detail = null) {
+  const data = detail || await api(`/api/runs/${runId}`);
+  let context = {};
+  try { context = JSON.parse(data.run.execution_context || "{}"); } catch (_error) { return; }
+  const references = new Map();
+  (context.knowledge_refs || []).forEach((reference) => {
+    if (reference?.document_id && !references.has(reference.document_id)) references.set(reference.document_id, reference);
+  });
+  if (!references.size || wrapper.querySelector(".chat-citation-feedback")) return;
+
+  const saved = new Map((data.citation_feedback_items || []).map((item) => [item.document_id, item]));
+  const feedback = document.createElement("section");
+  feedback.className = "citation-feedback chat-citation-feedback";
+  feedback.append(Object.assign(document.createElement("h3"), { textContent: "引用评价" }));
+  feedback.append(Object.assign(document.createElement("p"), { textContent: "评价本次回答实际命中的知识库资料；反馈将用于检索质量分析。" }));
+  const entries = [];
+  references.forEach((reference, documentId) => {
+    const previous = saved.get(documentId);
+    const entry = document.createElement("div"); entry.className = "citation-feedback-item";
+    const name = document.createElement("strong"); name.textContent = reference.filename || "未命名资料";
+    const status = document.createElement("select");
+    [["", "暂不评价"], ["correct", "引用正确"], ["incorrect", "引用有误"]].forEach(([value, label]) => {
+      const option = document.createElement("option"); option.value = value; option.textContent = label; status.appendChild(option);
+    });
+    status.value = previous ? (previous.citation_correct ? "correct" : "incorrect") : "";
+    const reason = document.createElement("select"); reason.className = "hidden";
+    [["", "选择问题原因"], ["wrong_document", "文档不相关"], ["wrong_passage", "命中片段不相关"], ["outdated", "资料已过期"], ["answer_misused", "回答误用了资料"], ["missing_evidence", "缺少应有资料"]].forEach(([value, label]) => {
+      const option = document.createElement("option"); option.value = value; option.textContent = label; reason.appendChild(option);
+    });
+    reason.value = previous?.reason_code || "";
+    const note = document.createElement("input"); note.type = "text"; note.maxLength = 800; note.placeholder = "备注（可选）"; note.className = "hidden"; note.value = previous?.note || "";
+    const sync = () => { const incorrect = status.value === "incorrect"; reason.classList.toggle("hidden", !incorrect); note.classList.toggle("hidden", !incorrect); };
+    status.addEventListener("change", sync); sync();
+    entry.append(name, status, reason, note); feedback.append(entry);
+    entries.push({ documentId, status, reason, note });
+  });
+  const actions = document.createElement("div"); actions.className = "confirmation-actions";
+  const allCorrect = document.createElement("button"); allCorrect.type = "button"; allCorrect.className = "secondary"; allCorrect.textContent = "全部标记为准确";
+  allCorrect.addEventListener("click", () => entries.forEach((entry) => { entry.status.value = "correct"; entry.status.dispatchEvent(new Event("change")); }));
+  const save = document.createElement("button"); save.type = "button"; save.textContent = saved.size ? "更新引用评价" : "保存引用评价";
+  save.addEventListener("click", async () => {
+    const selected = entries.filter((entry) => entry.status.value);
+    const invalid = selected.find((entry) => entry.status.value === "incorrect" && !entry.reason.value);
+    if (!selected.length) { save.textContent = "请至少评价一份资料"; return; }
+    if (invalid) { save.textContent = "请为有误引用选择原因"; invalid.reason.focus(); return; }
+    save.disabled = true;
+    try {
+      const citationItems = selected.map((entry) => ({ document_id: entry.documentId, citation_correct: entry.status.value === "correct", reason_code: entry.status.value === "incorrect" ? entry.reason.value : "", note: entry.status.value === "incorrect" ? entry.note.value : "" }));
+      await api(`/api/runs/${runId}/feedback`, { method: "POST", body: JSON.stringify({ rating: citationItems.every((item) => item.citation_correct) ? 1 : -1, citation_correct: citationItems.every((item) => item.citation_correct), citation_items: citationItems }) });
+      save.textContent = "已保存引用评价";
+    } catch (error) {
+      save.disabled = false; save.textContent = error.message || "保存失败";
+    }
+  });
+  actions.append(allCorrect, save); feedback.append(actions); wrapper.append(feedback);
 }
 
 function renderMessageContent(element, content, role = "assistant") {
@@ -1015,6 +1140,7 @@ async function sendMessage(content, { retry = false } = {}) {
   let assistant;
   let executionTimer;
   let assistantContent = "";
+  let completedRunId = "";
   let awaitingConfirmation = false;
   let cancelled = false;
   try {
@@ -1033,6 +1159,7 @@ async function sendMessage(content, { retry = false } = {}) {
     await chatStream.consume(response, (event) => {
         if (event.event === "meta") {
           state.currentThreadId = event.data.thread_id;
+          completedRunId = event.data.run_id || "";
           state.pendingFolderId = "";
           persistWorkspaceState();
           appendExecutionTrace(assistant, `已选择模型：${event.data.model}`);
@@ -1072,7 +1199,8 @@ async function sendMessage(content, { retry = false } = {}) {
     appendExecutionTrace(assistant, "已生成最终回答");
     executionTimer.stop("已完成");
     renderMessageContent(assistant.content, assistantContent);
-    state.messages.push({ role: "assistant", content: assistantContent });
+    state.messages.push({ role: "assistant", content: assistantContent, run_id: completedRunId });
+    if (completedRunId) await appendChatCitationFeedback(assistant.wrapper, completedRunId);
   } catch (error) {
     const message = error.message || "发送失败";
     if (assistant) {
@@ -1209,7 +1337,7 @@ els.chatForm.addEventListener("submit", async (event) => {
   }
 });
 
-[els.sourceModeSelect, els.knowledgeModeSelect, els.webModeSelect, els.fileModeSelect]
+[els.sourceModeSelect, els.fileModeSelect]
   .forEach((select) => select.addEventListener("change", executionMode.scheduleRoutePreview));
 
 [els.modelSelect, els.taskModeSelect].forEach((select) => select.addEventListener("change", () => {
@@ -1270,18 +1398,46 @@ els.newThreadButton.addEventListener("click", () => {
 
 els.threadSearch.addEventListener("input", renderThreads);
 
-els.runDetailsButton.addEventListener("click", () => {
+function setRunDrawerTab(tab) {
+  [[els.threadRunsTab, "thread"], [els.retrievalDiagnosticsButton, "diagnostics"], [els.viewAllRunsButton, "audit"]].forEach(([button, name]) => {
+    const active = name === tab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+}
+
+async function showThreadRuns() {
   els.runDrawer.classList.remove("hidden");
   els.runFilters.classList.add("hidden");
-  renderRuns();
-  if (state.runs[0]) loadRunDetail(state.runs[0].id);
-});
+  setRunDrawerTab("thread");
+  // `state.runs` is also used by the global audit view. Always reload it here
+  // so switching back cannot display audit records as this conversation's runs.
+  await loadRuns();
+  if (state.runs[0]) {
+    await loadRunDetail(state.runs[0].id);
+  } else {
+    els.runDetail.textContent = state.currentThreadId
+      ? "当前对话还没有运行记录。"
+      : "请先选择一个对话。";
+  }
+}
+
+els.runDetailsButton.addEventListener("click", () => showThreadRuns().catch((error) => { els.runDetail.textContent = error.message || "无法加载运行详情"; }));
+els.threadRunsTab.addEventListener("click", () => showThreadRuns().catch((error) => { els.runDetail.textContent = error.message || "无法加载运行详情"; }));
 
 els.closeRunDrawer.addEventListener("click", () => els.runDrawer.classList.add("hidden"));
 els.viewAllRunsButton.addEventListener("click", async () => {
   els.runDrawer.classList.remove("hidden");
   els.runFilters.classList.remove("hidden");
+  setRunDrawerTab("audit");
   await loadAuditRuns();
+});
+els.retrievalDiagnosticsButton.addEventListener("click", async () => {
+  els.runDrawer.classList.remove("hidden");
+  els.runFilters.classList.add("hidden");
+  setRunDrawerTab("diagnostics");
+  try { await loadRetrievalDiagnostics(); }
+  catch (error) { els.runDetail.textContent = error.message || "无法加载检索质量诊断"; }
 });
 [els.runStatusFilter, els.runTierFilter, els.runKnowledgeFilter].forEach((select) => {
   select.addEventListener("change", () => loadAuditRuns().catch((error) => { els.runDetail.textContent = error.message; }));
@@ -1464,6 +1620,7 @@ document.querySelectorAll(".tab").forEach((button) => {
     button.classList.add("active");
     const tab = button.dataset.tab;
     els.skillsGrid.classList.toggle("hidden", tab !== "skills");
+    els.skillDropZone.classList.toggle("hidden", tab !== "skills");
     els.appsGrid.classList.toggle("hidden", tab !== "apps");
   });
 });

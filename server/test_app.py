@@ -167,6 +167,31 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(source["title"], "Agent 平台文档")
         self.assertEqual(source["url"], "https://example.test/agent")
 
+    def test_completed_run_keeps_reasoning_summary_for_later_viewing(self):
+        events = self.chat({"thread_id": "", "content": "请说明平台能力"})
+        meta = next(event["data"] for event in events if event["event"] == "meta")
+
+        detail = self.request_json(f"/api/runs/{meta['run_id']}", token=self.token)
+        summary = next(event for event in detail["events"] if event["type"] == "reasoning_summary")
+        self.assertTrue(json.loads(summary["payload"])["items"])
+
+    def test_thread_context_deduplicates_knowledge_sources_by_document(self):
+        events = self.chat({"thread_id": "", "content": "你好"})
+        meta = next(event["data"] for event in events if event["event"] == "meta")
+        with app.db() as conn:
+            context = json.loads(conn.execute("SELECT execution_context FROM runs WHERE id = ?", (meta["run_id"],)).fetchone()["execution_context"])
+            context["knowledge_refs"] = [
+                {"document_id": "doc_1", "filename": "同一份资料.md", "position": 0, "excerpt": "第一处命中"},
+                {"document_id": "doc_1", "filename": "同一份资料.md", "position": 1, "excerpt": "第二处命中"},
+                {"document_id": "doc_2", "filename": "另一份资料.md", "position": 0, "excerpt": "第三处命中"},
+            ]
+            conn.execute("UPDATE runs SET execution_context = ? WHERE id = ?", (json.dumps(context, ensure_ascii=False), meta["run_id"]))
+
+        thread_context = self.request_json(f"/api/threads/{meta['thread_id']}/context", token=self.token)
+        sources = [item for item in thread_context["sources"] if item["kind"] == "knowledge"]
+        self.assertEqual([item["filename"] for item in sources], ["同一份资料.md", "另一份资料.md"])
+        self.assertEqual(sources[0]["excerpt"], "第一处命中")
+
     def test_skill_zip_upload_versions_and_restore(self):
         original_skills_dir = app.SKILLS_DIR
         original_history_dir = app.SKILL_HISTORY_DIR
@@ -557,6 +582,9 @@ class AgentPlatformApiTests(unittest.TestCase):
         events = self.chat({"thread_id": "", "content": "请制定一个完整的产品竞品调研方案"})
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        thread = self.request_json(f"/api/threads/{thread_id}", token=self.token)
+        assistant_message = next(message for message in thread["messages"] if message["role"] == "assistant")
+        self.assertEqual(assistant_message["run_id"], run["id"])
         context = json.loads(run["execution_context"])
         self.assertEqual(run["model"], app.DEEPSEEK_DEEP_MODEL)
         self.assertEqual(context["task_tier"], "deep")
@@ -671,9 +699,15 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(document["scope"], "project")
         self.assertEqual(document["project_space_id"], space["id"])
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('项目专属指标')}", token=self.token)["results"], [])
+        general = self.request_json("/api/knowledge", {
+            "filename": "通用资料.md", "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("通用指标是 99".encode("utf-8")).decode("ascii"),
+        }, self.token)["document"]
         member_space = self.request_json(f"/api/folders/{space['id']}", token=member_token)
         self.assertEqual(member_space["knowledge_documents"][0]["filename"], "项目资料.md")
         self.assertEqual(len(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"])), 1)
+        matches = app.search_knowledge(self.request_json("/api/me", token=self.token)["user"]["id"], "通用指标", project_space_id=space["id"])
+        self.assertEqual(matches[0]["document_id"], general["id"])
         self.request_json(f"/api/folders/{space['id']}", token=self.token, method="DELETE")
         self.assertEqual(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"]), [])
 
@@ -849,13 +883,15 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         events = self.chat({"thread_id": "", "content": "请说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
-        self.assertIn("参考资料：product.md（片段 1 · 摘录：", answer)
+        self.assertIn("参考资料：product.md", answer)
+        self.assertNotIn("片段", answer)
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         context = json.loads(run["execution_context"])
         self.assertEqual(context["knowledge_refs"][0]["filename"], "product.md")
         self.assertEqual(context["knowledge_route"], "retrieved")
         self.assertEqual(context["knowledge_match_count"], 1)
+        self.assertEqual(context["retrieval_policy"]["version"], "lexical-retrieval-v1")
         self.assertIn("knowledge_retrieved", [event["type"] for event in self.request_json(f"/api/runs/{run['id']}", token=self.token)["events"]])
         thread_context = self.request_json(f"/api/threads/{thread_id}/context", token=self.token)
         self.assertEqual(thread_context["sources"][0]["filename"], "product.md")
@@ -871,6 +907,36 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(metrics["feedback"]["citation_assessed"], 1)
         self.assertEqual(metrics["feedback"]["citation_accuracy"], 1.0)
 
+        citation_item = context["knowledge_refs"][0]
+        detailed_feedback = self.request_json(
+            f"/api/runs/{run['id']}/feedback",
+            {"rating": -1, "citation_correct": False, "citation_items": [{
+                "document_id": citation_item["document_id"], "citation_correct": False,
+                "reason_code": "wrong_document", "note": "文档与问题无关",
+            }]},
+            self.token,
+        )
+        self.assertEqual(detailed_feedback["citation_items"][0]["reason_code"], "wrong_document")
+        run_detail = self.request_json(f"/api/runs/{run['id']}", token=self.token)
+        self.assertEqual(len(run_detail["citation_feedback_items"]), 1)
+        self.assertEqual(run_detail["citation_feedback_items"][0]["document_id"], citation_item["document_id"])
+        self.assertEqual(run_detail["citation_feedback_items"][0]["position"], citation_item["position"])
+        metrics = self.request_json("/api/metrics", token=self.token)
+        self.assertEqual(metrics["feedback"]["document_citation_accuracy"], 0.0)
+        self.assertFalse(metrics["feedback"]["sufficient_for_retrieval_claim"])
+        self.assertEqual(metrics["retrieval_policy"]["version"], "lexical-retrieval-v1")
+        diagnostics = self.request_json("/api/retrieval-diagnostics", token=self.token)
+        self.assertEqual(diagnostics["sample"]["state"], "insufficient")
+        self.assertEqual(diagnostics["sample"]["document_feedback_count"], 1)
+        self.assertEqual(diagnostics["reason_counts"], {"wrong_document": 1})
+        self.assertEqual(diagnostics["documents"][0]["document_id"], citation_item["document_id"])
+        self.assertEqual(diagnostics["documents"][0]["risk_level"], "observe")
+        self.assertEqual(diagnostics["documents"][0]["reference"]["run_id"], run["id"])
+        self.assertEqual(diagnostics["documents"][0]["reference"]["position"], citation_item["position"])
+        self.assertIn("coverage", diagnostics["documents"][0]["reference"]["score_breakdown"])
+        self.assertEqual(diagnostics["policy_feedback"][0]["retrieval_policy_version"], "lexical-retrieval-v1")
+        self.assertEqual(diagnostics["policy_feedback"][0]["state"], "observing")
+
         generic_events = self.chat({"thread_id": thread_id, "content": "请分析一下这个平台的界面布局"})
         generic_answer = "".join(event["data"].get("content", "") for event in generic_events)
         generic_run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
@@ -881,6 +947,43 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])
+
+    def test_knowledge_citations_show_each_matched_document_once(self):
+        answer = app.append_knowledge_sources("回答", [
+            {"filename": "通用资料.md", "position": 0, "excerpt": "第一段"},
+            {"filename": "通用资料.md", "position": 1, "excerpt": "第二段"},
+            {"filename": "项目资料.md", "position": 0, "excerpt": "第三段"},
+        ], "retrieved")
+
+        self.assertEqual(answer, "回答\n\n参考资料：通用资料.md、项目资料.md")
+
+    def test_retrieval_policy_candidate_evaluation_publish_and_rollback(self):
+        user_id = self.request_json("/api/me", token=self.token)["user"]["id"]
+        timestamp = app.now()
+        with app.db() as conn:
+            conn.executemany("""INSERT INTO citation_feedback_items
+                (id, run_id, user_id, document_id, position, citation_correct, reason_code, note, retrieval_policy_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 0, 1, ?, '', 'lexical-retrieval-v1', ?, ?)""", [
+                (f"feedback_{index}", f"run_{index}", user_id, f"doc_{index}", "missing_evidence" if index < 3 else "", timestamp, timestamp)
+                for index in range(20)
+            ])
+        suggestions = self.request_json("/api/retrieval-suggestions", token=self.token)["suggestions"]
+        self.assertEqual(suggestions[0]["changed_variable"], "limit")
+        candidate = self.request_json(f"/api/retrieval-suggestions/{suggestions[0]['id']}/candidate", {}, self.token)["policy"]
+        self.assertEqual(candidate["config"]["limit"], 5)
+        evaluated = self.request_json(f"/api/retrieval-policies/{candidate['version']}/evaluate", {}, self.token)
+        self.assertEqual(evaluated["status"], "verified")
+        with app.db() as conn:
+            conn.execute("""INSERT INTO retrieval_policies
+                (version, config_json, status, parent_version, changed_variable, created_at)
+                VALUES ('candidate-bad-neighbors', ?, 'candidate', 'lexical-retrieval-v1', 'neighbor_radius', ?)""", (json.dumps({"limit": 4, "max_excerpt_chars": 900, "max_total_chars": 2800, "neighbor_radius": 0}), app.now()))
+        blocked = self.request_json("/api/retrieval-policies/candidate-bad-neighbors/evaluate", {}, self.token)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["experiment"]["decision"], "rollback")
+        published = self.request_json(f"/api/retrieval-policies/{candidate['version']}/publish", {}, self.token)
+        self.assertEqual(published["active"]["version"], candidate["version"])
+        rolled_back = self.request_json("/api/retrieval-policies/rollback", {}, self.token)
+        self.assertEqual(rolled_back["active"]["version"], "lexical-retrieval-v1")
 
     def test_xlsx_knowledge_extraction_preserves_sheet_and_cell_text(self):
         workbook = io.BytesIO()

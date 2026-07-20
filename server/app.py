@@ -40,7 +40,9 @@ from server.web_search import WebSearchClient, WebSearchConfig
 from server.mcp_client import McpServerConfig, McpToolManager
 from server.tool_policy import ToolPolicy
 from server.task_router import TaskRouter, classify_knowledge_intent
-from server.knowledge_retrieval import KnowledgeRetriever, query_terms
+from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, query_terms, retrieval_policy_snapshot
+from server.retrieval_governance import apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
+from server.evaluate_knowledge_retrieval import DEFAULT_FIXTURE as RETRIEVAL_EVAL_FIXTURE, evaluate as evaluate_retrieval, validate_cases as validate_retrieval_cases
 from server.structured_context import StructuredContextBuilder
 from server.memory_policy import MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content
 from server.safe_web_reader import SafeWebPageReader
@@ -788,6 +790,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
+                run_id TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at INTEGER NOT NULL
@@ -819,6 +822,40 @@ def init_db() -> None:
                 rating INTEGER NOT NULL,
                 note TEXT DEFAULT '',
                 citation_correct INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS citation_feedback_items (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                citation_correct INTEGER NOT NULL,
+                reason_code TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                retrieval_policy_version TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(run_id, user_id, document_id)
+            );
+            CREATE TABLE IF NOT EXISTS retrieval_policies (
+                version TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                parent_version TEXT NOT NULL DEFAULT '',
+                changed_variable TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                experiment_json TEXT NOT NULL DEFAULT '{}',
+                created_by_user_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                activated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS retrieval_policy_events (
+                id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_user_id TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS manual_tool_invocations (
@@ -936,6 +973,7 @@ def init_db() -> None:
         ensure_column(conn, "threads", "handoff_summary", "TEXT DEFAULT ''")
         ensure_column(conn, "threads", "structured_context", "TEXT DEFAULT '{}'")
         ensure_column(conn, "threads", "folder_id", "TEXT DEFAULT ''")
+        ensure_column(conn, "messages", "run_id", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "thread_folders", "section", "TEXT NOT NULL DEFAULT 'project'")
         ensure_column(conn, "thread_folders", "sort_order", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "knowledge_documents", "scope", "TEXT NOT NULL DEFAULT 'general'")
@@ -959,6 +997,13 @@ def init_db() -> None:
         ensure_column(conn, "runs", "phase_updated_at", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "resume_policy", "TEXT DEFAULT '{}'")
         ensure_column(conn, "run_feedback", "citation_correct", "INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_citation_feedback_items_user ON citation_feedback_items(user_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_citation_feedback_items_document ON citation_feedback_items(document_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieval_policy_events_version ON retrieval_policy_events(version, created_at DESC)")
+        default_policy = retrieval_policy_snapshot(KNOWLEDGE_RETRIEVER.config)
+        conn.execute("""INSERT OR IGNORE INTO retrieval_policies
+            (version, config_json, status, created_at, activated_at)
+            VALUES (?, ?, 'active', ?, ?)""", (default_policy["version"], json.dumps(default_policy["config"], ensure_ascii=False), now(), now()))
         ensure_column(conn, "run_events", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(conn, "run_events", "sequence", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "sessions", "expires_at", "INTEGER DEFAULT 0")
@@ -1025,6 +1070,77 @@ def safe_json_object(value: object) -> dict:
     except (TypeError, json.JSONDecodeError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+CITATION_FEEDBACK_REASON_CODES = {
+    "wrong_document",
+    "wrong_passage",
+    "outdated",
+    "answer_misused",
+    "missing_evidence",
+}
+
+
+def validate_citation_feedback_items(value: object, references: object) -> list[dict]:
+    """Validate document-level feedback against the references frozen for a Run."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("引用明细必须是列表")
+    available: dict[str, dict] = {}
+    for reference in references if isinstance(references, list) else []:
+        if not isinstance(reference, dict):
+            continue
+        document_id = str(reference.get("document_id", "")).strip()
+        if document_id and document_id not in available:
+            available[document_id] = reference
+    if len(value) > len(available):
+        raise ValueError("引用明细数量超过本次实际命中文档数")
+    items: list[dict] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("引用明细格式无效")
+        document_id = str(item.get("document_id", "")).strip()
+        if not document_id or document_id not in available or document_id in seen:
+            raise ValueError("引用文档不存在于本次运行")
+        citation_correct = item.get("citation_correct")
+        if not isinstance(citation_correct, bool):
+            raise ValueError("引用明细必须标记为正确或不正确")
+        reason_code = str(item.get("reason_code", "")).strip()
+        if citation_correct and reason_code:
+            raise ValueError("引用正确时不应填写错误原因")
+        if not citation_correct and reason_code not in CITATION_FEEDBACK_REASON_CODES:
+            raise ValueError("引用有误时必须选择有效原因")
+        note = str(item.get("note", ""))[:800]
+        reference = available[document_id]
+        position = reference.get("position", 0)
+        items.append({
+            "document_id": document_id,
+            "position": position if isinstance(position, int) else 0,
+            "citation_correct": citation_correct,
+            "reason_code": reason_code,
+            "note": note,
+        })
+        seen.add(document_id)
+    return items
+
+
+def active_retrieval_policy() -> tuple[str, RetrievalConfig]:
+    with db() as conn:
+        row = conn.execute("SELECT version, config_json FROM retrieval_policies WHERE status = 'active' ORDER BY activated_at DESC, created_at DESC LIMIT 1").fetchone()
+    if not row:
+        return retrieval_policy_snapshot(KNOWLEDGE_RETRIEVER.config)["version"], KNOWLEDGE_RETRIEVER.config
+    return row["version"], config_from_json(safe_json_object(row["config_json"]), KNOWLEDGE_RETRIEVER.config)
+
+
+def active_retrieval_policy_snapshot() -> dict:
+    version, config = active_retrieval_policy()
+    return retrieval_policy_snapshot(config, version)
+
+
+def is_platform_admin(user: dict) -> bool:
+    return str(user.get("email", "")).lower() == bootstrap_admin_credentials()[0]
 
 
 def estimate_tokens(text: str) -> int:
@@ -1174,7 +1290,8 @@ def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list
 
 def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "") -> list[dict]:
     rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id)
-    retriever = KNOWLEDGE_RETRIEVER
+    _, active_config = active_retrieval_policy()
+    retriever = KnowledgeRetriever(active_config)
     if limit != retriever.config.limit:
         retriever = KnowledgeRetriever(replace(retriever.config, limit=min(max(limit, 1), 20)))
     return retriever.search(query, rows)
@@ -1260,6 +1377,7 @@ def build_execution_context(
     return {
         "version": 1,
         "decision_policy": policy_snapshot(),
+        "retrieval_policy": active_retrieval_policy_snapshot(),
         "user_id": user_id,
         "model": task_profile["model"],
         "task_tier": task_profile["task_tier"],
@@ -1316,6 +1434,8 @@ def event_summary(event_type: str, payload: dict) -> str:
         return "已根据质量检查修订回答"
     if event_type == "reflection_completed":
         return f"质量检查：{payload.get('summary', '已完成')}"
+    if event_type == "provider_reasoning_available":
+        return "模型提供了推理数据，已记录可审计摘要"
     if event_type == "knowledge_retrieved":
         return f"本地知识库命中 {payload.get('count', 0)} 个资料片段"
     if event_type == "knowledge_no_match":
@@ -1490,6 +1610,15 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/metrics":
             self.get_metrics(user)
             return
+        if self.path == "/api/retrieval-diagnostics":
+            self.get_retrieval_diagnostics(user)
+            return
+        if self.path == "/api/retrieval-suggestions":
+            self.list_retrieval_suggestions(user)
+            return
+        if self.path == "/api/retrieval-policies":
+            self.list_retrieval_policies(user)
+            return
         if self.path.startswith("/api/memories"):
             self.list_memories(user)
             return
@@ -1613,6 +1742,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/runs/") and self.path.endswith("/feedback"):
             self.create_run_feedback(user)
+            return
+        if self.path.startswith("/api/retrieval-suggestions/") and self.path.endswith("/candidate"):
+            self.create_retrieval_candidate(user)
+            return
+        if self.path.startswith("/api/retrieval-policies/") and self.path.endswith("/evaluate"):
+            self.evaluate_retrieval_candidate(user)
+            return
+        if self.path.startswith("/api/retrieval-policies/") and self.path.endswith("/publish"):
+            self.publish_retrieval_policy(user)
+            return
+        if self.path == "/api/retrieval-policies/rollback":
+            self.rollback_retrieval_policy(user)
             return
         if self.path.startswith("/api/tools/") and self.path.endswith("/execute"):
             self.execute_manual_tool(user)
@@ -1834,7 +1975,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
 
         sources: list[dict] = []
-        seen_sources: set[tuple[str, int]] = set()
+        seen_knowledge_documents: set[str] = set()
         seen_web_urls: set[str] = set()
         for run in runs:
             context = safe_json_object(run["execution_context"])
@@ -1843,9 +1984,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     continue
                 document_id = str(reference.get("document_id", ""))
                 position = reference.get("position")
-                if not document_id or not isinstance(position, int) or (document_id, position) in seen_sources:
+                if not document_id or not isinstance(position, int) or document_id in seen_knowledge_documents:
                     continue
-                seen_sources.add((document_id, position))
+                seen_knowledge_documents.add(document_id)
                 sources.append({
                     "kind": "knowledge",
                     "document_id": document_id,
@@ -2205,7 +2346,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             artifact = conn.execute(
                 "SELECT * FROM artifacts WHERE run_id = ?", (run_id,)
             ).fetchone()
-        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "confirmations": [row_to_dict(item) for item in approvals], "artifact": row_to_dict(artifact) if artifact else None})
+            feedback = conn.execute("SELECT * FROM run_feedback WHERE run_id = ? AND user_id = ?", (run_id, user["id"])).fetchone()
+            citation_feedback_items = conn.execute("""SELECT document_id, position, citation_correct, reason_code, note,
+                retrieval_policy_version, created_at, updated_at FROM citation_feedback_items
+                WHERE run_id = ? AND user_id = ? ORDER BY created_at ASC, id ASC""", (run_id, user["id"])).fetchall()
+        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "confirmations": [row_to_dict(item) for item in approvals], "artifact": row_to_dict(artifact) if artifact else None, "feedback": row_to_dict(feedback) if feedback else None, "citation_feedback_items": [row_to_dict(item) for item in citation_feedback_items]})
 
     def resolve_confirmation(self, user: dict) -> None:
         run_id = self.path.split("/")[-2]
@@ -2260,15 +2405,38 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if citation_correct is not None and not isinstance(citation_correct, bool):
             self.send_error_json("引用评价必须为布尔值")
             return
+        updates_citation_items = "citation_items" in payload
         with db() as conn:
-            run = conn.execute("SELECT runs.id FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
+            run = conn.execute("SELECT runs.id, runs.execution_context FROM runs JOIN threads ON threads.id = runs.thread_id WHERE runs.id = ? AND threads.user_id = ?", (run_id, user["id"])).fetchone()
             if not run:
                 self.send_error_json("运行记录不存在", HTTPStatus.NOT_FOUND)
                 return
+            context = safe_json_object(run["execution_context"])
+            existing_feedback = conn.execute("SELECT citation_correct FROM run_feedback WHERE run_id = ? AND user_id = ?", (run_id, user["id"])).fetchone()
+            if updates_citation_items:
+                try:
+                    citation_items = validate_citation_feedback_items(payload.get("citation_items"), context.get("knowledge_refs", []))
+                except ValueError as exc:
+                    self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+                    return
+            else:
+                citation_items = []
+                if citation_correct is None and existing_feedback:
+                    citation_correct = bool(existing_feedback["citation_correct"]) if existing_feedback["citation_correct"] is not None else None
+            retrieval_policy_version = str((context.get("retrieval_policy") or {}).get("version", "unknown"))[:80]
             conn.execute("DELETE FROM run_feedback WHERE run_id = ? AND user_id = ?", (run_id, user["id"]))
             conn.execute("INSERT INTO run_feedback (id, run_id, user_id, rating, note, citation_correct, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id("feedback"), run_id, user["id"], rating, note, int(citation_correct) if citation_correct is not None else None, now()))
-            append_run_event(conn, run_id, "user_feedback", {"rating": rating, "citation_correct": citation_correct, "has_note": bool(note)})
-        self.send_json({"ok": True, "run_id": run_id, "rating": rating, "citation_correct": citation_correct})
+            if updates_citation_items:
+                conn.execute("DELETE FROM citation_feedback_items WHERE run_id = ? AND user_id = ?", (run_id, user["id"]))
+                timestamp = now()
+                conn.executemany("""INSERT INTO citation_feedback_items
+                    (id, run_id, user_id, document_id, position, citation_correct, reason_code, note, retrieval_policy_version, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", [
+                    (new_id("citation_feedback"), run_id, user["id"], item["document_id"], item["position"], int(item["citation_correct"]), item["reason_code"], item["note"], retrieval_policy_version, timestamp, timestamp)
+                    for item in citation_items
+                ])
+            append_run_event(conn, run_id, "user_feedback", {"rating": rating, "citation_correct": citation_correct, "has_note": bool(note), "citation_item_count": len(citation_items), "negative_reason_codes": sorted({item["reason_code"] for item in citation_items if item["reason_code"]})})
+        self.send_json({"ok": True, "run_id": run_id, "rating": rating, "citation_correct": citation_correct, "citation_items": citation_items})
 
     def list_manual_tool_invocations(self, user: dict) -> None:
         with db() as conn:
@@ -2326,6 +2494,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 (user["id"], user["id"]),
             ).fetchall()
             feedback = conn.execute("SELECT rating, citation_correct FROM run_feedback WHERE user_id = ?", (user["id"],)).fetchall()
+            citation_items = conn.execute("SELECT citation_correct, reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
         buckets: dict[str, dict] = {}
         routes: dict[str, int] = {}
         knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0, "insufficient": 0, "retried": 0}
@@ -2384,8 +2553,205 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             "citation_assessed": len(citation_feedback),
             "citation_correct": sum(row["citation_correct"] == 1 for row in citation_feedback),
             "citation_accuracy": round(sum(row["citation_correct"] == 1 for row in citation_feedback) / len(citation_feedback), 4) if citation_feedback else None,
+            "document_citation_assessed": len(citation_items),
+            "document_citation_correct": sum(row["citation_correct"] == 1 for row in citation_items),
+            "document_citation_accuracy": round(sum(row["citation_correct"] == 1 for row in citation_items) / len(citation_items), 4) if citation_items else None,
+            "document_feedback_reasons": {reason: sum(row["reason_code"] == reason for row in citation_items) for reason in sorted(CITATION_FEEDBACK_REASON_CODES) if any(row["reason_code"] == reason for row in citation_items)},
+            "minimum_citation_samples": 20,
+            "sufficient_for_retrieval_claim": len(citation_items) >= 20,
         }
-        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "feedback": feedback_metrics})
+        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "feedback": feedback_metrics, "retrieval_policy": active_retrieval_policy_snapshot()})
+
+    def get_retrieval_diagnostics(self, user: dict) -> None:
+        """Return aggregate, user-isolated retrieval feedback without source text."""
+        with db() as conn:
+            runs = conn.execute("""SELECT runs.id, runs.execution_context FROM runs JOIN threads ON threads.id = runs.thread_id
+                WHERE threads.user_id = ? ORDER BY runs.started_at DESC LIMIT 500""", (user["id"],)).fetchall()
+            run_feedback = conn.execute("SELECT citation_correct FROM run_feedback WHERE user_id = ? AND citation_correct IS NOT NULL", (user["id"],)).fetchall()
+            items = conn.execute("SELECT document_id, citation_correct, reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
+            policy_feedback = conn.execute("""SELECT retrieval_policy_version, COUNT(*) AS assessed_count,
+                SUM(CASE WHEN citation_correct = 1 THEN 1 ELSE 0 END) AS correct_count
+                FROM citation_feedback_items WHERE user_id = ?
+                GROUP BY retrieval_policy_version ORDER BY MAX(updated_at) DESC""", (user["id"],)).fetchall()
+            documents = conn.execute("""SELECT citation_feedback_items.document_id,
+                COALESCE(knowledge_documents.filename, '已删除资料') AS filename,
+                COUNT(*) AS assessed_count,
+                SUM(CASE WHEN citation_feedback_items.citation_correct = 0 THEN 1 ELSE 0 END) AS incorrect_count,
+                SUM(CASE WHEN citation_feedback_items.reason_code = 'missing_evidence' THEN 1 ELSE 0 END) AS missing_evidence_count
+                FROM citation_feedback_items LEFT JOIN knowledge_documents ON knowledge_documents.id = citation_feedback_items.document_id
+                WHERE citation_feedback_items.user_id = ?
+                GROUP BY citation_feedback_items.document_id, knowledge_documents.filename
+                ORDER BY incorrect_count DESC, assessed_count DESC, filename ASC LIMIT 20""", (user["id"],)).fetchall()
+
+        total_runs = len(runs)
+        retrieval_attempted = evidence_found = no_evidence = 0
+        reference_context: dict[str, dict] = {}
+        for row in runs:
+            context = safe_json_object(row["execution_context"])
+            route = str(context.get("knowledge_route", "not_needed"))
+            if route in {"retrieved", "required_no_match", "insufficient"}:
+                retrieval_attempted += 1
+                if context.get("knowledge_refs"):
+                    evidence_found += 1
+                else:
+                    no_evidence += 1
+            for reference in context.get("knowledge_refs", []):
+                if not isinstance(reference, dict):
+                    continue
+                document_id = str(reference.get("document_id", ""))
+                if document_id and document_id not in reference_context:
+                    reference_context[document_id] = {
+                        "run_id": row["id"],
+                        "position": reference.get("position", 0),
+                        "score": reference.get("score", 0),
+                        "score_breakdown": reference.get("score_breakdown", {}),
+                    }
+        reason_counts = {reason: sum(row["reason_code"] == reason for row in items) for reason in sorted(CITATION_FEEDBACK_REASON_CODES)}
+        reason_counts = {reason: count for reason, count in reason_counts.items() if count}
+        relevance_items = [row for row in items if row["reason_code"] not in {"answer_misused", "missing_evidence"}]
+        document_rows = []
+        for row in documents:
+            item = row_to_dict(row)
+            assessed = int(item["assessed_count"] or 0)
+            incorrect = int(item["incorrect_count"] or 0)
+            item["incorrect_rate"] = round(incorrect / assessed, 4) if assessed else 0.0
+            item["risk_level"] = "high" if assessed >= 3 and incorrect else "observe"
+            item["reference"] = reference_context.get(item["document_id"], {})
+            document_rows.append(item)
+        document_feedback_count = len(items)
+        sample_state = "ready" if document_feedback_count >= 20 else "insufficient"
+        self.send_json({
+            "retrieval_policy": active_retrieval_policy_snapshot(),
+            "sample": {
+                "run_count": total_runs,
+                "retrieval_attempted": retrieval_attempted,
+                "document_feedback_count": document_feedback_count,
+                "run_citation_feedback_count": len(run_feedback),
+                "minimum_document_feedback": 20,
+                "state": sample_state,
+                "message": "样本量达到诊断门槛，可用于比较候选策略" if sample_state == "ready" else "样本不足，仅展示观察结果，不得宣称检索已改善",
+            },
+            "metrics": {
+                "retrieval_trigger_rate": round(retrieval_attempted / total_runs, 4) if total_runs else None,
+                "evidence_found_rate": round(evidence_found / retrieval_attempted, 4) if retrieval_attempted else None,
+                "no_evidence_rate": round(no_evidence / retrieval_attempted, 4) if retrieval_attempted else None,
+                "evaluated_document_relevance_accuracy": round(sum(row["citation_correct"] == 1 for row in relevance_items) / len(relevance_items), 4) if relevance_items else None,
+                "answer_citation_accuracy": round(sum(row["citation_correct"] == 1 for row in run_feedback) / len(run_feedback), 4) if run_feedback else None,
+                "missing_evidence_rate": round(reason_counts.get("missing_evidence", 0) / document_feedback_count, 4) if document_feedback_count else None,
+            },
+            "reason_counts": reason_counts,
+            "documents": document_rows,
+            "policy_feedback": [{
+                **row_to_dict(row),
+                "citation_accuracy": round(row["correct_count"] / row["assessed_count"], 4) if row["assessed_count"] else None,
+                "state": "ready" if row["assessed_count"] >= 20 else "observing",
+            } for row in policy_feedback],
+        })
+
+    def _retrieval_suggestion_data(self, user: dict) -> tuple[dict, list[dict]]:
+        with db() as conn:
+            rows = conn.execute("SELECT reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
+        reasons = {reason: sum(row["reason_code"] == reason for row in rows) for reason in CITATION_FEEDBACK_REASON_CODES}
+        version, config = active_retrieval_policy()
+        return {"version": version, "document_feedback_count": len(rows), "reason_counts": reasons}, suggestions_for_feedback(len(rows), reasons, config)
+
+    def list_retrieval_suggestions(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以查看检索优化建议", HTTPStatus.FORBIDDEN)
+            return
+        evidence, suggestions = self._retrieval_suggestion_data(user)
+        self.send_json({"evidence": evidence, "suggestions": suggestions})
+
+    def list_retrieval_policies(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以查看检索策略", HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            rows = conn.execute("SELECT version, config_json, status, parent_version, changed_variable, evidence_json, experiment_json, created_at, activated_at FROM retrieval_policies ORDER BY created_at DESC").fetchall()
+        policies = []
+        for row in rows:
+            item = row_to_dict(row)
+            item["config"] = safe_json_object(item.pop("config_json"))
+            item["evidence"] = safe_json_object(item.pop("evidence_json"))
+            item["experiment"] = safe_json_object(item.pop("experiment_json"))
+            policies.append(item)
+        self.send_json({"active": active_retrieval_policy_snapshot(), "policies": policies})
+
+    def create_retrieval_candidate(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以创建检索候选策略", HTTPStatus.FORBIDDEN)
+            return
+        suggestion_id = self.path.split("/")[-2]
+        evidence, suggestions = self._retrieval_suggestion_data(user)
+        suggestion = next((item for item in suggestions if item["id"] == suggestion_id), None)
+        if not suggestion:
+            self.send_error_json("优化建议不存在或样本不足", HTTPStatus.CONFLICT)
+            return
+        parent_version, base_config = active_retrieval_policy()
+        candidate_config = apply_suggestion(base_config, suggestion)
+        version = f"candidate-{uuid.uuid4().hex[:12]}"
+        with db() as conn:
+            conn.execute("""INSERT INTO retrieval_policies (version, config_json, status, parent_version, changed_variable, evidence_json, created_by_user_id, created_at)
+                VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?)""", (version, json.dumps(config_as_dict(candidate_config), ensure_ascii=False), parent_version, suggestion["changed_variable"], json.dumps({"suggestion": suggestion, "evidence": evidence}, ensure_ascii=False), user["id"], now()))
+            conn.execute("INSERT INTO retrieval_policy_events (id, version, event_type, actor_user_id, detail_json, created_at) VALUES (?, ?, 'candidate_created', ?, ?, ?)", (new_id("retrieval_policy_event"), version, user["id"], json.dumps({"suggestion_id": suggestion_id}, ensure_ascii=False), now()))
+        self.send_json({"policy": {"version": version, "parent_version": parent_version, "changed_variable": suggestion["changed_variable"], "config": config_as_dict(candidate_config), "status": "candidate"}})
+
+    def evaluate_retrieval_candidate(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以评测检索候选策略", HTTPStatus.FORBIDDEN)
+            return
+        version = self.path.split("/")[-2]
+        with db() as conn:
+            candidate = conn.execute("SELECT * FROM retrieval_policies WHERE version = ? AND status IN ('candidate', 'verified', 'blocked')", (version,)).fetchone()
+            if not candidate:
+                self.send_error_json("检索候选策略不存在", HTTPStatus.NOT_FOUND)
+                return
+            baseline = conn.execute("SELECT * FROM retrieval_policies WHERE version = ?", (candidate["parent_version"],)).fetchone()
+        if not baseline:
+            self.send_error_json("候选策略缺少基线版本", HTTPStatus.CONFLICT)
+            return
+        cases = validate_retrieval_cases(json.loads(RETRIEVAL_EVAL_FIXTURE.read_text(encoding="utf-8")))
+        baseline_report = evaluate_retrieval(cases, KnowledgeRetriever(config_from_json(safe_json_object(baseline["config_json"]))))
+        candidate_report = evaluate_retrieval(cases, KnowledgeRetriever(config_from_json(safe_json_object(candidate["config_json"]))))
+        gates = ("recall_at_4", "top1_accuracy", "no_match_accuracy", "neighbor_accuracy")
+        regressions = [metric for metric in gates if candidate_report[metric] < baseline_report[metric] or candidate_report["failures"]]
+        decision = "promote" if not regressions else "rollback"
+        experiment = {"fixture": RETRIEVAL_EVAL_FIXTURE.name, "baseline": {metric: baseline_report[metric] for metric in gates}, "candidate": {metric: candidate_report[metric] for metric in gates}, "failures": candidate_report["failures"], "decision": decision, "regressions": sorted(set(regressions))}
+        status = "verified" if decision == "promote" else "blocked"
+        with db() as conn:
+            conn.execute("UPDATE retrieval_policies SET status = ?, experiment_json = ? WHERE version = ?", (status, json.dumps(experiment, ensure_ascii=False), version))
+            conn.execute("INSERT INTO retrieval_policy_events (id, version, event_type, actor_user_id, detail_json, created_at) VALUES (?, ?, 'candidate_evaluated', ?, ?, ?)", (new_id("retrieval_policy_event"), version, user["id"], json.dumps(experiment, ensure_ascii=False), now()))
+        self.send_json({"version": version, "status": status, "experiment": experiment})
+
+    def publish_retrieval_policy(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以发布检索策略", HTTPStatus.FORBIDDEN)
+            return
+        version = self.path.split("/")[-2]
+        with db() as conn:
+            candidate = conn.execute("SELECT * FROM retrieval_policies WHERE version = ? AND status = 'verified'", (version,)).fetchone()
+            if not candidate:
+                self.send_error_json("仅可发布已通过评测的候选策略", HTTPStatus.CONFLICT)
+                return
+            conn.execute("UPDATE retrieval_policies SET status = 'stable' WHERE status = 'active'")
+            conn.execute("UPDATE retrieval_policies SET status = 'active', activated_at = ? WHERE version = ?", (now(), version))
+            conn.execute("INSERT INTO retrieval_policy_events (id, version, event_type, actor_user_id, detail_json, created_at) VALUES (?, ?, 'published', ?, '{}', ?)", (new_id("retrieval_policy_event"), version, user["id"], now()))
+        self.send_json({"ok": True, "active": active_retrieval_policy_snapshot()})
+
+    def rollback_retrieval_policy(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以回滚检索策略", HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            current = conn.execute("SELECT version FROM retrieval_policies WHERE status = 'active'").fetchone()
+            target = conn.execute("SELECT version FROM retrieval_policies WHERE status = 'stable' ORDER BY activated_at DESC, created_at DESC LIMIT 1").fetchone()
+            if not current or not target:
+                self.send_error_json("没有可回滚的稳定检索策略", HTTPStatus.CONFLICT)
+                return
+            conn.execute("UPDATE retrieval_policies SET status = 'retired' WHERE version = ?", (current["version"],))
+            conn.execute("UPDATE retrieval_policies SET status = 'active', activated_at = ? WHERE version = ?", (now(), target["version"]))
+            conn.execute("INSERT INTO retrieval_policy_events (id, version, event_type, actor_user_id, detail_json, created_at) VALUES (?, ?, 'rollback', ?, ?, ?)", (new_id("retrieval_policy_event"), target["version"], user["id"], json.dumps({"from_version": current["version"]}, ensure_ascii=False), now()))
+        self.send_json({"ok": True, "active": active_retrieval_policy_snapshot()})
 
     def list_knowledge(self, user: dict) -> None:
         rows = KNOWLEDGE_SERVICE.list_visible(user["id"])
@@ -2889,6 +3255,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 ensure_run_active(run_id)
                 CHAT_SERVICE.record_runtime_event(run_id, event_type, payload, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
                 self.write_event("status", {"summary": event_summary(event_type, payload)})
+                if event_type == "provider_reasoning_available":
+                    self.write_event("reasoning_summary", {"items": [f"模型本次返回了推理数据（{payload.get('characters', 0)} 字符）；原始内容不展示，仅保留可审计记录。"]})
 
             draft_parts = []
             for chunk in stream_answer(thread_id, content, execution_context, emit_runtime_event):
@@ -3175,10 +3543,9 @@ def build_system_prompt(execution_context: dict) -> str:
 
 
 def append_knowledge_sources(answer: str, references: list[dict], knowledge_route: str) -> str:
-    labels = list(dict.fromkeys(
-        f"{item['filename']}（片段 {item['position'] + 1} · 摘录：{re.sub(r'\s+', ' ', item.get('excerpt', '')).strip()[:88]}）"
-        for item in references
-    ))
+    # A citation is a document-level affordance in the chat UI.  Several matching
+    # chunks from one document should not turn into noisy, repeated source chips.
+    labels = list(dict.fromkeys(str(item.get("filename", "未命名资料")) for item in references))
     if labels:
         return answer.rstrip() + "\n\n参考资料：" + "、".join(labels)
     if knowledge_route == "required_no_match":
@@ -3321,7 +3688,7 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         answer = append_knowledge_sources(answer, context.get("knowledge_refs", []), context.get("knowledge_route", ""))
         artifact = create_artifact(user_id, run_id, kind, source_content, answer)
         with db() as conn:
-            conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], "assistant", answer, now()))
+            conn.execute("INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], run_id, "assistant", answer, now()))
             refresh_structured_context(conn, run["thread_id"])
             RUNTIME_STORE.transition_run(conn, run_id, "completed")
             phase = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()

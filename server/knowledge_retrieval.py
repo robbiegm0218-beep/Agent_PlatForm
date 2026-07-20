@@ -15,6 +15,8 @@ _QUERY_NOISE = (
     "是什么", "什么是", "如何", "怎么", "哪些", "一下",
 )
 
+RETRIEVAL_POLICY_VERSION = "lexical-retrieval-v1"
+
 
 def normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.lower())
@@ -40,6 +42,20 @@ class RetrievalConfig:
     max_excerpt_chars: int = 900
     max_total_chars: int = 2800
     neighbor_radius: int = 1
+
+
+def retrieval_policy_snapshot(config: RetrievalConfig | None = None, version: str = RETRIEVAL_POLICY_VERSION) -> dict:
+    """Return the immutable retrieval settings recorded with each Run."""
+    active = config or RetrievalConfig()
+    return {
+        "version": version,
+        "config": {
+            "limit": active.limit,
+            "max_excerpt_chars": active.max_excerpt_chars,
+            "max_total_chars": active.max_total_chars,
+            "neighbor_radius": active.neighbor_radius,
+        },
+    }
 
 
 class KnowledgeRetriever:

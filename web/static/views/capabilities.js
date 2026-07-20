@@ -20,12 +20,21 @@ window.AgentCapabilityViews = {
   },
   renderApps(els, apps, tools, escape, { onExecute }) {
     els.appsGrid.innerHTML = "";
+    els.appsGrid.classList.add("apps-capability-layout");
+    const appSection = document.createElement("section"); appSection.className = "capability-group";
+    appSection.innerHTML = "<div class=\"capability-group-heading\"><h3>已接入应用</h3><p>这些应用是 Agent 在对话中按任务需要调用的能力。</p></div>";
+    const appGrid = document.createElement("div"); appGrid.className = "capability-app-grid";
     apps.forEach((app) => {
       const card = document.createElement("article");
       card.className = "capability-card";
       card.innerHTML = `<h3>${escape(app.name)}</h3><p>${escape(app.description)}</p><div class="card-footer"><span class="status-pill">${escape(app.status)}</span></div>`;
-      els.appsGrid.appendChild(card);
+      appGrid.appendChild(card);
     });
+    appSection.appendChild(appGrid); els.appsGrid.appendChild(appSection);
+
+    const toolSection = document.createElement("section"); toolSection.className = "capability-group tool-test-group";
+    toolSection.innerHTML = "<div class=\"capability-group-heading\"><h3>手动工具测试</h3><p>仅供管理员验证工具返回值，不是对话配置，不会改变知识库的检索范围或自动调用规则。</p></div>";
+    const toolGrid = document.createElement("div"); toolGrid.className = "capability-tool-grid";
     tools.forEach((tool) => {
       const card = document.createElement("article");
       card.className = "capability-card tool-card";
@@ -51,8 +60,9 @@ window.AgentCapabilityViews = {
         finally { submit.disabled = !tool.enabled; }
       });
       form.append(submit, result);
-      const footer = document.createElement("div"); footer.className = "card-footer"; footer.innerHTML = `<span class="status-pill">${tool.enabled ? "本地只读工具" : "未启用"}</span>`;
-      card.append(heading, description, form, footer); els.appsGrid.appendChild(card);
+      const footer = document.createElement("div"); footer.className = "card-footer"; footer.innerHTML = `<span class="status-pill">${tool.enabled ? "仅供手动验证" : "未启用"}</span>`;
+      card.append(heading, description, form, footer); toolGrid.appendChild(card);
     });
+    toolSection.appendChild(toolGrid); els.appsGrid.appendChild(toolSection);
   },
 };
