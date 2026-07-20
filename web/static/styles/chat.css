@@ -62,7 +62,7 @@
 }
 
 .drawer-header { display: grid; grid-template-columns: minmax(0, 1fr) 32px; gap: 8px; align-items: center; }
-.run-drawer-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; min-width: 0; padding: 3px; border-radius: 8px; background: var(--panel-soft); }
+.run-drawer-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; min-width: 0; padding: 3px; border-radius: 8px; background: var(--panel-soft); }
 .run-drawer-tab { min-width: 0; height: 32px; padding: 0 6px; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .run-drawer-tab.active { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06); }
 .run-filters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0 4px; }
@@ -82,8 +82,18 @@
 .answer-feedback span { margin-right: 2px; }
 .answer-feedback button { min-height: 30px; padding: 4px 8px; font-size: 12px; }
 .answer-feedback button.active { border-color: var(--accent); background: #e4f2ef; color: #17685f; }
+.answer-feedback select { min-height: 30px; max-width: 160px; font-size: 12px; }
+.run-audit-layer { max-width: 620px; margin: 8px 0; border: 1px solid #d9e7e4; border-radius: 9px; background: #f8fbfa; }
+.run-audit-layer-toggle { width: 100%; min-height: 36px; padding: 8px 11px; border: 0; background: transparent; color: #38645e; font: 600 13px/1.3 inherit; text-align: left; }
+.run-audit-layer-body { white-space: pre-line; border-top: 1px solid #d9e7e4; padding: 8px 11px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.run-clarification-card { max-width: 620px; margin: 8px 0; padding: 10px 12px; border: 1px solid #e6c98b; border-radius: 9px; background: #fffaf0; color: #765a23; font-size: 12px; line-height: 1.5; }
 .retrieval-diagnostics { display: grid; gap: 10px; white-space: normal; }
 .retrieval-diagnostics h3, .retrieval-diagnostics h4, .retrieval-diagnostics p { margin: 0; }
+.agent-rollout { display: grid; gap: 10px; white-space: normal; }
+.agent-rollout h3, .agent-rollout h4, .agent-rollout p { margin: 0; }
+.agent-rollout h3 { color: var(--text); font-size: 16px; }
+.agent-rollout h4 { margin-top: 4px; color: var(--text); font-size: 13px; }
+.agent-rollout p, .agent-rollout small { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .retrieval-diagnostics h3 { color: var(--text); font-size: 16px; }
 .retrieval-diagnostics h4 { margin-top: 4px; color: var(--text); font-size: 13px; }
 .retrieval-diagnostics p, .retrieval-diagnostics small { color: var(--muted); font-size: 12px; line-height: 1.55; }

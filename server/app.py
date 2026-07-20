@@ -43,11 +43,16 @@ from server.task_router import TaskRouter, classify_knowledge_intent
 from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, query_terms, retrieval_policy_snapshot
 from server.retrieval_governance import apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
 from server.evaluate_knowledge_retrieval import DEFAULT_FIXTURE as RETRIEVAL_EVAL_FIXTURE, evaluate as evaluate_retrieval, validate_cases as validate_retrieval_cases
+from server.evaluate_p45_rollout import fixed_report as p45_fixed_report, recommend as recommend_p45_rollout, shadow_report as p45_shadow_report
 from server.structured_context import StructuredContextBuilder
 from server.memory_policy import MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content
 from server.safe_web_reader import SafeWebPageReader
 from server.skill_contract import loadable_resource_paths, normalize_skill_contract, restrict_tools
 from server.intent_planner import IntentPlanner
+from server.task_planning import fallback_task_frame, parse_task_frame, planning_prompt, task_frame_summary
+from server.evidence_service import append_authorized_observations, build_knowledge_ledger, ledger_summary, parse_model_assessment, rewrite_queries
+from server.agent_orchestrator import AgentOrchestrator, OrchestrationError, OrchestratorState, BUDGETS, validate_next_action
+from server.task_verifier import verify as verify_task
 from server.decision_quality import policy_snapshot
 from server.auth_service import AuthService
 from server.knowledge_service import KnowledgeService
@@ -78,6 +83,8 @@ def resolve_artifact_node() -> str:
 
 ARTIFACT_NODE = resolve_artifact_node()
 ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
+TESSERACT_BINARY = next((candidate for candidate in (shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
+IMAGE_KNOWLEDGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 INTENT_PLANNER = IntentPlanner()
 
 
@@ -130,6 +137,23 @@ MAX_KNOWLEDGE_UPLOAD_BYTES = int(os.environ.get("MAX_KNOWLEDGE_UPLOAD_BYTES", st
 MAX_RESPONSE_TOKENS = int(os.environ.get("MAX_RESPONSE_TOKENS", "2048"))
 MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
+AGENT_INTELLIGENCE_V2 = os.environ.get("AGENT_INTELLIGENCE_V2", "false").lower() in {"1", "true", "yes"}
+AGENT_PLANNER_MODE = os.environ.get("AGENT_PLANNER_MODE", "off").strip().lower()
+if AGENT_PLANNER_MODE not in {"off", "shadow", "active"}:
+    LOGGER.warning("invalid_agent_planner_mode mode=%s; using off", AGENT_PLANNER_MODE)
+    AGENT_PLANNER_MODE = "off"
+AGENT_EVIDENCE_MODE = os.environ.get("AGENT_EVIDENCE_MODE", "off").strip().lower()
+if AGENT_EVIDENCE_MODE not in {"off", "shadow", "active"}:
+    LOGGER.warning("invalid_agent_evidence_mode mode=%s; using off", AGENT_EVIDENCE_MODE)
+    AGENT_EVIDENCE_MODE = "off"
+AGENT_ORCHESTRATOR_MODE = os.environ.get("AGENT_ORCHESTRATOR_MODE", "off").strip().lower()
+if AGENT_ORCHESTRATOR_MODE not in {"off", "shadow", "active"}:
+    LOGGER.warning("invalid_agent_orchestrator_mode mode=%s; using off", AGENT_ORCHESTRATOR_MODE)
+    AGENT_ORCHESTRATOR_MODE = "off"
+AGENT_VERIFIER_MODE = os.environ.get("AGENT_VERIFIER_MODE", "off").strip().lower()
+if AGENT_VERIFIER_MODE not in {"off", "shadow", "active"}:
+    LOGGER.warning("invalid_agent_verifier_mode mode=%s; using off", AGENT_VERIFIER_MODE)
+    AGENT_VERIFIER_MODE = "off"
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
 REQUEST_WINDOW_NS = 60 * 1_000_000_000
 REQUESTS_BY_USER: dict[str, list[int]] = {}
@@ -183,6 +207,8 @@ MODEL_CATALOG = {
         "supports_tools": True,
         "vision": False,
         "structured_output": False,
+        "supports_reasoning_signal": True,
+        "supports_json_contract": False,
         "context_window": None,
         "max_output_tokens": {"quick": 2048, "standard": 4096, "deep": 6144},
     },
@@ -192,6 +218,8 @@ MODEL_CATALOG = {
         "supports_tools": True,
         "vision": False,
         "structured_output": False,
+        "supports_reasoning_signal": True,
+        "supports_json_contract": False,
         "context_window": None,
         "max_output_tokens": {"quick": 4096, "standard": 6144, "deep": 8192},
     },
@@ -252,6 +280,8 @@ def build_model_registry() -> ModelRegistry:
                     tool_calling=profile["supports_tools"],
                     vision=profile.get("vision", False),
                     structured_output=profile.get("structured_output", False),
+                    reasoning_signal=profile.get("supports_reasoning_signal", False),
+                    json_contract=profile.get("supports_json_contract", profile.get("structured_output", False)),
                 ),
                 task_tier=profile["tier"],
                 context_window=profile.get("context_window"),
@@ -528,6 +558,18 @@ def platform_status_tool(_arguments: dict) -> dict:
         "model": DEEPSEEK_MODEL,
         "deepseek_configured": bool(DEEPSEEK_API_KEY),
         "storage": "sqlite",
+        "agent_intelligence": agent_intelligence_status(),
+    }
+
+
+def agent_intelligence_status() -> dict:
+    """Expose rollout modes without exposing prompts, keys or model internals."""
+    return {
+        "enabled": AGENT_INTELLIGENCE_V2,
+        "planner": AGENT_PLANNER_MODE,
+        "evidence": AGENT_EVIDENCE_MODE,
+        "orchestrator": AGENT_ORCHESTRATOR_MODE,
+        "verifier": AGENT_VERIFIER_MODE,
     }
 
 
@@ -997,6 +1039,7 @@ def init_db() -> None:
         ensure_column(conn, "runs", "phase_updated_at", "INTEGER DEFAULT 0")
         ensure_column(conn, "runs", "resume_policy", "TEXT DEFAULT '{}'")
         ensure_column(conn, "run_feedback", "citation_correct", "INTEGER")
+        ensure_column(conn, "run_feedback", "reason_code", "TEXT DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_citation_feedback_items_user ON citation_feedback_items(user_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_citation_feedback_items_document ON citation_feedback_items(document_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieval_policy_events_version ON retrieval_policy_events(version, created_at DESC)")
@@ -1180,6 +1223,70 @@ def plan_intent(content: str, task_profile: dict) -> dict:
     return INTENT_PLANNER.plan(content, task_profile).as_dict()
 
 
+def plan_task_frame(content: str, task_profile: dict, intent_plan: dict, execution_modes: dict, structured_context: dict) -> dict | None:
+    """Produce an auditable TaskFrame without changing the V1 execution path."""
+    mode = AGENT_PLANNER_MODE if AGENT_INTELLIGENCE_V2 else "off"
+    eligible = task_profile.get("task_tier") in {"standard", "deep"} or task_profile.get("confidence") == "low"
+    if mode == "off":
+        return None
+    started = time.monotonic()
+    fallback = fallback_task_frame(
+        content, intent_plan=intent_plan, execution_modes=execution_modes,
+        task_confidence=task_profile.get("confidence", "medium"),
+    )
+    result = {
+        "planner_version": "task-frame-v1",
+        "mode": "shadow" if mode == "active" else mode,
+        "eligible": eligible,
+        "status": "fallback",
+        "fallback_reason": "",
+        "token_estimate": 0,
+        "frame": fallback,
+    }
+    if not eligible:
+        result["fallback_reason"] = "not_eligible"
+    elif not model_is_configured(task_profile["model"]):
+        result["fallback_reason"] = "planner_model_unavailable"
+    else:
+        planner_context = {
+            "task_tier": task_profile.get("task_tier"),
+            "intent": {key: intent_plan.get(key) for key in ("knowledge_needed", "clarification_needed", "confidence")},
+            "execution_modes": execution_modes,
+            "context_keys": sorted(structured_context.keys()) if isinstance(structured_context, dict) else [],
+            "available_capabilities": {"knowledge": execution_modes.get("knowledge") != "off", "web": execution_modes.get("web") != "off", "workspace": execution_modes.get("file") != "off"},
+        }
+        request_text = json.dumps({"task": content[:1200], "context": planner_context}, ensure_ascii=False)
+        try:
+            response = deepseek_chat(
+                [{"role": "system", "content": planning_prompt()}, {"role": "user", "content": request_text}],
+                [], task_profile["model"], min(task_profile["max_output_tokens"], 1800),
+            )
+            output = response.get("content", "") if isinstance(response, dict) else ""
+            result["frame"] = parse_task_frame(output)
+            result["status"] = "model"
+            result["token_estimate"] = estimate_tokens(request_text) + estimate_tokens(output)
+        except (RuntimeError, ValueError) as exc:
+            result["fallback_reason"] = f"planner_parse_or_provider_failure:{type(exc).__name__}"
+    result["duration_ms"] = round((time.monotonic() - started) * 1000, 3)
+    result["summary"] = task_frame_summary(result["frame"])
+    return result
+
+
+def build_orchestrator_shadow_trace(task_profile: dict, execution_context: dict) -> list[dict] | None:
+    if not AGENT_INTELLIGENCE_V2 or AGENT_ORCHESTRATOR_MODE == "off":
+        return None
+    flow = AgentOrchestrator(task_profile["task_tier"])
+    targets = []
+    if execution_context.get("intent_plan", {}).get("knowledge_needed"):
+        targets.extend([OrchestratorState.COLLECT_EVIDENCE, OrchestratorState.ASSESS_EVIDENCE])
+    targets.append(OrchestratorState.DRAFT)
+    targets.extend([OrchestratorState.VERIFY, OrchestratorState.COMPLETE])
+    trace = []
+    for target in targets:
+        trace.append(flow.transition(target, reason="shadow_projection"))
+    return trace
+
+
 def resolve_execution_modes(payload: dict) -> dict:
     """Normalize user-controlled evidence and tool execution boundaries."""
     modes = {
@@ -1221,7 +1328,30 @@ def extract_knowledge_text(filename: str, raw: bytes) -> str:
         return "\n\n".join(f"【PDF 第 {index + 1} 页】\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages))
     if suffix == ".xlsx":
         return extract_xlsx_knowledge_text(raw)
-    raise ValueError("仅支持 Markdown、TXT、DOCX、PDF 和 XLSX 文件")
+    if suffix in IMAGE_KNOWLEDGE_SUFFIXES:
+        return extract_image_knowledge_text(filename, raw)
+    raise ValueError("仅支持 Markdown、TXT、DOCX、PDF、XLSX 和受支持图片文件")
+
+
+def extract_image_knowledge_text(filename: str, raw: bytes) -> str:
+    """Run bounded local OCR; image bytes never leave this machine."""
+    if not TESSERACT_BINARY:
+        raise ValueError("当前环境未配置本地 OCR；请先安装 Tesseract 或使用已配置的视觉模型")
+    if Path(filename).suffix.lower() not in IMAGE_KNOWLEDGE_SUFFIXES:
+        raise ValueError("不支持该图片格式")
+    try:
+        result = subprocess.run(
+            [TESSERACT_BINARY, "stdin", "stdout", "-l", "chi_sim+eng", "--psm", "3"],
+            input=raw, text=False, capture_output=True, timeout=25,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("图片 OCR 超时") from exc
+    if result.returncode != 0:
+        raise ValueError("图片 OCR 解析失败")
+    text = result.stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("图片中未识别到可检索文本")
+    return f"【图片 OCR（本地）：{Path(filename).name[:120]}】\n{text[:20000]}"
 
 
 def extract_xlsx_knowledge_text(raw: bytes) -> str:
@@ -1322,7 +1452,48 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
     return merged[:4], trace
 
 
-def build_execution_plan(content: str, active_skills: list[dict], allowed_tools: list[dict]) -> list[dict]:
+def assess_knowledge_evidence(user_id: str, content: str, intent_plan: dict, project_space_id: str,
+                              task_frame: dict | None, references: list[dict], trace: dict,
+                              task_profile: dict | None = None) -> tuple[list[dict], dict, dict | None]:
+    """Add P45 evidence assessment; only active mode may perform bounded retries."""
+    mode = AGENT_EVIDENCE_MODE if AGENT_INTELLIGENCE_V2 else "off"
+    if mode == "off" or not intent_plan.get("knowledge_needed"):
+        return references, trace, None
+    ledger = build_knowledge_ledger(task_frame, references, knowledge_needed=True)
+    model_assessment = {"status": "not_needed"}
+    profile = task_profile or {}
+    if ledger["decision"] != "sufficient" and profile.get("task_tier") in {"standard", "deep"} and model_is_configured(profile.get("model", "")):
+        evidence_view = [{"document_id": item.get("document_id"), "filename": item.get("filename"), "matched_terms": item.get("matched_terms", [])} for item in references]
+        try:
+            response = deepseek_chat([
+                {"role": "system", "content": "你是证据充分性检查器。只返回 JSON：decision（retrieve_more、clarify、answer_with_limits 之一）和 missing_requirement_ids。不能授权资料或工具，不能把已知缺口判为充分。"},
+                {"role": "user", "content": json.dumps({"requirements": ledger["requirements"], "evidence": evidence_view}, ensure_ascii=False)},
+            ], [], profile["model"], min(profile.get("max_output_tokens", 1024), 1024))
+            model_assessment = {"status": "model", **parse_model_assessment(response.get("content", ""), ledger)}
+            ledger["decision"] = model_assessment["decision"]
+        except (RuntimeError, ValueError):
+            model_assessment = {"status": "fallback"}
+    retried_queries = []
+    if mode == "active" and ledger["decision"] == "retrieve_more":
+        seen = {(item.get("document_id"), item.get("position")) for item in references}
+        for query in rewrite_queries(task_frame, ledger, content):
+            retried_queries.append(query)
+            for item in search_knowledge(user_id, query, project_space_id=project_space_id):
+                key = (item.get("document_id"), item.get("position"))
+                if key not in seen:
+                    seen.add(key)
+                    references.append(item)
+        references = references[:4]
+        ledger = build_knowledge_ledger(task_frame, references, knowledge_needed=True)
+    updated = dict(trace)
+    updated["evidence_state"] = ledger["decision"]
+    updated["evidence_mode"] = mode
+    updated["evidence_rewrite_queries"] = retried_queries
+    updated["evidence_model_assessment"] = model_assessment
+    return references, updated, ledger
+
+
+def build_execution_plan(content: str, active_skills: list[dict], allowed_tools: list[dict], task_frame: dict | None = None) -> list[dict]:
     def step(step_id: str, title: str, phase: str, *, requires_confirmation: bool = False, timeout_seconds: int = 30, max_retries: int = 0) -> dict:
         return {
             "id": step_id,
@@ -1334,6 +1505,21 @@ def build_execution_plan(content: str, active_skills: list[dict], allowed_tools:
             "max_retries": max_retries,
             "resume_policy": "resume_from_contract",
         }
+    frame = (task_frame or {}).get("frame", task_frame or {})
+    if isinstance(frame, dict) and frame.get("goal"):
+        steps = [step("task_understanding", "确认任务目标与约束", "planning")]
+        for index, requirement in enumerate(frame.get("evidence_requirements", [])[:3], start=1):
+            description = str(requirement.get("description", "任务所需依据"))[:72]
+            steps.append(step(f"evidence_{index}", f"核对依据：{description}", "retrieving", timeout_seconds=30, max_retries=1))
+        if active_skills:
+            steps.append(step("apply_skills", "应用已启用技能", "generating", timeout_seconds=60, max_retries=1))
+        if allowed_tools:
+            steps.append(step("authorized_tools", "按需补充授权工具信息", "executing_tool", timeout_seconds=30, max_retries=1))
+        for index, deliverable in enumerate(frame.get("deliverables", [])[:4], start=1):
+            description = str(deliverable.get("description", "生成任务交付物"))[:72]
+            steps.append(step(f"deliverable_{index}", f"完成交付：{description}", "generating", timeout_seconds=90, max_retries=1))
+        steps.append(step("task_verification", "验收并生成最终回答", "reflecting", timeout_seconds=90, max_retries=1))
+        return steps
     complex_markers = ("计划", "方案", "调研", "分析", "步骤", "并且", "然后", "先")
     is_complex = len(content) >= 48 or any(marker in content for marker in complex_markers)
     if not is_complex:
@@ -1380,6 +1566,7 @@ def build_execution_context(
         "retrieval_policy": active_retrieval_policy_snapshot(),
         "user_id": user_id,
         "model": task_profile["model"],
+        "model_roles": {"planner_model": task_profile["model"], "executor_model": task_profile["model"], "verifier_model": task_profile["model"], "fallback_reason": "同一已配置模型承担角色；不扩大能力或权限"},
         "task_tier": task_profile["task_tier"],
         "model_route": task_profile["route"],
         "model_route_reason": task_profile["reason"],
@@ -1422,6 +1609,20 @@ def event_summary(event_type: str, payload: dict) -> str:
         return f"技能路由：{names}"
     if event_type == "plan_created":
         return f"执行计划：{len(payload.get('steps', []))} 个步骤"
+    if event_type == "task_frame_planned":
+        status = "模型" if payload.get("status") == "model" else "回退"
+        return f"任务理解已生成（{status}）"
+    if event_type == "evidence_assessed":
+        decision = payload.get("summary", {}).get("decision", "")
+        return "资料证据已评估" if decision == "sufficient" else "资料证据仍有缺口"
+    if event_type == "task_verified":
+        return "任务验收：" + ("通过" if payload.get("passed") else payload.get("summary", "发现待补充项"))
+    if event_type == "model_role_selected":
+        return f"模型角色：{payload.get('role', 'executor')} · {payload.get('model', '未记录')}"
+    if event_type == "next_action_assessed":
+        return f"下一步建议：{payload.get('type', 'draft_answer')}（已通过权限校验）"
+    if event_type == "clarification_requested":
+        return "等待补充信息：" + str(payload.get("reason", "任务关键信息不足"))[:120]
     if event_type == "tool_call":
         return f"正在调用工具：{payload.get('tool_name', payload.get('tool_id', '本地工具'))}"
     if event_type == "tool_result":
@@ -1454,6 +1655,12 @@ def build_reasoning_summary(execution_context: dict) -> list[str]:
         summary.append(f"识别到可能需要本地资料；本轮命中 {count} 个资料片段。")
     else:
         summary.append("未识别到必须依赖本地资料的证据需求。")
+    task_frame = execution_context.get("task_frame")
+    if task_frame:
+        summary.append("已生成结构化任务理解，仅用于审计和后续能力验证，不改变本轮工具权限或回答流程。")
+    evidence = execution_context.get("evidence_ledger")
+    if evidence:
+        summary.append("本地资料证据已评估：" + ("已覆盖当前资料需求。" if evidence.get("decision") == "sufficient" else "仍存在待补充的资料需求。"))
     tools = execution_context.get("tools", [])
     if tools:
         summary.append("仅在需要时可调用：" + "、".join(tool["name"] for tool in tools[:4]) + "。")
@@ -1576,6 +1783,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "database": "sqlite",
                     "database_ready": True,
                     "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+                    "agent_intelligence": agent_intelligence_status(),
                 }
             )
             return
@@ -1602,6 +1810,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                         "tool_calling": registered.capabilities.tool_calling if registered else profile["supports_tools"],
                         "vision": registered.capabilities.vision if registered else False,
                         "structured_output": registered.capabilities.structured_output if registered else False,
+                        "reasoning_signal": registered.capabilities.reasoning_signal if registered else False,
+                        "json_contract": registered.capabilities.json_contract if registered else False,
                         "context_window": registered.context_window if registered else profile.get("context_window"),
                     },
                 })
@@ -1609,6 +1819,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/metrics":
             self.get_metrics(user)
+            return
+        if self.path == "/api/agent-rollout":
+            fixed = p45_fixed_report()
+            shadow = p45_shadow_report(DB_PATH, user["id"])
+            self.send_json({"scope": "current_user", "fixed": fixed, "shadow": shadow, "recommendation": recommend_p45_rollout(fixed, shadow), "agent_intelligence": agent_intelligence_status()})
             return
         if self.path == "/api/retrieval-diagnostics":
             self.get_retrieval_diagnostics(user)
@@ -1973,6 +2188,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 """,
                 (thread_id,),
             ).fetchall()
+            visible_document_ids = {row["id"] for row in conn.execute("""SELECT id FROM knowledge_documents
+                WHERE (scope = 'general' AND user_id = ?) OR
+                (scope = 'project' AND EXISTS (SELECT 1 FROM space_members
+                    WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))""",
+                (user["id"], user["id"])).fetchall()}
 
         sources: list[dict] = []
         seen_knowledge_documents: set[str] = set()
@@ -1987,6 +2207,15 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 if not document_id or not isinstance(position, int) or document_id in seen_knowledge_documents:
                     continue
                 seen_knowledge_documents.add(document_id)
+                if document_id not in visible_document_ids:
+                    sources.append({
+                        "kind": "knowledge",
+                        "title": "资料引用已隐藏",
+                        "redacted": True,
+                        "run_id": run["id"],
+                        "used_at": run["started_at"],
+                    })
+                    continue
                 sources.append({
                     "kind": "knowledge",
                     "document_id": document_id,
@@ -2372,7 +2601,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "approved": True, "run_id": run_id, "next_confirmation": row_to_dict(next_approval)})
             return
         try:
-            result = CHAT_SERVICE.resume_confirmed_artifact(run_id, user["id"], complete_confirmed_artifact_run)
+            result = CHAT_SERVICE.resume_confirmed_operation(run_id, user["id"], complete_confirmed_artifact_run)
         except Exception as exc:
             LOGGER.warning("confirmed_run_failed run_id=%s error=%s", run_id, str(exc)[:160])
             self.send_error_json(str(exc), HTTPStatus.BAD_GATEWAY)
@@ -2401,6 +2630,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("反馈评分必须为 1 或 -1")
             return
         note = str(payload.get("note", ""))[:800]
+        reason_code = str(payload.get("reason_code", ""))[:80]
+        answer_reason_codes = {"goal_misunderstood", "insufficient_evidence", "inaccurate", "not_executed", "too_verbose", "format_unsuitable"}
+        if rating == -1 and reason_code and reason_code not in answer_reason_codes:
+            self.send_error_json("回答反馈原因无效")
+            return
+        if rating == 1: reason_code = ""
         citation_correct = payload.get("citation_correct")
         if citation_correct is not None and not isinstance(citation_correct, bool):
             self.send_error_json("引用评价必须为布尔值")
@@ -2425,7 +2660,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     citation_correct = bool(existing_feedback["citation_correct"]) if existing_feedback["citation_correct"] is not None else None
             retrieval_policy_version = str((context.get("retrieval_policy") or {}).get("version", "unknown"))[:80]
             conn.execute("DELETE FROM run_feedback WHERE run_id = ? AND user_id = ?", (run_id, user["id"]))
-            conn.execute("INSERT INTO run_feedback (id, run_id, user_id, rating, note, citation_correct, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id("feedback"), run_id, user["id"], rating, note, int(citation_correct) if citation_correct is not None else None, now()))
+            conn.execute("INSERT INTO run_feedback (id, run_id, user_id, rating, note, citation_correct, reason_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (new_id("feedback"), run_id, user["id"], rating, note, int(citation_correct) if citation_correct is not None else None, reason_code, now()))
             if updates_citation_items:
                 conn.execute("DELETE FROM citation_feedback_items WHERE run_id = ? AND user_id = ?", (run_id, user["id"]))
                 timestamp = now()
@@ -2435,8 +2670,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     (new_id("citation_feedback"), run_id, user["id"], item["document_id"], item["position"], int(item["citation_correct"]), item["reason_code"], item["note"], retrieval_policy_version, timestamp, timestamp)
                     for item in citation_items
                 ])
-            append_run_event(conn, run_id, "user_feedback", {"rating": rating, "citation_correct": citation_correct, "has_note": bool(note), "citation_item_count": len(citation_items), "negative_reason_codes": sorted({item["reason_code"] for item in citation_items if item["reason_code"]})})
-        self.send_json({"ok": True, "run_id": run_id, "rating": rating, "citation_correct": citation_correct, "citation_items": citation_items})
+            append_run_event(conn, run_id, "user_feedback", {"rating": rating, "reason_code": reason_code, "citation_correct": citation_correct, "has_note": bool(note), "citation_item_count": len(citation_items), "negative_reason_codes": sorted({item["reason_code"] for item in citation_items if item["reason_code"]})})
+        self.send_json({"ok": True, "run_id": run_id, "rating": rating, "reason_code": reason_code, "citation_correct": citation_correct, "citation_items": citation_items})
 
     def list_manual_tool_invocations(self, user: dict) -> None:
         with db() as conn:
@@ -2499,6 +2734,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         routes: dict[str, int] = {}
         knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0, "insufficient": 0, "retried": 0}
         decisions = {"runs": 0, "implicit_knowledge_retrievals": 0, "low_confidence": 0}
+        model_roles: dict[str, dict] = {}
         for row in rows:
             run = row_to_dict(row)
             context = json.loads(run["execution_context"] or "{}")
@@ -2523,6 +2759,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if intent.get("confidence") == "low": decisions["low_confidence"] += 1
             if intent.get("knowledge_needed") and not context.get("knowledge_intent", {}).get("needed"):
                 decisions["implicit_knowledge_retrievals"] += 1
+            for role, usage in context.get("model_usage", {}).items():
+                if not isinstance(usage, dict): continue
+                bucket = model_roles.setdefault(role, {"runs": 0, "calls": 0, "token_estimate": 0, "duration_ms": 0.0, "models": {}})
+                bucket["runs"] += 1; bucket["calls"] += int(usage.get("calls", 0)); bucket["token_estimate"] += int(usage.get("token_estimate", usage.get("input_token_estimate", 0)) or 0) + int(usage.get("output_token_estimate", 0) or 0); bucket["duration_ms"] += float(usage.get("duration_ms", 0) or 0)
+                model_name = str(usage.get("model", "unknown")); bucket["models"][model_name] = bucket["models"].get(model_name, 0) + 1
         for bucket in buckets.values():
             bucket["average_seconds"] = round(bucket["average_seconds"] / bucket["runs"], 2)
         successes = sum(event["type"] == "tool_result" for event in tool_events)
@@ -2560,7 +2801,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             "minimum_citation_samples": 20,
             "sufficient_for_retrieval_claim": len(citation_items) >= 20,
         }
-        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "feedback": feedback_metrics, "retrieval_policy": active_retrieval_policy_snapshot()})
+        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "model_roles": model_roles, "feedback": feedback_metrics, "retrieval_policy": active_retrieval_policy_snapshot()})
 
     def get_retrieval_diagnostics(self, user: dict) -> None:
         """Return aggregate, user-isolated retrieval feedback without source text."""
@@ -2755,7 +2996,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def list_knowledge(self, user: dict) -> None:
         rows = KNOWLEDGE_SERVICE.list_visible(user["id"])
-        self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader)})
+        self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader), "image_ocr_supported": bool(TESSERACT_BINARY)})
 
     def list_artifacts(self, user: dict) -> None:
         with db() as conn:
@@ -3182,6 +3423,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "retrieve_knowledge": retrieve_knowledge_with_fallback,
                     "load_memories": load_relevant_memories,
                     "build_execution_context": build_execution_context,
+                    "plan_task_frame": plan_task_frame,
+                    "assess_knowledge_evidence": assess_knowledge_evidence,
+                    "build_orchestrator_trace": build_orchestrator_shadow_trace,
                     "select_structured_context": STRUCTURED_CONTEXT.select,
                     "load_space_context": load_space_context,
                 },
@@ -3199,7 +3443,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if artifact_kind:
                 execution_context["artifact_request"] = {"kind": artifact_kind, "target": "本地受控产物目录"}
             actual_model = execution_context["model"]
-            execution_plan = build_execution_plan(content, active_skills, execution_context["tools"])
+            execution_plan = build_execution_plan(content, active_skills, execution_context["tools"], execution_context.get("task_frame"))
             if artifact_kind:
                 execution_plan[0]["requires_confirmation"] = True
                 execution_plan[0]["phase"] = "awaiting_confirmation"
@@ -3210,6 +3454,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 execution_plan=execution_plan, dependencies={
                     "now": now, "new_id": new_id, "append_event": append_run_event,
                     "runtime": RUNTIME_STORE, "json": json, "reasoning_summary": build_reasoning_summary,
+                    "evidence_summary": ledger_summary,
                     "artifact_confirmation_text": artifact_confirmation_text,
                 },
             )
@@ -3243,6 +3488,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 append_run_event(conn, run_id, "model_request", {
                     "model": actual_model,
                     "task_tier": execution_context["task_tier"],
+                    "role": "executor",
                 })
                 current = conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
                 if current and current["run_phase"] in {"planning", "retrieving"}:
@@ -3253,6 +3499,22 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 )
             def emit_runtime_event(event_type: str, payload: dict) -> None:
                 ensure_run_active(run_id)
+                if event_type in {"tool_call", "tool_result", "tool_error"}:
+                    execution_context.setdefault("tool_events", []).append({"type": event_type, **payload})
+                if event_type == "tool_result":
+                    tool_id = str(payload.get("tool_id", ""))
+                    tool_call_id = str(payload.get("tool_call_id", ""))
+                    if tool_id and tool_call_id:
+                        append_runtime_evidence(execution_context, [{
+                            "source_type": "tool", "source_id": f"{tool_id}:{tool_call_id}",
+                            "supports": evidence_requirement_ids(execution_context), "relevance": "medium",
+                        }])
+                        ledger = execution_context.get("evidence_ledger") or {}
+                        CHAT_SERVICE.record_runtime_event(run_id, "evidence_reassessed", {
+                            "after_tool_id": tool_id,
+                            "decision": ledger.get("decision", "unknown"),
+                            "missing_requirement_ids": ledger.get("missing_requirement_ids", []),
+                        }, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
                 CHAT_SERVICE.record_runtime_event(run_id, event_type, payload, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
                 self.write_event("status", {"summary": event_summary(event_type, payload)})
                 if event_type == "provider_reasoning_available":
@@ -3599,7 +3861,20 @@ def artifact_confirmation_text(kind: str) -> str:
     return f"将根据本次任务生成 {label} 文件，并写入本机 data/artifacts/ 目录。确认后才会创建文件。"
 
 
-def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, answer: str) -> dict:
+def artifact_source_from_conversation(thread_id: str, command: str) -> tuple[str, bool]:
+    """Resolve explicit 'above content' commands to the preceding assistant answer."""
+    normalized = re.sub(r"\s+", "", command)
+    if not re.search(r"(?:上面|上文|上述|前面|刚才).{0,12}(?:内容|回答|结果|对话)?", normalized):
+        return command, False
+    with db() as conn:
+        previous = conn.execute("""SELECT content FROM messages
+            WHERE thread_id = ? AND role = 'assistant'
+            ORDER BY created_at DESC, id DESC LIMIT 1""", (thread_id,)).fetchone()
+    content = str(previous["content"]).strip() if previous else ""
+    return (content, True) if content else (command, False)
+
+
+def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, answer: str, *, title_content: str = "") -> dict:
     if kind not in {"markdown", "xlsx"}:
         raise ValueError("不支持的文件类型")
     with db() as conn:
@@ -3622,7 +3897,7 @@ def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, a
     path = (storage_dir / filename).resolve()
     if storage_dir.resolve() not in path.parents or path.exists():
         raise ValueError("文件产物路径无效")
-    title = source_content.strip().splitlines()[0][:80] or "Agent_Platform 输出"
+    title = (title_content or source_content).strip().splitlines()[0][:80] or "Agent_Platform 输出"
     try:
         if kind == "markdown":
             path.write_text(f"# {title}\n\n{answer.strip()}\n", encoding="utf-8")
@@ -3672,6 +3947,8 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         append_run_event(conn, run_id, "model_request", {"model": run["model"]})
 
     def emit_runtime_event(event_type: str, payload: dict) -> None:
+        if event_type in {"tool_call", "tool_result", "tool_error"}:
+            context.setdefault("tool_events", []).append({"type": event_type, **payload})
         with db() as event_conn:
             phase = event_conn.execute("SELECT run_phase FROM runs WHERE id = ?", (run_id,)).fetchone()
             current_phase = phase["run_phase"] if phase else ""
@@ -3683,10 +3960,21 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
 
     try:
         source_content = user_message["content"]
-        draft = "".join(stream_answer(run["thread_id"], source_content, context, emit_runtime_event))
-        answer, reflection = reflect_answer(source_content, draft, context, emit_runtime_event)
-        answer = append_knowledge_sources(answer, context.get("knowledge_refs", []), context.get("knowledge_route", ""))
-        artifact = create_artifact(user_id, run_id, kind, source_content, answer)
+        artifact_content, used_previous_answer = artifact_source_from_conversation(run["thread_id"], source_content)
+        if used_previous_answer:
+            answer = "已根据上一次回答生成文件。"
+            reflection = {"applied": False, "passed": True, "issues": [], "summary": "文件正文复用了上一条回答", "revision_count": 0}
+        else:
+            draft = "".join(stream_answer(run["thread_id"], source_content, context, emit_runtime_event))
+            answer, reflection = reflect_answer(source_content, draft, context, emit_runtime_event)
+            answer = append_knowledge_sources(answer, context.get("knowledge_refs", []), context.get("knowledge_route", ""))
+            artifact_content = answer
+        artifact = create_artifact(user_id, run_id, kind, source_content, artifact_content,
+                                   title_content=artifact_content if used_previous_answer else "")
+        artifact_verdict = verify_task(
+            (context.get("task_frame") or {}).get("frame"), context.get("evidence_ledger"), answer,
+            tool_events=context.get("tool_events"), artifact_records=[artifact], artifact_request=request,
+        )
         with db() as conn:
             conn.execute("INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)", (new_id("msg"), run["thread_id"], run_id, "assistant", answer, now()))
             refresh_structured_context(conn, run["thread_id"])
@@ -3701,6 +3989,11 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
                 ("completed", json.dumps({"answer_chars": len(answer), "status": "completed"}), now(), run_id),
             )
             append_run_event(conn, run_id, "completed", {"length": len(answer)})
+            append_run_event(conn, run_id, "task_verified", {
+                "mode": AGENT_VERIFIER_MODE, "stage": "artifact_created", "passed": artifact_verdict["passed"],
+                "action": artifact_verdict["action"], "summary": artifact_verdict["summary"],
+                "missing_evidence": artifact_verdict["missing_evidence"],
+            })
         return {"content": answer, "artifact": artifact}
     except Exception as exc:
         with db() as conn:
@@ -3714,6 +4007,17 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
             )
             append_run_event(conn, run_id, "failed", {"error": str(exc)})
         raise
+
+
+def evidence_requirement_ids(execution_context: dict) -> list[str]:
+    ledger = execution_context.get("evidence_ledger", {})
+    return list(ledger.get("missing_requirement_ids") or [item.get("id") for item in ledger.get("requirements", []) if item.get("id")])
+
+
+def append_runtime_evidence(execution_context: dict, observations: list[dict]) -> None:
+    ledger = execution_context.get("evidence_ledger")
+    if ledger and observations:
+        execution_context["evidence_ledger"] = append_authorized_observations(ledger, observations)
 
 
 def execute_authorized_web_search(user_content: str, execution_context: dict, on_event) -> None:
@@ -3740,6 +4044,7 @@ def execute_authorized_web_search(user_content: str, execution_context: dict, on
         result = LOCAL_TOOLS.execute("web_search", arguments, {"web_search"})
         sources = result.get("sources", []) if isinstance(result, dict) else []
         execution_context["web_search_sources"] = sources[:10]
+        append_runtime_evidence(execution_context, [{"source_type": "web", "source_id": str(item.get("url", item.get("title", ""))), "supports": evidence_requirement_ids(execution_context), "freshness": "current"} for item in sources[:10] if item.get("url") or item.get("title")])
         execution_context["web_search_provider"] = result.get("provider", "unknown") if isinstance(result, dict) else "unknown"
         execution_context["allowed_tool_ids"] = [tool_id for tool_id in execution_context["allowed_tool_ids"] if tool_id != "web_search"]
         execution_context["tools"] = [tool for tool in execution_context["tools"] if tool["id"] != "web_search"]
@@ -3785,6 +4090,7 @@ def execute_required_workspace_search(user_content: str, execution_context: dict
     try:
         result = LOCAL_TOOLS.execute("search_workspace_files", arguments, {"search_workspace_files"})
         execution_context["workspace_search_results"] = result.get("matches", []) if isinstance(result, dict) else []
+        append_runtime_evidence(execution_context, [{"source_type": "workspace", "source_id": str(item.get("path", item.get("relative_path", item.get("filename", item.get("name", ""))))), "supports": evidence_requirement_ids(execution_context)} for item in execution_context["workspace_search_results"] if item.get("path") or item.get("relative_path") or item.get("filename") or item.get("name")])
         on_event("tool_result", {
             "tool_call_id": tool_call_id,
             "tool_id": "search_workspace_files",
@@ -3823,7 +4129,10 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
     execute_required_workspace_search(user_content, execution_context, on_event)
     if model_is_configured(execution_context["model"]):
         system_prompt = build_system_prompt(execution_context)
-        yield from run_deepseek_agent(thread_id, system_prompt, execution_context, on_event)
+        if AGENT_INTELLIGENCE_V2 and AGENT_ORCHESTRATOR_MODE == "active":
+            yield from run_orchestrated_agent(thread_id, system_prompt, execution_context, on_event)
+        else:
+            yield from run_deepseek_agent(thread_id, system_prompt, execution_context, on_event)
         return
 
     system_prompt = build_system_prompt(execution_context)
@@ -3856,10 +4165,18 @@ def should_reflect(content: str, execution_context: dict) -> bool:
 
 
 def reflect_answer(user_content: str, draft_answer: str, execution_context: dict, on_event) -> tuple[str, dict]:
-    if not should_reflect(user_content, execution_context):
+    verifier_mode = AGENT_VERIFIER_MODE if AGENT_INTELLIGENCE_V2 else "off"
+    verdict = None
+    if verifier_mode != "off":
+        verdict = verify_task((execution_context.get("task_frame") or {}).get("frame"), execution_context.get("evidence_ledger"), draft_answer, tool_events=execution_context.get("tool_events"), artifact_request=execution_context.get("artifact_request"))
+        on_event("task_verified", {"mode": verifier_mode, "passed": verdict["passed"], "action": verdict["action"], "summary": verdict["summary"], "missing_evidence": verdict["missing_evidence"]})
+        if verifier_mode == "active" and verdict["action"] == "complete_with_limits":
+            draft_answer += "\n\n说明：现有资料不足以完整验证上述结论，建议补充相关资料后再确认。"
+    if not should_reflect(user_content, execution_context) and not (verifier_mode == "active" and verdict and verdict["action"] == "revise"):
         return draft_answer, {"applied": False, "passed": True, "issues": [], "summary": "普通任务，未触发质量检查", "revision_count": 0}
 
     on_event("reflection_started", {})
+    on_event("model_role_selected", {"role": "verifier", "model": execution_context.get("model_roles", {}).get("verifier_model", execution_context["model"])})
     if not model_is_configured(execution_context["model"]):
         snapshot = {
             "applied": True,
@@ -3869,6 +4186,7 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
             "revision_count": 0,
         }
         on_event("reflection_completed", snapshot)
+        snapshot["task_verification"] = verdict
         return draft_answer, snapshot
 
     evaluation_prompt = (
@@ -3884,6 +4202,7 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
     except RuntimeError:
         snapshot = {"applied": True, "passed": True, "issues": [], "summary": "质量检查暂不可用，保留原回答", "revision_count": 0}
         on_event("reflection_completed", snapshot)
+        snapshot["task_verification"] = verdict
         return draft_answer, snapshot
     assessment = parse_reflection(evaluation_message.get("content", ""))
     revision_count = 0
@@ -3901,12 +4220,20 @@ def reflect_answer(user_content: str, draft_answer: str, execution_context: dict
             answer = revised
             revision_count = 1
             on_event("reflection_revised", {"summary": "已完成一次自动修订"})
+            if verifier_mode == "active":
+                verdict = verify_task((execution_context.get("task_frame") or {}).get("frame"), execution_context.get("evidence_ledger"), answer, tool_events=execution_context.get("tool_events"), artifact_request=execution_context.get("artifact_request"))
+                on_event("task_verified", {"mode": verifier_mode, "stage": "post_revision", "passed": verdict["passed"], "action": verdict["action"], "summary": verdict["summary"], "missing_evidence": verdict["missing_evidence"]})
     snapshot = {
         "applied": True,
         "passed": assessment["passed"],
         "issues": assessment["issues"],
         "summary": assessment["summary"],
         "revision_count": revision_count,
+        "task_verification": verdict,
+    }
+    execution_context.setdefault("model_usage", {})["verifier"] = {
+        "model": execution_context.get("model_roles", {}).get("verifier_model", execution_context["model"]),
+        "calls": 1, "token_estimate": estimate_tokens(draft_answer),
     }
     on_event("reflection_completed", snapshot)
     return answer, snapshot
@@ -3941,6 +4268,113 @@ def run_deepseek_agent(thread_id: str, system_prompt: str, execution_context: di
         summarize_tool_result=summarize_tool_result,
     ))
     yield from loop.stream(thread_id, system_prompt, execution_context, on_event)
+
+
+def run_orchestrated_agent(thread_id: str, system_prompt: str, execution_context: dict, on_event):
+    """Apply P45-C lifecycle validation around the existing authorized tool loop."""
+    flow = AgentOrchestrator(execution_context["task_tier"])
+    next_action = suggest_next_action(execution_context)
+    on_event("next_action_assessed", next_action)
+    if next_action.get("source") == "model":
+        flow.record_model_call()
+    def advance(target: OrchestratorState, reason: str):
+        on_event("orchestrator_transition", {"mode": "active", **flow.transition(target, reason=reason)})
+    if execution_context.get("intent_plan", {}).get("knowledge_needed"):
+        advance(OrchestratorState.COLLECT_EVIDENCE, "knowledge_context_available")
+        advance(OrchestratorState.ASSESS_EVIDENCE, "knowledge_evidence_assessed")
+    enforce_action = next_action.get("source") == "model"
+    if enforce_action and next_action.get("type") == "clarify_user":
+        if flow.snapshot.state == OrchestratorState.PLAN:
+            advance(OrchestratorState.CLARIFY, "model_requested_user_clarification")
+        else:
+            advance(OrchestratorState.CLARIFY, "evidence_requires_user_clarification")
+        reason = next_action.get("reason") or "缺少完成任务所需的关键范围、数据或目标"
+        on_event("clarification_requested", {"reason": reason})
+        yield f"为了继续完成这项任务，还需要你补充：{reason}。"
+        on_event("orchestrator_budget", {"mode": "active", **flow.budget()})
+        return
+    if enforce_action and next_action.get("type") == "complete_with_limits":
+        if flow.snapshot.state == OrchestratorState.PLAN:
+            advance(OrchestratorState.COLLECT_EVIDENCE, "limit_assessment_required")
+            advance(OrchestratorState.ASSESS_EVIDENCE, "limit_assessment_completed")
+        advance(OrchestratorState.COMPLETE_WITH_LIMITS, "model_requested_limited_completion")
+        reason = next_action.get("reason") or "当前授权范围内的证据不足"
+        yield f"本轮无法完整完成该任务：{reason}。我没有把缺失内容当作已验证结论；你可以补充资料、范围或允许的来源后继续。"
+        on_event("orchestrator_budget", {"mode": "active", **flow.budget()})
+        return
+    if enforce_action and next_action.get("type") in {"draft_answer", "retrieve_knowledge"}:
+        if flow.snapshot.state == OrchestratorState.PLAN:
+            advance(OrchestratorState.DRAFT, "model_requested_direct_draft")
+        elif flow.snapshot.state == OrchestratorState.ASSESS_EVIDENCE:
+            advance(OrchestratorState.DRAFT, "model_assessed_available_evidence")
+    elif execution_context.get("allowed_tool_ids"):
+        if flow.snapshot.state == OrchestratorState.PLAN:
+            advance(OrchestratorState.COLLECT_EVIDENCE, "tool_evidence_preflight")
+            advance(OrchestratorState.ASSESS_EVIDENCE, "tool_evidence_assessed")
+        advance(OrchestratorState.ACT, "authorized_read_only_tools_available")
+    else:
+        advance(OrchestratorState.DRAFT, "no_authorized_tools")
+    def observed_event(event_type: str, payload: dict):
+        if event_type == "model_call":
+            flow.record_model_call()
+        if event_type == "tool_call" and flow.snapshot.state in {OrchestratorState.OBSERVE, OrchestratorState.ASSESS_EVIDENCE}:
+            if flow.snapshot.state == OrchestratorState.OBSERVE:
+                advance(OrchestratorState.ASSESS_EVIDENCE, "next_tool_requires_reassessment")
+            advance(OrchestratorState.ACT, "next_authorized_tool")
+        if event_type == "tool_call":
+            flow.record_tool_call()
+        on_event(event_type, payload)
+        if event_type in {"tool_result", "tool_error"} and flow.snapshot.state == OrchestratorState.ACT:
+            advance(OrchestratorState.OBSERVE, "read_only_tool_observed")
+            if event_type == "tool_error":
+                advance(OrchestratorState.REPLAN, "read_only_tool_failed")
+                advance(OrchestratorState.ASSESS_EVIDENCE, "replan_ready")
+    bounded_context = dict(execution_context)
+    # Reserve one model call for the final answer.  The planning call above
+    # also consumes the run budget when it originated from a configured model.
+    remaining_model_calls = BUDGETS[execution_context["task_tier"]]["model"] - flow.snapshot.model_calls
+    max_tool_turns = max(0, remaining_model_calls - 1)
+    bounded_context["max_tool_steps"] = min(
+        execution_context.get("max_tool_steps", MAX_TOOL_STEPS),
+        BUDGETS[execution_context["task_tier"]]["tool"],
+        max_tool_turns,
+    )
+    bounded_context["strict_tool_budget"] = True
+    # The proposal is never a permission grant.  Only a schema-validated,
+    # already-authorized read action may be handed to the loop for execution.
+    if next_action.get("type") == "use_tool":
+        bounded_context["initial_tool_action"] = next_action
+    elif enforce_action and next_action.get("type") in {"draft_answer", "retrieve_knowledge"}:
+        # The action was to draft from the already frozen evidence. Do not let
+        # the executor silently choose an additional tool call in this turn.
+        bounded_context["allowed_tool_ids"] = []
+        bounded_context["tools"] = []
+        bounded_context["max_tool_steps"] = 0
+        system_prompt += "\n\n[已校验的下一步]\n请直接基于已冻结的证据起草回答；本轮不要再调用工具。"
+    yield from run_deepseek_agent(thread_id, system_prompt, bounded_context, observed_event)
+    if flow.snapshot.state == OrchestratorState.ACT: advance(OrchestratorState.OBSERVE, "model_completed_without_tool_call")
+    if flow.snapshot.state == OrchestratorState.OBSERVE: advance(OrchestratorState.DRAFT, "observations_available")
+    if flow.snapshot.state == OrchestratorState.ASSESS_EVIDENCE: advance(OrchestratorState.DRAFT, "replan_completed_without_more_tools")
+    if flow.snapshot.state == OrchestratorState.DRAFT:
+        advance(OrchestratorState.VERIFY, "v1_answer_completed")
+        advance(OrchestratorState.COMPLETE, "v1_verification_boundary")
+    on_event("orchestrator_budget", {"mode": "active", **flow.budget()})
+
+
+def suggest_next_action(execution_context: dict) -> dict:
+    """Ask for an advisory action contract, then enforce platform permissions."""
+    allowed = set(execution_context.get("allowed_tool_ids", []))
+    fallback = {"type": "draft_answer", "reason": "沿用受控执行器生成回答", "source": "fallback"}
+    model = execution_context.get("model")
+    if not model or not model_is_configured(model):
+        return fallback
+    prompt = {"allowed_tool_ids": sorted(allowed), "evidence_state": (execution_context.get("evidence_ledger") or {}).get("decision", "unknown"), "allowed_actions": ["use_tool", "retrieve_knowledge", "clarify_user", "draft_answer", "complete_with_limits"]}
+    try:
+        response = deepseek_chat([{"role":"system","content":"只返回 JSON next_action：type、reason；use_tool 时带 tool_id、arguments。不得请求未授权工具。"}, {"role":"user","content":json.dumps(prompt, ensure_ascii=False)}], [], model, 300)
+        action = validate_next_action(json.loads(response.get("content", "")), allowed)
+        return {**action, "source": "model"}
+    except (RuntimeError, ValueError, json.JSONDecodeError, OrchestrationError):
+        return fallback
 
 
 def summarize_tool_result(result: dict) -> str:

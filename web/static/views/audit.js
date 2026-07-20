@@ -1,7 +1,7 @@
 window.AgentAuditView = {
   renderRunList(state, els, onSelect) {
     els.runList.innerHTML = "";
-    const labels = { completed: "已完成", failed: "失败", cancelled: "已取消", awaiting_confirmation: "待确认", running: "运行中" };
+    const labels = { completed: "已完成", failed: "失败", cancelled: "已取消", awaiting_confirmation: "待确认", running: "运行中", skipped: "已跳过" };
     state.runs.forEach((run) => {
       const button = document.createElement("button");
       button.className = `run-item ${run.status}`;
@@ -181,5 +181,30 @@ window.AgentAuditView = {
       panel.append(admin);
     }
     els.runDetail.appendChild(panel);
+  },
+  renderAgentRollout(els, data) {
+    els.runDetail.replaceChildren();
+    const { fixed = {}, shadow = {}, recommendation = "shadow", agent_intelligence: intelligence = {} } = data;
+    const candidate = shadow.v2 || {};
+    const baseline = shadow.v1 || {};
+    const labels = { administrator_canary: "可进入管理员灰度", shadow: "继续 Shadow 观察", rollback: "建议回退到 V1" };
+    const percent = (value) => value == null ? "暂无数据" : `${(value * 100).toFixed(1)}%`;
+    const panel = document.createElement("section"); panel.className = "agent-rollout";
+    panel.append(Object.assign(document.createElement("h3"), { textContent: "智能发布" }));
+    panel.append(Object.assign(document.createElement("p"), { textContent: labels[recommendation] || recommendation }));
+    const status = document.createElement("small");
+    status.textContent = `固定评测：${fixed.passed ? "通过" : "未通过"}｜Shadow 样本：${shadow.v2_shadow_runs || 0}/30｜当前开关：${intelligence.enabled ? "已启用" : "关闭"}`;
+    panel.append(status);
+    const grid = document.createElement("div"); grid.className = "diagnostic-metrics";
+    [["V1 完成率", percent(baseline.completion_rate)], ["V2 完成率", percent(candidate.completion_rate)], ["V2 验收失败率", percent(candidate.verification_failure_rate)], ["V2 P95 时延", candidate.p95_seconds == null ? "暂无数据" : `${candidate.p95_seconds} 秒`]].forEach(([label, value]) => {
+      const item = document.createElement("div"); item.className = "diagnostic-metric";
+      item.append(Object.assign(document.createElement("span"), { textContent: label }), Object.assign(document.createElement("strong"), { textContent: value })); grid.appendChild(item);
+    });
+    panel.append(grid);
+    const modes = document.createElement("p");
+    modes.textContent = `Planner：${intelligence.planner || "off"}；证据：${intelligence.evidence || "off"}；编排：${intelligence.orchestrator || "off"}；验收：${intelligence.verifier || "off"}`;
+    panel.append(modes);
+    panel.append(Object.assign(document.createElement("small"), { textContent: "报告只统计当前账号的运行元数据，不读取对话或资料正文。达到门槛前不会自动开启 Active。" }));
+    els.runDetail.append(panel);
   },
 };

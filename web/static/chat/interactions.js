@@ -1,5 +1,5 @@
 window.AgentChatInteractions = {
-  appendConfirmationActions({ assistant, confirmation, api, state, appendTrace, renderContent, appendArtifact, refreshThreads, loadRuns }) {
+  appendConfirmationActions({ assistant, confirmation, api, state, appendTrace, renderContent, appendArtifact, appendCompletedFeedback, refreshThreads, loadRuns }) {
     if (assistant.wrapper.querySelector(".confirmation-actions")) return;
     const actions = document.createElement("div");
     actions.className = "confirmation-actions";
@@ -20,9 +20,10 @@ window.AgentChatInteractions = {
         });
         appendTrace(assistant, "已完成已确认操作");
         renderContent(assistant.content, result.content || "");
-        if (result.content) state.messages.push({ role: "assistant", content: result.content });
+        if (result.content) state.messages.push({ role: "assistant", content: result.content, run_id: confirmation.run_id });
         actions.remove();
         if (result.artifact) appendArtifact(assistant.wrapper, result.artifact);
+        if (appendCompletedFeedback) await appendCompletedFeedback(assistant.wrapper, confirmation.run_id);
         await Promise.all([refreshThreads(), loadRuns()]);
       } catch (error) {
         appendTrace(assistant, "已确认操作执行失败");

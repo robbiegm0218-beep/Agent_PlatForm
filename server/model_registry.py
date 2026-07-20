@@ -23,6 +23,8 @@ class ModelCapabilities:
     tool_calling: bool = False
     vision: bool = False
     structured_output: bool = False
+    reasoning_signal: bool = False
+    json_contract: bool = False
 
 
 @dataclass(frozen=True)

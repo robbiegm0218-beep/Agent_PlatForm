@@ -1,6 +1,7 @@
 import json
 import base64
 import io
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -89,6 +90,34 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertTrue(health["database_ready"])
         self.assertEqual(health["database"], "sqlite")
         self.assertEqual(health["environment"], "development")
+        self.assertIn("agent_intelligence", health)
+        self.assertIn("enabled", health["agent_intelligence"])
+
+    def test_agent_rollout_is_current_user_scoped(self):
+        report = self.request_json("/api/agent-rollout", token=self.token)
+        self.assertEqual(report["scope"], "current_user")
+        self.assertIn(report["recommendation"], {"shadow", "rollback", "administrator_canary"})
+        self.assertIn("v2_shadow_runs", report["shadow"])
+
+    def test_shadow_run_is_recorded_and_counted_by_rollout_report(self):
+        original = (app.AGENT_INTELLIGENCE_V2, app.AGENT_PLANNER_MODE, app.AGENT_EVIDENCE_MODE, app.AGENT_ORCHESTRATOR_MODE, app.AGENT_VERIFIER_MODE)
+        try:
+            app.AGENT_INTELLIGENCE_V2 = True
+            app.AGENT_PLANNER_MODE = "shadow"
+            app.AGENT_EVIDENCE_MODE = "shadow"
+            app.AGENT_ORCHESTRATOR_MODE = "shadow"
+            app.AGENT_VERIFIER_MODE = "shadow"
+            events = self.chat({"thread_id": "", "content": "请制定一份产品调研方案"})
+            self.assertEqual(events[-1]["event"], "done")
+            thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
+            run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+            context = json.loads(run["execution_context"])
+            self.assertIn("task_frame", context)
+            report = self.request_json("/api/agent-rollout", token=self.token)
+            self.assertEqual(report["shadow"]["v2_shadow_runs"], 1)
+            self.assertEqual(report["recommendation"], "shadow")
+        finally:
+            (app.AGENT_INTELLIGENCE_V2, app.AGENT_PLANNER_MODE, app.AGENT_EVIDENCE_MODE, app.AGENT_ORCHESTRATOR_MODE, app.AGENT_VERIFIER_MODE) = original
 
     def test_auth_service_login_logout_and_logout_all_sessions(self):
         second = self.request_json("/api/login", {"email": "admin@example.com", "password": "admin123"})["token"]
@@ -189,8 +218,11 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         thread_context = self.request_json(f"/api/threads/{meta['thread_id']}/context", token=self.token)
         sources = [item for item in thread_context["sources"] if item["kind"] == "knowledge"]
-        self.assertEqual([item["filename"] for item in sources], ["同一份资料.md", "另一份资料.md"])
-        self.assertEqual(sources[0]["excerpt"], "第一处命中")
+        # The fabricated document IDs are deliberately not visible to this test
+        # user.  The API must still deduplicate them without leaking metadata.
+        self.assertEqual(len(sources), 2)
+        self.assertTrue(all(item.get("redacted") for item in sources))
+        self.assertEqual([item["title"] for item in sources], ["资料引用已隐藏", "资料引用已隐藏"])
 
     def test_skill_zip_upload_versions_and_restore(self):
         original_skills_dir = app.SKILLS_DIR
@@ -403,10 +435,15 @@ class AgentPlatformApiTests(unittest.TestCase):
         )
         self.assertTrue(all(event["schema_version"] == 1 for event in run_detail["events"]))
         event_types = [event["type"] for event in run_detail["events"]]
-        self.assertEqual(
-            [event_type for event_type in event_types if event_type != "phase_changed"],
-            ["started", "execution_context", "skill_routed", "reasoning_summary", "knowledge_not_needed", "plan_created", "model_request", "completed"],
-        )
+        non_phase_events = [event_type for event_type in event_types if event_type != "phase_changed"]
+        self.assertEqual(non_phase_events[:4], ["started", "execution_context", "skill_routed", "reasoning_summary"])
+        self.assertIn("task_frame_planned", non_phase_events)
+        self.assertIn("orchestrator_transition", non_phase_events)
+        self.assertIn("knowledge_not_needed", non_phase_events)
+        self.assertIn("plan_created", non_phase_events)
+        self.assertIn("model_request", non_phase_events)
+        self.assertIn("task_verified", non_phase_events)
+        self.assertEqual(non_phase_events[-1], "completed")
         self.assertEqual(
             [json.loads(event["payload"])["to"] for event in run_detail["events"] if event["type"] == "phase_changed"],
             ["generating", "completed"],
@@ -478,8 +515,31 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertNotIn("storage_path", thread_context["outputs"][0])
             self.assertEqual(detail["run"]["status"], "completed")
             self.assertIn("artifact_created", [event["type"] for event in detail["events"]])
+            artifact_verification = [event for event in detail["events"] if event["type"] == "task_verified" and json.loads(event["payload"]).get("stage") == "artifact_created"]
+            self.assertEqual(len(artifact_verification), 1)
+            self.assertTrue(json.loads(artifact_verification[0]["payload"])["passed"])
             repeated = app.create_artifact(artifacts[0]["user_id"], run_id, "markdown", "ignored", "ignored")
             self.assertEqual(repeated["id"], result["artifact"]["id"])
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_artifact_command_can_use_the_previous_answer_as_file_content(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        try:
+            thread = self.request_json("/api/threads", {"title": "上文生成文件"}, self.token)["thread"]
+            with app.db() as conn:
+                conn.execute("INSERT INTO messages (id, thread_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)",
+                    ("previous_answer", thread["id"], "这是需要完整写入文件的上一条回答。\n\n包含第二段。", app.now()))
+            events = self.chat({"thread_id": thread["id"], "content": "把上面内容生成MD文件"})
+            self.assertEqual(events[-1]["event"], "confirmation")
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            result = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30)
+            self.assertEqual(result["content"], "已根据上一次回答生成文件。")
+            downloaded, content_type = self.download_artifact(result["artifact"]["id"])
+            self.assertEqual(content_type, "text/markdown")
+            self.assertIn("这是需要完整写入文件的上一条回答。", downloaded.decode("utf-8"))
+            self.assertNotIn("把上面内容生成MD文件", downloaded.decode("utf-8"))
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
 
@@ -552,7 +612,7 @@ class AgentPlatformApiTests(unittest.TestCase):
             app.ARTIFACT_DIR = original_artifact_dir
 
     def test_local_tool_execution_is_bounded_and_audited(self):
-        events = self.chat({"thread_id": "", "content": "请告诉我平台状态"})
+        events = self.chat({"thread_id": "", "content": "请分析当前平台状态，并给出优化方案"})
         self.assertEqual(events[-1]["event"], "done")
         self.assertIn("平台状态", "".join(event["data"].get("content", "") for event in events))
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
@@ -565,6 +625,9 @@ class AgentPlatformApiTests(unittest.TestCase):
         tool_result = next(json.loads(event["payload"]) for event in detail["events"] if event["type"] == "tool_result")
         self.assertTrue(tool_call["tool_call_id"])
         self.assertEqual(tool_call["tool_call_id"], tool_result["tool_call_id"])
+        tool_steps = [step for step in detail["steps"] if json.loads(step["input_json"]).get("phase") == "executing_tool"]
+        self.assertEqual(len(tool_steps), 1)
+        self.assertEqual(tool_steps[0]["status"], "completed")
 
     def test_high_value_task_records_reflection_without_private_reasoning(self):
         events = self.chat({"thread_id": "", "content": "请写一份产品调研方案"})
@@ -611,6 +674,8 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["sample_size"], 1)
         self.assertIn("quick", metrics["tiers"])
         self.assertIn("success_rate", metrics["tools"])
+        self.assertIn("executor", metrics["model_roles"])
+        self.assertGreaterEqual(metrics["model_roles"]["executor"]["calls"], 1)
         self.assertIn("confirmation_rejection_rate", metrics["tools"])
         self.assertGreaterEqual(metrics["tools"]["average_duration_ms"], 0)
         audit_runs = self.request_json("/api/runs?tier=quick", token=self.token)["runs"]
@@ -710,6 +775,38 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(matches[0]["document_id"], general["id"])
         self.request_json(f"/api/folders/{space['id']}", token=self.token, method="DELETE")
         self.assertEqual(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"]), [])
+
+    def test_project_knowledge_delete_requires_space_owner(self):
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("knowledge_delete_member", "knowledge-delete-member@example.com", app.hash_password("member123"), "资料成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "knowledge-delete-member@example.com", "password": "member123"})["token"]
+        space = self.request_json("/api/folders", {"name": "资料权限项目", "section": "project"}, self.token)["folder"]
+        self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "knowledge-delete-member@example.com"}, self.token)
+        document = self.request_json(f"/api/folders/{space['id']}/knowledge", {
+            "filename": "仅所有者可删.md", "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("受保护的项目资料".encode("utf-8")).decode("ascii"),
+        }, self.token)["document"]
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request_json(f"/api/knowledge/{document['id']}", token=member_token, method="DELETE")
+        self.assertEqual(denied.exception.code, 404)
+        self.assertTrue(self.request_json(f"/api/knowledge/{document['id']}", token=self.token, method="DELETE")["ok"])
+
+    def test_historical_knowledge_sources_are_redacted_when_viewer_loses_access(self):
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", ("citation_member", "citation-member@example.com", app.hash_password("member123"), "引用成员", app.now()))
+        member_token = self.request_json("/api/login", {"email": "citation-member@example.com", "password": "member123"})["token"]
+        space = self.request_json("/api/folders", {"name": "历史引用项目", "section": "project"}, self.token)["folder"]
+        self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "citation-member@example.com"}, self.token)
+        thread = self.request_json("/api/threads", {"title": "历史资料任务", "folder_id": space["id"]}, self.token)["thread"]
+        with app.db() as conn:
+            conn.execute("""INSERT INTO runs (id, thread_id, status, model, started_at, execution_context)
+                VALUES (?, ?, 'completed', 'test', ?, ?)""", ("redacted_source_run", thread["id"], app.now(), json.dumps({"knowledge_refs": [{"document_id": "deleted_or_private_doc", "filename": "机密路线图.md", "position": 0, "excerpt": "不得向项目成员展示"}]})))
+        context = self.request_json(f"/api/threads/{thread['id']}/context", token=member_token)
+        self.assertEqual(context["sources"], [{"kind": "knowledge", "title": "资料引用已隐藏", "redacted": True, "run_id": "redacted_source_run", "used_at": context["sources"][0]["used_at"]}])
+        detail = self.request_json(f"/api/folders/{space['id']}", token=member_token)
+        self.assertEqual(detail["sources"][0]["title"], "资料引用已隐藏")
+        self.assertTrue(detail["sources"][0]["redacted"])
+        self.assertNotIn("机密路线图", json.dumps({"sources": detail["sources"]}, ensure_ascii=False))
 
     def test_execution_modes_are_frozen_and_constrain_knowledge_and_file_tools(self):
         off_events = self.chat({
@@ -903,6 +1000,9 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.token,
         )
         self.assertTrue(feedback["citation_correct"])
+        answer_feedback = self.request_json(f"/api/runs/{run['id']}/feedback", {"rating": -1, "reason_code": "inaccurate"}, self.token)
+        self.assertEqual(answer_feedback["reason_code"], "inaccurate")
+        self.assertEqual(self.request_json(f"/api/runs/{run['id']}", token=self.token)["feedback"]["reason_code"], "inaccurate")
         metrics = self.request_json("/api/metrics", token=self.token)
         self.assertEqual(metrics["feedback"]["citation_assessed"], 1)
         self.assertEqual(metrics["feedback"]["citation_accuracy"], 1.0)
@@ -995,6 +1095,15 @@ class AgentPlatformApiTests(unittest.TestCase):
         text = app.extract_knowledge_text("budget.xlsx", workbook.getvalue())
         self.assertIn("【工作表：预算】", text)
         self.assertIn("项目 | 预算", text)
+
+    def test_image_knowledge_uses_bounded_local_ocr_without_network(self):
+        completed = subprocess.CompletedProcess(["tesseract"], 0, stdout="产品指标：42".encode("utf-8"), stderr=b"")
+        with patch.object(app, "TESSERACT_BINARY", "/opt/homebrew/bin/tesseract"), patch.object(app.subprocess, "run", return_value=completed) as run:
+            text = app.extract_knowledge_text("指标截图.png", b"\x89PNG\r\n\x1a\nimage")
+        self.assertIn("【图片 OCR（本地）：指标截图.png】", text)
+        self.assertIn("产品指标：42", text)
+        self.assertEqual(run.call_args.kwargs["timeout"], 25)
+        self.assertEqual(run.call_args.kwargs["input"], b"\x89PNG\r\n\x1a\nimage")
 
     def test_knowledge_search_is_strictly_isolated_by_user(self):
         with app.db() as conn:
@@ -1100,6 +1209,18 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertTrue(detail["artifact"]["filename"].endswith(".md"))
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
+
+
+class ExecutionPlanTests(unittest.TestCase):
+    def test_task_frame_generates_a_dynamic_run_plan(self):
+        frame = {"frame": {
+            "goal": "制定迁移方案",
+            "evidence_requirements": [{"id": "e1", "description": "现有系统约束"}],
+            "deliverables": [{"id": "d1", "description": "迁移步骤"}, {"id": "d2", "description": "风险清单"}],
+        }}
+        plan = app.build_execution_plan("制定迁移方案", [], [], frame)
+        self.assertEqual([item["id"] for item in plan], ["task_understanding", "evidence_1", "deliverable_1", "deliverable_2", "task_verification"])
+        self.assertIn("迁移步骤", plan[2]["title"])
 
 
 if __name__ == "__main__":

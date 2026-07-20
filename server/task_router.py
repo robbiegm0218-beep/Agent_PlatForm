@@ -146,10 +146,10 @@ class TaskRouter:
             model_route = "manual"
             model_reason = "用户手动选择模型"
             reasons.append(model_reason)
-        elif task_tier == "deep" and not needs_tools:
+        elif task_tier == "deep":
             model = self._deep_model
             model_route = "automatic"
-            model_reason = "复杂任务使用高质量模型"
+            model_reason = "复杂任务使用高质量模型；如需工具则校验其工具能力"
         else:
             model = self._default_model
             model_route = "automatic"

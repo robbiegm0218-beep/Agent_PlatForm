@@ -5,6 +5,11 @@ here incrementally so existing event and database contracts stay stable.
 """
 from __future__ import annotations
 
+import json
+
+from server.tool_approval import approval_preview
+from server.evidence_service import append_context_sources
+
 
 class ChatService:
     def __init__(self, db_factory=None, now=None, new_id=None):
@@ -70,6 +75,37 @@ class ChatService:
         execution_context["space_context"] = dependencies["load_space_context"](conn, user_id, thread_id)
         execution_context["retrieval_trace"] = retrieval_trace
         execution_context["route_summary"]["memory_count"] = len(memories)
+        planner = dependencies.get("plan_task_frame")
+        if planner:
+            task_frame = planner(content, task_profile, intent_plan, execution_modes, execution_context["structured_context"])
+            if task_frame:
+                execution_context["task_frame"] = task_frame
+                execution_context.setdefault("model_usage", {})["planner"] = {
+                    "model": execution_context.get("model_roles", {}).get("planner_model", task_profile["model"]),
+                    "calls": 1 if task_frame.get("status") == "model" else 0,
+                    "duration_ms": task_frame.get("duration_ms", 0), "token_estimate": task_frame.get("token_estimate", 0),
+                }
+        assess_evidence = dependencies.get("assess_knowledge_evidence")
+        if assess_evidence:
+            knowledge_refs, retrieval_trace, evidence_ledger = assess_evidence(
+                user_id, content, intent_plan, project_space_id,
+                (execution_context.get("task_frame") or {}).get("frame"), knowledge_refs, retrieval_trace, task_profile,
+            )
+            execution_context["knowledge_refs"] = knowledge_refs
+            execution_context["knowledge_match_count"] = len(knowledge_refs)
+            execution_context["route_summary"]["knowledge_matches"] = len(knowledge_refs)
+            execution_context["retrieval_trace"] = retrieval_trace
+            if evidence_ledger:
+                evidence_ledger = append_context_sources(
+                    evidence_ledger, has_user_input=bool(content.strip()),
+                    memory_ids=[str(item.get("id", "")) for item in memories if isinstance(item, dict)],
+                )
+                execution_context["evidence_ledger"] = evidence_ledger
+        build_orchestrator_trace = dependencies.get("build_orchestrator_trace")
+        if build_orchestrator_trace:
+            trace = build_orchestrator_trace(task_profile, execution_context)
+            if trace:
+                execution_context["orchestrator_trace"] = trace
         return execution_context, active_skills, intent_plan, knowledge_refs, retrieval_trace, memories
 
     def create_run_record(self, conn, *, thread_id: str, content: str, execution_context: dict,
@@ -88,6 +124,22 @@ class ChatService:
         append_event(conn, run_id, "execution_context", {"model": execution_context["model"], "task_tier": execution_context["task_tier"], "tool_ids": execution_context["allowed_tool_ids"], "tool_route_confidence": execution_context["tool_route_confidence"], "tool_route_reason": execution_context["tool_route_reason"], "execution_modes": execution_context["execution_modes"], "knowledge_matches": len(knowledge_refs), "memory_count": len(memories), "intent_plan": execution_context["intent_plan"]})
         append_event(conn, run_id, "skill_routed", {"route": execution_context["skill_route"], "skills": [skill["name"] for skill in active_skills]})
         append_event(conn, run_id, "reasoning_summary", {"items": dependencies["reasoning_summary"](execution_context)})
+        task_frame = execution_context.get("task_frame")
+        if task_frame:
+            append_event(conn, run_id, "task_frame_planned", {
+                "planner_version": task_frame["planner_version"], "mode": task_frame["mode"],
+                "eligible": task_frame["eligible"], "status": task_frame["status"],
+                "fallback_reason": task_frame["fallback_reason"], "duration_ms": task_frame["duration_ms"],
+                "token_estimate": task_frame["token_estimate"], "summary": task_frame["summary"],
+            })
+        evidence_ledger = execution_context.get("evidence_ledger")
+        if evidence_ledger:
+            append_event(conn, run_id, "evidence_assessed", {
+                "mode": execution_context.get("retrieval_trace", {}).get("evidence_mode", "shadow"),
+                "summary": dependencies["evidence_summary"](evidence_ledger),
+            })
+        for transition in execution_context.get("orchestrator_trace", []):
+            append_event(conn, run_id, "orchestrator_transition", {"mode": "shadow", **transition})
         knowledge_event = "knowledge_retrieved" if knowledge_refs else ("knowledge_no_match" if task_profile["needs_knowledge"] else "knowledge_not_needed")
         append_event(conn, run_id, knowledge_event, {"count": len(knowledge_refs), "intent": task_profile["knowledge_intent"]["reason"]})
         if retrieval_trace:
@@ -106,12 +158,38 @@ class ChatService:
         if artifact_kind:
             runtime.transition_run(conn, run_id, "awaiting_confirmation")
             runtime.transition_phase(conn, run_id, "awaiting_confirmation", detail={"step": "confirmation"})
-            conn.execute("""INSERT INTO run_approval_requests (id, run_id, position, step_id, request, status, created_at, operation_id, risk_level, tool_id, arguments_json, effect_summary, rollback_summary, idempotency_key)
-                VALUES (?, ?, 1, 'step_1', ?, ?, ?, ?, 'local_write', 'create_artifact', ?, ?, ?, ?)""", (new_id("approval"), run_id, dependencies["artifact_confirmation_text"](artifact_kind), "pending", now(), f"operation_{run_id}", dependencies["json"].dumps({"kind": artifact_kind}, ensure_ascii=False), f"在本机受控产物目录创建一个 {artifact_kind} 文件", "可在产物列表中删除该文件；删除不会影响原始对话和运行记录", f"artifact:{run_id}:{artifact_kind}"))
+            approval = approval_preview(
+                tool_id="create_artifact", tool_name="创建本地文件", risk_level="local_write",
+                arguments={"kind": artifact_kind}, visible_argument_keys={"kind"},
+                effect_summary=f"在本机受控产物目录创建一个 {artifact_kind} 文件",
+                rollback_summary="可在产物列表中删除该文件；删除不会影响原始对话和运行记录",
+                idempotency_key=f"artifact:{run_id}:{artifact_kind}",
+            )
+            self.create_tool_approval_request(
+                conn, run_id=run_id, position=1, step_id="step_1", approval=approval,
+                operation_id=f"operation_{run_id}", new_id=new_id, now=now,
+            )
             append_event(conn, run_id, "confirmation_requested", {"kind": artifact_kind, "target": "data/artifacts", "risk_level": "local_write", "tool_id": "create_artifact", "rollback_summary": "可在产物列表中删除该文件；删除不会影响原始对话和运行记录", "idempotency_key": f"artifact:{run_id}:{artifact_kind}"})
         elif knowledge_refs or execution_context["knowledge_route"] == "required_no_match":
             runtime.transition_phase(conn, run_id, "retrieving", detail={"knowledge_matches": len(knowledge_refs)})
         return run_id, knowledge_event
+
+    @staticmethod
+    def create_tool_approval_request(conn, *, run_id: str, position: int, step_id: str, approval: dict,
+                                     operation_id: str, new_id, now) -> str:
+        """Persist one sanitized risky-tool request for a resumable Run.
+
+        Callers must obtain ``approval`` from ``tool_approval.approval_preview``;
+        that keeps raw parameters outside this durable user-facing record.
+        """
+        approval_id = new_id("approval")
+        conn.execute("""INSERT INTO run_approval_requests (id, run_id, position, step_id, request, status, created_at, operation_id, risk_level, tool_id, arguments_json, effect_summary, rollback_summary, idempotency_key)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            approval_id, run_id, position, step_id, approval["request"], now(), operation_id,
+            approval["risk_level"], approval["tool_id"], approval["arguments_json"],
+            approval["effect_summary"], approval["rollback_summary"], approval["idempotency_key"],
+        ))
+        return approval_id
 
     def record_runtime_event(self, run_id: str, event_type: str, payload: dict, dependencies: dict) -> None:
         with self.db_factory() as conn:
@@ -120,12 +198,34 @@ class ChatService:
             runtime = dependencies["runtime"]
             if event_type == "tool_call" and current_phase in {"planning", "retrieving", "generating"}:
                 runtime.transition_phase(conn, run_id, "executing_tool", detail={"tool_id": payload.get("tool_id", "")})
+                self._advance_run_step(conn, run_id, "executing_tool", {"tool_id": payload.get("tool_id", "")})
             elif event_type == "reflection_started" and current_phase in {"generating", "executing_tool"}:
                 runtime.transition_phase(conn, run_id, "reflecting")
+                self._advance_run_step(conn, run_id, "reflecting", {})
             dependencies["append_event"](conn, run_id, event_type, payload)
+
+    def _advance_run_step(self, conn, run_id: str, phase: str, detail: dict) -> None:
+        """Move the saved plan at an observed runtime boundary, without inventing work."""
+        running = conn.execute("SELECT id FROM run_steps WHERE run_id = ? AND status = 'running' ORDER BY position LIMIT 1", (run_id,)).fetchone()
+        if running:
+            conn.execute("UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE id = ?", ("completed", json.dumps({"status": "completed", "observed_phase": phase}, ensure_ascii=False), self.now(), running["id"]))
+        next_step = None
+        for candidate in conn.execute("SELECT id, input_json FROM run_steps WHERE run_id = ? AND status = 'pending' ORDER BY position", (run_id,)).fetchall():
+            try:
+                if json.loads(candidate["input_json"] or "{}").get("phase") == phase:
+                    next_step = candidate
+                    break
+            except json.JSONDecodeError:
+                continue
+        if next_step:
+            conn.execute("UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE id = ?", ("running", json.dumps({"status": "running", **detail}, ensure_ascii=False), self.now(), next_step["id"]))
 
     def finalize_run(self, run_id: str, thread_id: str, content: str, answer: str, execution_context: dict, reflection: dict, dependencies: dict) -> None:
         with self.db_factory() as conn:
+            execution_context.setdefault("model_usage", {})["executor"] = {
+                "model": execution_context.get("model_roles", {}).get("executor_model", execution_context["model"]),
+                "calls": 1, "input_token_estimate": dependencies["estimate_tokens"](content), "output_token_estimate": dependencies["estimate_tokens"](answer),
+            }
             conn.execute("INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)", (self.new_id("msg"), thread_id, run_id, "assistant", answer, self.now()))
             dependencies["refresh_context"](conn, thread_id)
             runtime = dependencies["runtime"]
@@ -135,7 +235,22 @@ class ChatService:
                 runtime.transition_phase(conn, run_id, "completed")
             conn.execute("UPDATE runs SET execution_context = ?, reflection_snapshot = ?, input_tokens_estimate = ?, output_tokens_estimate = ?, tool_call_count = ? WHERE id = ?", (dependencies["json"].dumps(execution_context, ensure_ascii=False), dependencies["json"].dumps(reflection, ensure_ascii=False), dependencies["estimate_tokens"](content), dependencies["estimate_tokens"](answer), conn.execute("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND type = 'tool_call'", (run_id,)).fetchone()["count"], run_id))
             conn.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (self.now(), thread_id))
-            conn.execute("UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status IN ('pending', 'running')", ("completed", dependencies["json"].dumps({"answer_chars": len(answer), "status": "completed"}), self.now(), run_id))
+            output = dependencies["json"].dumps({"answer_chars": len(answer), "status": "completed"})
+            conn.execute("UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status = 'running'", ("completed", output, self.now(), run_id))
+            # A tool step that was never called is shown as skipped, rather
+            # than as a completed action. Other pending steps are completed by
+            # the final generation pass.
+            pending = conn.execute("SELECT id, input_json FROM run_steps WHERE run_id = ? AND status = 'pending'", (run_id,)).fetchall()
+            for step in pending:
+                try:
+                    phase = json.loads(step["input_json"] or "{}").get("phase")
+                except json.JSONDecodeError:
+                    phase = None
+                if phase == "executing_tool":
+                    step_status, step_output = "skipped", dependencies["json"].dumps({"status": "skipped", "reason": "模型判断无需调用授权工具"}, ensure_ascii=False)
+                else:
+                    step_status, step_output = "completed", output
+                conn.execute("UPDATE run_steps SET status = ?, output_json = ?, updated_at = ? WHERE id = ?", (step_status, step_output, self.now(), step["id"]))
             dependencies["append_event"](conn, run_id, "completed", {"length": len(answer)})
 
     def cancel_run(self, run_id: str, user_id: str, dependencies: dict) -> str:
@@ -202,6 +317,10 @@ class ChatService:
             conn.execute("UPDATE run_steps SET status = ?, error = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND status = 'running'", ("failed", error, dependencies["json"].dumps({"error": error[:500], "status": "failed"}), self.now(), run_id))
             return True
 
-    def resume_confirmed_artifact(self, run_id: str, user_id: str, executor):
-        """Service-owned confirmation-resume entry; executor keeps artifact I/O isolated."""
+    def resume_confirmed_operation(self, run_id: str, user_id: str, executor):
+        """Resume the approved operation from the same persisted Run."""
         return executor(run_id, user_id)
+
+    def resume_confirmed_artifact(self, run_id: str, user_id: str, executor):
+        """Compatibility name for the file-artifact operation."""
+        return self.resume_confirmed_operation(run_id, user_id, executor)

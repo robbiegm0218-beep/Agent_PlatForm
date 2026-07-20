@@ -99,9 +99,17 @@ window.AgentRunTrace = {
       knowledge_no_match: () => "本地知识库未命中，回答已标注为建议或待验证项",
       knowledge_not_needed: () => "本次问题未使用本地资料",
       plan_created: (payload) => `执行计划：${(payload.steps || []).length} 个步骤`,
+      task_frame_planned: (payload) => `任务理解：${payload.status === "model" ? "模型已生成" : "已使用安全回退"}`,
+      evidence_assessed: (payload) => `资料证据：${payload.summary?.decision === "sufficient" ? "已覆盖当前需求" : "仍有待补充项"}`,
+      orchestrator_transition: (payload) => `执行状态：${payload.to || "处理中"}`,
+      orchestrator_budget: (payload) => `本轮预算：模型 ${payload.model_calls || 0} 次，工具 ${payload.tool_calls || 0} 次`,
+      task_verified: (payload) => `任务验收：${payload.passed ? "通过" : payload.summary || "发现待补充项"}`,
+      model_role_selected: (payload) => `模型角色：${payload.role || "executor"} · ${payload.model || "未记录"}`,
+      next_action_assessed: (payload) => `下一步建议：${payload.type || "draft_answer"}（已校验）`,
+      clarification_requested: (payload) => `等待补充信息：${payload.reason || "任务关键信息不足"}`,
       model_request: (payload) => `已选择模型：${payload.model || run.model || "未记录"}`,
-      tool_call: (payload) => `正在调用工具：${payload.tool_name || payload.tool_id || "本地工具"}`,
-      tool_result: (payload) => `工具完成：${payload.tool_name || payload.tool_id || "本地工具"}`,
+      tool_call: (payload) => `正在调用工具：${payload.tool_name || payload.tool_id || "本地工具"}${payload.purpose ? `（${payload.purpose}）` : ""}`,
+      tool_result: (payload) => `工具完成：${payload.tool_name || payload.tool_id || "本地工具"}${payload.evidence_gap_status ? `（${payload.evidence_gap_status}）` : ""}`,
       tool_error: (payload) => `工具失败：${payload.tool_name || payload.tool_id || "本地工具"}`,
       reflection_started: () => "正在进行结果质量检查",
       reflection_revised: () => "已根据质量检查修订回答",
@@ -127,6 +135,39 @@ window.AgentRunTrace = {
       body.classList.toggle("hidden", expanded);
     });
     const nodes = [];
+    const context = parse(run.execution_context);
+    const taskFrame = context.task_frame?.frame;
+    if (taskFrame) {
+      const section = document.createElement("section"); section.className = "run-audit-layer";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "run-audit-layer-toggle"; toggle.setAttribute("aria-expanded", "false"); toggle.textContent = "任务理解";
+      const body = document.createElement("div"); body.className = "run-audit-layer-body hidden";
+      const items = [taskFrame.goal, ...(taskFrame.deliverables || []).map((item) => `交付：${item.description}`), ...(taskFrame.constraints || []).map((item) => `约束：${item.description}`)].filter(Boolean);
+      body.textContent = items.join("\n"); section.append(toggle, body); addToggle(toggle, body); nodes.push(section);
+    }
+    const ledger = context.evidence_ledger;
+    if (ledger) {
+      const section = document.createElement("section"); section.className = "run-audit-layer";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "run-audit-layer-toggle"; toggle.setAttribute("aria-expanded", "false"); toggle.textContent = ledger.decision === "sufficient" ? "证据与来源：已覆盖" : "证据与缺口：待补充";
+      const body = document.createElement("div"); body.className = "run-audit-layer-body hidden";
+      const missing = ledger.missing_requirement_ids || []; body.textContent = missing.length ? `待补充：${missing.join("、")}` : `已使用 ${ledger.items?.length || 0} 条授权资料证据`;
+      section.append(toggle, body); addToggle(toggle, body); nodes.push(section);
+      if (ledger.decision === "clarify") {
+        const card = document.createElement("section"); card.className = "run-clarification-card";
+        const labels = (ledger.missing_requirement_ids || []).join("、") || "任务范围或关键资料";
+        card.textContent = `需要你补充：${labels}。补充后可在当前对话继续，Agent 会基于已保存的运行上下文重新处理。`;
+        nodes.push(card);
+      }
+    }
+    const verificationEvent = [...events].reverse().find((event) => event.type === "task_verified");
+    if (verificationEvent) {
+      const verification = parse(verificationEvent.payload);
+      const section = document.createElement("section"); section.className = "run-audit-layer";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "run-audit-layer-toggle"; toggle.setAttribute("aria-expanded", "false"); toggle.textContent = verification.passed ? "任务验收：通过" : "任务验收：待补充";
+      const body = document.createElement("div"); body.className = "run-audit-layer-body hidden";
+      const gaps = verification.missing_evidence || [];
+      body.textContent = [verification.summary, gaps.length ? `待补充证据：${gaps.join("、")}` : ""].filter(Boolean).join("\n");
+      section.append(toggle, body); addToggle(toggle, body); nodes.push(section);
+    }
     if (summaryItems.length) {
       const reasoning = document.createElement("section"); reasoning.className = "reasoning-summary";
       const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "reasoning-summary-toggle"; toggle.setAttribute("aria-expanded", "false"); toggle.innerHTML = "<span>推理摘要（已保存）</span><span class=\"reasoning-summary-chevron\">⌄</span>";

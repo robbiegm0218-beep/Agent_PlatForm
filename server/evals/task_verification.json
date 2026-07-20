@@ -1,0 +1,8 @@
+{"version":1,"cases":[
+{"id":"v01","template":"answer"},{"id":"v02","template":"answer"},{"id":"v03","template":"answer"},{"id":"v04","template":"answer"},{"id":"v05","template":"answer"},
+{"id":"v06","template":"knowledge_gap"},{"id":"v07","template":"knowledge_gap"},{"id":"v08","template":"knowledge_gap"},{"id":"v09","template":"knowledge_gap"},{"id":"v10","template":"knowledge_gap"},
+{"id":"v11","template":"analysis_missing"},{"id":"v12","template":"analysis_missing"},{"id":"v13","template":"analysis_missing"},{"id":"v14","template":"analysis_missing"},{"id":"v15","template":"analysis_missing"},
+{"id":"v16","template":"plan_missing"},{"id":"v17","template":"plan_missing"},{"id":"v18","template":"plan_missing"},{"id":"v19","template":"plan_missing"},{"id":"v20","template":"plan_missing"},
+{"id":"v21","template":"plan_complete"},{"id":"v22","template":"plan_complete"},{"id":"v23","template":"plan_complete"},{"id":"v24","template":"plan_complete"},{"id":"v25","template":"plan_complete"},
+{"id":"v26","template":"code_missing"},{"id":"v27","template":"code_missing"},{"id":"v28","template":"code_missing"},{"id":"v29","template":"code_missing"},{"id":"v30","template":"code_missing"},
+{"id":"v31","template":"code_complete"},{"id":"v32","template":"code_complete"},{"id":"v33","template":"code_complete"},{"id":"v34","template":"code_complete"},{"id":"v35","template":"code_complete"}]}

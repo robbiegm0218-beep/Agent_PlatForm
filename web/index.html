@@ -145,6 +145,7 @@
             <div class="run-drawer-tabs" role="tablist" aria-label="运行记录视图">
               <button id="threadRunsTab" class="run-drawer-tab active" type="button" role="tab" aria-selected="true">运行详情</button>
               <button id="retrievalDiagnosticsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">检索质量</button>
+              <button id="agentRolloutButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">智能发布</button>
               <button id="viewAllRunsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">全部审计</button>
             </div>
             <button id="closeRunDrawer" class="icon-button" type="button" aria-label="关闭">×</button>
@@ -210,10 +211,10 @@
           <header class="page-header">
             <div>
               <h2>知识库</h2>
-              <span>本地资料仅在检索命中后用于对话</span>
+              <span>本地资料仅在检索命中后用于对话；图片会在本机进行 OCR，不会上传到外部服务</span>
             </div>
             <button id="uploadKnowledgeButton" class="icon-text-button" type="button">上传资料</button>
-            <input id="knowledgeFileInput" type="file" accept=".md,.txt,.docx,.pdf,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" class="hidden" />
+            <input id="knowledgeFileInput" type="file" accept=".md,.txt,.docx,.pdf,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/png,image/jpeg,image/webp,image/tiff" class="hidden" />
           </header>
           <div class="knowledge-toolbar">
             <input id="knowledgeSearch" type="search" placeholder="检索本地资料" />

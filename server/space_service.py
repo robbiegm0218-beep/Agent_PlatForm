@@ -116,6 +116,11 @@ class SpaceService:
                 JOIN users ON users.id = knowledge_documents.created_by_user_id
                 WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
                 ORDER BY knowledge_documents.created_at DESC""", (space_id,)).fetchall()
+            visible_document_ids = {row["id"] for row in conn.execute("""SELECT id FROM knowledge_documents
+                WHERE (scope = 'general' AND user_id = ?) OR
+                (scope = 'project' AND EXISTS (SELECT 1 FROM space_members
+                    WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))""",
+                (user_id, user_id)).fetchall()}
 
         sources: list[dict] = []
         seen_sources: set[tuple[str, str]] = set()
@@ -127,6 +132,9 @@ class SpaceService:
                 if key in seen_sources:
                     continue
                 seen_sources.add(key)
+                if str(reference.get("document_id", "")) not in visible_document_ids:
+                    sources.append({"kind": "knowledge", "title": "资料引用已隐藏", "redacted": True, "task_title": run["title"]})
+                    continue
                 sources.append({"kind": "knowledge", "title": str(reference.get("filename", "本地资料"))[:255], "excerpt": str(reference.get("excerpt", ""))[:320], "task_title": run["title"]})
         for event in web_events:
             for source in parse_json(event["payload"]).get("sources", []):

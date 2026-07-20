@@ -10,10 +10,10 @@
 | --- | --- |
 | 空间、任务、对话历史与 Markdown 回答渲染 | 空间可独立展开、排序，并在统一概览中查看关联任务、产物、知识库/网页来源和成员；任务可按空间归属或独立存在；空间成员支持本地邀请与移除（所有者受保护）；SQLite 持久化、PBKDF2-SHA256 密码散列、会话过期与按用户限流 |
 | DeepSeek 默认模型与 OpenAI 兼容供应商接入、快速/标准/深度任务档位 | Provider 注册表、环境变量密钥隔离、确定性模型/工具路由、有限步 Agent Loop |
-| Markdown、TXT、Word、PDF、Excel（XLSX）知识库上传、检索与引用 | 仅注入命中片段；PDF 保留页码、Excel 保留工作表/单元格来源；资料按用户隔离，可删除 |
+| Markdown、TXT、Word、PDF、Excel（XLSX）和图片知识库上传、检索与引用 | 仅注入命中片段；PDF 保留页码、Excel 保留工作表/单元格来源；PNG/JPG/WebP/TIFF 通过本机 Tesseract OCR 解析，不上传外部服务；资料按用户隔离，可删除 |
 | JSON、Markdown、标准 Agent Skill ZIP 技能包管理 | 版本归档、启用/停用与回滚；ZIP 资源受限保存，脚本不会执行 |
-| Markdown、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
-| 运行详情、步骤、工具调用与取消 | Run 状态机、事件序号和版本、全局审计筛选；对资料引用可直接评价准确性 |
+| Markdown、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；“上面/上文内容生成文件”会复用上一条 Agent 回答作为文件正文；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
+| 运行详情、步骤、工具调用与取消 | Run 状态机、事件序号和版本、全局审计筛选；回答可评价“有帮助/没帮助”并记录原因；资料引用可逐文档评价准确性 |
 | 平台状态、工作区文件名检索、可选网页检索 | 可解释的工具意图路由；优先 Tavily MCP、失败回退 REST；应用页可按 Schema 填参执行已注册的只读工具，失败可重试且保留安全审计摘要 |
 
 ## 架构与执行边界
@@ -93,6 +93,13 @@ DEEPSEEK_MODEL="deepseek-v4-flash"
 DEEPSEEK_DEEP_MODEL="deepseek-v4-pro"
 DEEPSEEK_SSL_VERIFY="true"
 # 可选：DEEPSEEK_CA_FILE="/path/to/ca.pem"
+
+# P45 智能执行闭环：默认全部关闭。先只启用 shadow 收集对比数据。
+AGENT_INTELLIGENCE_V2="false"
+AGENT_PLANNER_MODE="off"       # off | shadow | active
+AGENT_EVIDENCE_MODE="off"      # off | shadow | active
+AGENT_ORCHESTRATOR_MODE="off"  # off | shadow | active
+AGENT_VERIFIER_MODE="off"      # off | shadow | active
 ```
 
 | 变量 | 作用 | 默认值 |
@@ -103,8 +110,22 @@ DEEPSEEK_SSL_VERIFY="true"
 | `SESSION_TTL_SECONDS` | 登录会话有效期 | 14 天 |
 | `RATE_LIMIT_PER_MINUTE` | 单用户每分钟请求上限 | 30 |
 | `MAX_TOOL_STEPS` | 单次 Run 最大工具循环步数 | 4 |
+| `AGENT_INTELLIGENCE_V2` | P45 总开关；关闭即回退既有 V1 流程 | `false` |
+| `AGENT_*_MODE` | Planner、Evidence、Orchestrator、Verifier 分别控制为关闭、Shadow 或受控 Active | `off` |
 
 本地排查证书问题时可临时设置 `DEEPSEEK_SSL_VERIFY=false`；生产环境应配置正确 CA 并保持校验开启。
+
+### P45 灰度顺序
+
+先启用 `AGENT_INTELLIGENCE_V2=true`，并将四个 `AGENT_*_MODE` 均设为 `shadow`。Shadow 不改变用户最终回答或工具执行，只记录 TaskFrame、证据判断和状态预演。积累至少 30 个 V2 Run 后执行：
+
+```bash
+python3 -m server.evaluate_p45_rollout --database agent_platform.db --output data/evaluations/p45-rollout.json
+```
+
+报告仅会建议进入管理员灰度，不会自动开启 Active。出现 `rollback` 时将 `AGENT_INTELLIGENCE_V2=false` 并重启服务即可回到 V1，历史 Run 不受影响。只有报告为 `administrator_canary` 后，才可由管理员将相应模式逐项改为 `active`。
+
+回答评价与逐文档引用评价都会保存为用户隔离的 Run 元数据和审计事件。它们用于后续质量诊断、候选检索策略实验和版本对比，不会因单条评价直接改写模型回答或线上检索结果。
 
 ### 可选：接入 OpenAI 兼容供应商
 

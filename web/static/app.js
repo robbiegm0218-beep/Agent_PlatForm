@@ -869,6 +869,12 @@ async function loadRetrievalDiagnostics() {
   auditView.renderRetrievalDiagnostics(els, data, { onSelectRun: loadRunDetail, governance });
 }
 
+async function loadAgentRollout() {
+  els.runList.innerHTML = "";
+  const data = await api("/api/agent-rollout");
+  auditView.renderAgentRollout(els, data);
+}
+
 function renderMessages() {
   els.messages.innerHTML = "";
   if (!state.messages.length) {
@@ -917,15 +923,20 @@ function appendChatAnswerFeedback(wrapper, runId, detail) {
   const label = document.createElement("span"); label.textContent = "这次回答有帮助吗？";
   const helpful = document.createElement("button"); helpful.type = "button"; helpful.className = "secondary"; helpful.textContent = "👍 有帮助";
   const unhelpful = document.createElement("button"); unhelpful.type = "button"; unhelpful.className = "secondary"; unhelpful.textContent = "👎 没帮助";
+  const reason = document.createElement("select"); reason.className = "hidden"; reason.setAttribute("aria-label", "选择回答问题原因");
+  [["", "请选择原因"], ["goal_misunderstood", "未理解目标"], ["insufficient_evidence", "资料不足"], ["inaccurate", "结论不准确"], ["not_executed", "没有执行"], ["too_verbose", "过于啰嗦"], ["format_unsuitable", "格式不合适"]].forEach(([value, text]) => reason.append(new Option(text, value)));
   const savedRating = detail.feedback?.rating;
   const setSelected = (rating) => {
     helpful.classList.toggle("active", rating === 1);
     unhelpful.classList.toggle("active", rating === -1);
+    reason.classList.toggle("hidden", rating !== -1);
   };
   const save = async (rating, button) => {
+    if (rating === -1 && !reason.value) { setSelected(-1); reason.focus(); return; }
+    if (rating === 1) reason.value = "";
     helpful.disabled = true; unhelpful.disabled = true;
     try {
-      await api(`/api/runs/${runId}/feedback`, { method: "POST", body: JSON.stringify({ rating }) });
+      await api(`/api/runs/${runId}/feedback`, { method: "POST", body: JSON.stringify({ rating, reason_code: rating === -1 ? reason.value : "" }) });
       setSelected(rating);
     } catch (error) {
       button.textContent = error.message || "保存失败";
@@ -934,9 +945,11 @@ function appendChatAnswerFeedback(wrapper, runId, detail) {
     }
   };
   helpful.addEventListener("click", () => save(1, helpful));
-  unhelpful.addEventListener("click", () => save(-1, unhelpful));
+  unhelpful.addEventListener("click", () => { setSelected(-1); save(-1, unhelpful); });
+  reason.addEventListener("change", () => { if (reason.value) save(-1, unhelpful); });
   setSelected(savedRating);
-  feedback.append(label, helpful, unhelpful);
+  reason.value = detail.feedback?.reason_code || "";
+  feedback.append(label, helpful, unhelpful, reason);
   wrapper.append(feedback);
 }
 
@@ -1200,7 +1213,11 @@ async function sendMessage(content, { retry = false } = {}) {
     executionTimer.stop("已完成");
     renderMessageContent(assistant.content, assistantContent);
     state.messages.push({ role: "assistant", content: assistantContent, run_id: completedRunId });
-    if (completedRunId) await appendChatCitationFeedback(assistant.wrapper, completedRunId);
+    if (completedRunId) {
+      const runDetail = await api(`/api/runs/${completedRunId}`);
+      appendChatAnswerFeedback(assistant.wrapper, completedRunId, runDetail);
+      await appendChatCitationFeedback(assistant.wrapper, completedRunId, runDetail);
+    }
   } catch (error) {
     const message = error.message || "发送失败";
     if (assistant) {
@@ -1227,6 +1244,11 @@ function appendConfirmationActions(assistant, confirmation, sourceContent) {
     appendTrace: appendExecutionTrace,
     renderContent: renderMessageContent,
     appendArtifact: appendArtifactLink,
+    appendCompletedFeedback: async (wrapper, runId) => {
+      const detail = await api(`/api/runs/${runId}`);
+      appendChatAnswerFeedback(wrapper, runId, detail);
+      await appendChatCitationFeedback(wrapper, runId, detail);
+    },
     refreshThreads: refreshThreadList,
     loadRuns,
   });
@@ -1399,7 +1421,7 @@ els.newThreadButton.addEventListener("click", () => {
 els.threadSearch.addEventListener("input", renderThreads);
 
 function setRunDrawerTab(tab) {
-  [[els.threadRunsTab, "thread"], [els.retrievalDiagnosticsButton, "diagnostics"], [els.viewAllRunsButton, "audit"]].forEach(([button, name]) => {
+  [[els.threadRunsTab, "thread"], [els.retrievalDiagnosticsButton, "diagnostics"], [els.agentRolloutButton, "rollout"], [els.viewAllRunsButton, "audit"]].forEach(([button, name]) => {
     const active = name === tab;
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
@@ -1438,6 +1460,13 @@ els.retrievalDiagnosticsButton.addEventListener("click", async () => {
   setRunDrawerTab("diagnostics");
   try { await loadRetrievalDiagnostics(); }
   catch (error) { els.runDetail.textContent = error.message || "无法加载检索质量诊断"; }
+});
+els.agentRolloutButton.addEventListener("click", async () => {
+  els.runDrawer.classList.remove("hidden");
+  els.runFilters.classList.add("hidden");
+  setRunDrawerTab("rollout");
+  try { await loadAgentRollout(); }
+  catch (error) { els.runDetail.textContent = error.message || "无法加载智能发布报告"; }
 });
 [els.runStatusFilter, els.runTierFilter, els.runKnowledgeFilter].forEach((select) => {
   select.addEventListener("change", () => loadAuditRuns().catch((error) => { els.runDetail.textContent = error.message; }));
