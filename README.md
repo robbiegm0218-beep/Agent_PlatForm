@@ -276,6 +276,7 @@ python3 -m server.evaluate_skill_contracts
 
 决策质量评测位于 [`docs/decision-quality.md`](docs/decision-quality.md)，用于固定评测 Planner、检索、澄清和项目空间边界；策略版本会冻结到每个 Run 的执行上下文中。
 
+<!--
 ## 当前限制与下一步
 
 - 当前是单进程、单 Agent 运行模型，适合交互式与分钟内完成的任务；不适合长时间后台工作、跨进程等待或高并发 Worker。
@@ -285,3 +286,4 @@ python3 -m server.evaluate_skill_contracts
 - SQLite 适合当前单机部署；当需要多实例写入、高并发或分布式 Worker 时，再评估迁移到服务化数据库和持久化执行框架。
 
 详细的完成项与迭代顺序见 [实施计划](docs/implementation-plan.md)。
+-->
