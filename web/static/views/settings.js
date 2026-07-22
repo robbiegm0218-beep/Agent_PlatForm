@@ -18,12 +18,22 @@ window.AgentSettingsView = {
       body: JSON.stringify({ confirmation: "EXPORT_MY_DATA" }),
     });
   },
+  async requestAccountDeletion(api) {
+    return api("/api/account-deletion/request", {
+      method: "POST",
+      body: JSON.stringify({ confirmation: "DELETE_MY_ACCOUNT" }),
+    });
+  },
+  async cancelAccountDeletion(api) {
+    return api("/api/account-deletion/cancel", { method: "POST", body: JSON.stringify({}) });
+  },
   async loadHostingStatus(api) {
-    const [startup, security, usage] = await Promise.all([
+    const [startup, security, usage, deletion] = await Promise.all([
       api("/api/startup-status"),
       api("/api/security-events"),
       api("/api/personal-usage"),
+      api("/api/account-deletion"),
     ]);
-    return { startup, events: security.events || [], usage };
+    return { startup, events: security.events || [], usage, deletion };
   },
 };

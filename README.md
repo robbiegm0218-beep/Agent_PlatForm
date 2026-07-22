@@ -241,7 +241,9 @@ python3 -m server.startup_checks --create-directories
 | `AGENT_DATABASE_PATH` | SQLite 数据库文件 | `agent_platform.db` |
 | `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 生产环境首个管理员凭据 | 必填 |
-| `PERSONAL_DAILY_RUN_LIMIT` / `PERSONAL_MONTHLY_RUN_LIMIT` | 新任务每日 / 30 天硬上限；`0` 表示关闭该限制 | `100` / `1000` |
+| `PERSONAL_*_RUN_LIMIT` / `PERSONAL_*_TOKEN_LIMIT` | 新任务每日 / 30 天的任务数与 Token 估算硬上限；`0` 表示关闭对应限制 | `100` / `1000`；`200000` / `2000000` |
+| `PERSONAL_SINGLE_RUN_TOKEN_LIMIT` | 单次任务的输入估算加最大输出预留上限；超过时提示拆分任务 | `16000` |
+| `LOGIN_FAILURE_LIMIT` / `LOGIN_LOCK_SECONDS` | 按账号散列和来源散列累计失败次数，并临时锁定登录 | `5` / `900` |
 
 当前开发机没有 Docker，因此仓库中的 Dockerfile 与 Compose 配置尚未完成真实镜像构建验证；部署前请在目标机器运行 `docker compose config` 与上述启动命令。
 

@@ -93,6 +93,21 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("agent_intelligence", health)
         self.assertIn("enabled", health["agent_intelligence"])
 
+    def test_api_security_headers_and_cross_origin_write_are_rejected(self):
+        request = urllib.request.Request(f"{self.base_url}/api/health")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            self.assertIn("form-action 'self'", response.headers["Content-Security-Policy"])
+            self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.headers["Cross-Origin-Resource-Policy"], "same-origin")
+        cross_origin = urllib.request.Request(
+            f"{self.base_url}/api/login", data=b'{}', method="POST",
+            headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(cross_origin, timeout=3)
+        self.assertEqual(denied.exception.code, 403)
+
     def test_agent_rollout_is_current_user_scoped(self):
         report = self.request_json("/api/agent-rollout", token=self.token)
         self.assertEqual(report["scope"], "current_user")
@@ -183,7 +198,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         health = self.request_json("/api/health")
         self.assertTrue(health["schema"]["ready"])
         with app.db() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], app.migration_status(conn)["latest_version"])
 
     def test_personal_data_export_requires_confirmation_and_excludes_credentials(self):
         thread = self.request_json("/api/threads", {"title": "导出测试"}, self.token)["thread"]
@@ -212,6 +227,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("day", usage)
         self.assertIn("month", usage)
         self.assertIn("storage", usage)
+        self.assertEqual(usage["limits"]["daily_tokens"], app.PERSONAL_DAILY_TOKEN_LIMIT)
         self.assertEqual(usage["day"]["runs"], 0)
         self.assertIn("Token", usage["token_note"])
 
@@ -231,6 +247,33 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertTrue(self.request_json("/api/threads", token=self.token)["threads"])
         finally:
             app.PERSONAL_DAILY_RUN_LIMIT = original_limit
+
+    def test_single_run_token_budget_blocks_oversized_new_chat(self):
+        original_limit = app.PERSONAL_SINGLE_RUN_TOKEN_LIMIT
+        app.PERSONAL_SINGLE_RUN_TOKEN_LIMIT = 1
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as limited:
+                self.request_json("/api/chat", {"thread_id": "", "content": "新的任务"}, self.token)
+            self.assertEqual(limited.exception.code, 429)
+        finally:
+            app.PERSONAL_SINGLE_RUN_TOKEN_LIMIT = original_limit
+
+    def test_login_failures_lock_the_source_without_storing_passwords(self):
+        original_limit = app.AUTH_SERVICE.login_failure_limit
+        app.AUTH_SERVICE.login_failure_limit = 1
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as failed:
+                self.request_json("/api/login", {"email": "admin@example.com", "password": "wrong-password"})
+            self.assertEqual(failed.exception.code, 429)
+            with self.assertRaises(urllib.error.HTTPError) as locked:
+                self.request_json("/api/login", {"email": "admin@example.com", "password": "admin123"})
+            self.assertEqual(locked.exception.code, 429)
+            with app.db() as conn:
+                throttle = conn.execute("SELECT scope_key, failure_count FROM login_throttles").fetchone()
+            self.assertTrue(throttle["scope_key"].startswith(("email:", "source:")))
+            self.assertEqual(throttle["failure_count"], 1)
+        finally:
+            app.AUTH_SERVICE.login_failure_limit = original_limit
 
     def test_account_deletion_request_requires_confirmation_and_can_be_cancelled(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:

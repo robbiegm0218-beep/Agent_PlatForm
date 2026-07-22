@@ -146,6 +146,9 @@ PERSONAL_DAILY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_DAILY_RUN_LIMIT",
 PERSONAL_MONTHLY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_MONTHLY_RUN_LIMIT", "1000")))
 PERSONAL_DAILY_TOKEN_LIMIT = max(0, int(os.environ.get("PERSONAL_DAILY_TOKEN_LIMIT", "200000")))
 PERSONAL_MONTHLY_TOKEN_LIMIT = max(0, int(os.environ.get("PERSONAL_MONTHLY_TOKEN_LIMIT", "2000000")))
+PERSONAL_SINGLE_RUN_TOKEN_LIMIT = max(0, int(os.environ.get("PERSONAL_SINGLE_RUN_TOKEN_LIMIT", "16000")))
+LOGIN_FAILURE_LIMIT = max(1, int(os.environ.get("LOGIN_FAILURE_LIMIT", "5")))
+LOGIN_LOCK_SECONDS = max(1, int(os.environ.get("LOGIN_LOCK_SECONDS", "900")))
 AGENT_INTELLIGENCE_V2 = os.environ.get("AGENT_INTELLIGENCE_V2", "false").lower() in {"1", "true", "yes"}
 AGENT_PLANNER_MODE = os.environ.get("AGENT_PLANNER_MODE", "off").strip().lower()
 if AGENT_PLANNER_MODE not in {"off", "shadow", "active"}:
@@ -777,7 +780,7 @@ def db() -> sqlite3.Connection:
 
 
 SPACE_SERVICE = SpaceService(db, now, new_id)
-AUTH_SERVICE = AuthService(db, now, new_id, verify_password, hash_password, SESSION_TTL_SECONDS, SPACE_SERVICE)
+AUTH_SERVICE = AuthService(db, now, new_id, verify_password, hash_password, SESSION_TTL_SECONDS, SPACE_SERVICE, LOGIN_FAILURE_LIMIT, LOGIN_LOCK_SECONDS)
 KNOWLEDGE_SERVICE = KnowledgeService(db)
 CHAT_SERVICE = ChatService(db, now, new_id)
 
@@ -1250,6 +1253,8 @@ def allow_request(user_id: str) -> bool:
 
 
 def personal_run_budget_error(user_id: str, reserved_tokens: int = 0) -> str:
+    if PERSONAL_SINGLE_RUN_TOKEN_LIMIT and reserved_tokens > PERSONAL_SINGLE_RUN_TOKEN_LIMIT:
+        return f"本次任务预计最多使用 {reserved_tokens} Token，超过单次任务预算（{PERSONAL_SINGLE_RUN_TOKEN_LIMIT}），请拆分任务或调整服务端预算。"
     current = now()
     windows = (
         ("每日", PERSONAL_DAILY_RUN_LIMIT, PERSONAL_DAILY_TOKEN_LIMIT, current - 24 * 60 * 60 * 1_000_000_000),
@@ -1736,11 +1741,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         return
 
     def end_headers(self) -> None:
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; media-src 'none'; worker-src 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        if self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def require_same_origin_for_write(self) -> bool:
@@ -1778,8 +1786,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.handle_api_delete()
 
     def read_json(self, max_bytes: int = MAX_REQUEST_BYTES) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > max_bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("请求长度无效") from exc
+        if length < 0 or length > max_bytes:
             raise ValueError("请求内容过大")
         if length == 0:
             return {}
@@ -2152,9 +2163,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         payload = self.read_json()
         email = payload.get("email", "").strip().lower()
         password = payload.get("password", "")
-        user, token = AUTH_SERVICE.login(email, password)
+        user, token, error = AUTH_SERVICE.login(email, password, self.client_address[0] if self.client_address else "")
         if not user:
-            self.send_error_json("邮箱或密码错误", HTTPStatus.UNAUTHORIZED)
+            self.send_error_json(error or "邮箱或密码错误", HTTPStatus.TOO_MANY_REQUESTS if error != "邮箱或密码错误" else HTTPStatus.UNAUTHORIZED)
             return
         self.send_json({"token": token, "user": public_user(row_to_dict(user))})
 
@@ -2882,6 +2893,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_json({
             "day": period(day_start), "month": period(month_start),
             "storage": {"knowledge_documents": int(knowledge["count"]), "knowledge_bytes": int(knowledge["bytes"]), "artifact_bytes": artifact_bytes},
+            "limits": {
+                "daily_runs": PERSONAL_DAILY_RUN_LIMIT, "monthly_runs": PERSONAL_MONTHLY_RUN_LIMIT,
+                "daily_tokens": PERSONAL_DAILY_TOKEN_LIMIT, "monthly_tokens": PERSONAL_MONTHLY_TOKEN_LIMIT,
+                "single_run_tokens": PERSONAL_SINGLE_RUN_TOKEN_LIMIT,
+            },
             "token_note": "Token 为本地估算值，不等同于模型供应商账单。",
         })
 
@@ -3206,7 +3222,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         content_type = content_types.get(artifact["kind"], "application/octet-stream")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{artifact["filename"]}"')
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", Path(str(artifact["filename"])).name) or "download"
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
         self.send_header("Content-Length", str(path.stat().st_size))
         self.end_headers()
         self.wfile.write(path.read_bytes())

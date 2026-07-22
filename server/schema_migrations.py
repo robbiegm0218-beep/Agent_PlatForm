@@ -56,9 +56,19 @@ def _account_deletion_requests(conn: sqlite3.Connection) -> None:
         )""")
 
 
+def _login_throttles(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS login_throttles (
+            scope_key TEXT PRIMARY KEY,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            locked_until INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        )""")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "personal_accounts_and_security_events", _personal_accounts),
     Migration(2, "account_deletion_requests", _account_deletion_requests),
+    Migration(3, "login_throttles", _login_throttles),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

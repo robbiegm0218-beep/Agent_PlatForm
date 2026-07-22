@@ -21,6 +21,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertIn("is_admin", {row[1] for row in self.conn.execute("PRAGMA table_info(users)")})
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'security_events'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'account_deletion_requests'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'login_throttles'").fetchone())
 
     def test_failed_migration_rolls_back_its_changes(self):
         def fail(conn):

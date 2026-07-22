@@ -1141,7 +1141,7 @@ const STARTUP_CHECK_LABELS = {
   image_ocr: "图片 OCR",
 };
 
-function renderPersonalHostingStatus(startup, events, usage = {}) {
+function renderPersonalHostingStatus(startup, events, usage = {}, deletion = {}) {
   const checks = Object.entries(startup.checks || {}).map(([key, item]) => `
     <div class="startup-check">
       <span>${escapeHtml(STARTUP_CHECK_LABELS[key] || key)}</span>
@@ -1156,6 +1156,7 @@ function renderPersonalHostingStatus(startup, events, usage = {}) {
     login: "登录", logout: "退出登录", sessions_revoked: "退出所有设备",
     password_change: "修改密码", password_reset_requested: "创建密码重置凭证", password_reset: "重置密码",
     personal_data_export: "导出个人数据",
+    account_deletion_requested: "申请删除账号", account_deletion_cancelled: "取消删除申请",
   };
   els.securityEventsList.innerHTML = events.length ? events.map((item) => {
     const raw = Number(item.created_at || 0);
@@ -1165,23 +1166,39 @@ function renderPersonalHostingStatus(startup, events, usage = {}) {
   }).join("") : "暂无安全记录";
   const day = usage.day || {};
   const month = usage.month || {};
+  const limits = usage.limits || {};
   const storageUsage = usage.storage || {};
   const mb = (value) => `${(Number(value || 0) / 1024 / 1024).toFixed(2)} MB`;
   els.personalUsageSummary.innerHTML = `
-    <div class="startup-check"><span>近 24 小时</span><strong>${day.runs || 0} 次任务 · ${Number(day.input_tokens_estimate || 0) + Number(day.output_tokens_estimate || 0)} Token</strong></div>
-    <div class="startup-check"><span>近 30 天</span><strong>${month.runs || 0} 次任务 · ${Number(month.input_tokens_estimate || 0) + Number(month.output_tokens_estimate || 0)} Token</strong></div>
+    <div class="startup-check"><span>近 24 小时</span><strong>${day.runs || 0}${limits.daily_runs ? ` / ${limits.daily_runs}` : ""} 次 · ${Number(day.input_tokens_estimate || 0) + Number(day.output_tokens_estimate || 0)}${limits.daily_tokens ? ` / ${limits.daily_tokens}` : ""} Token</strong></div>
+    <div class="startup-check"><span>近 30 天</span><strong>${month.runs || 0}${limits.monthly_runs ? ` / ${limits.monthly_runs}` : ""} 次 · ${Number(month.input_tokens_estimate || 0) + Number(month.output_tokens_estimate || 0)}${limits.monthly_tokens ? ` / ${limits.monthly_tokens}` : ""} Token</strong></div>
+    <div class="startup-check"><span>单次任务预算</span><strong>${limits.single_run_tokens || "未限制"} Token</strong></div>
     <div class="startup-check"><span>知识库</span><strong>${storageUsage.knowledge_documents || 0} 份 · ${mb(storageUsage.knowledge_bytes)}</strong></div>
     <div class="startup-check"><span>产物存储</span><strong>${mb(storageUsage.artifact_bytes)}</strong></div>`;
+  const deletionRequest = deletion.request;
+  if (deletionRequest?.status === "scheduled") {
+    const raw = Number(deletionRequest.scheduled_for || 0);
+    const milliseconds = raw > 1e15 ? raw / 1e6 : raw * 1000;
+    const scheduledFor = milliseconds ? new Date(milliseconds).toLocaleString() : "等待期结束时";
+    els.accountDeletionStatus.textContent = `已申请删除账号，计划于 ${scheduledFor} 执行；在此之前可以取消。`;
+    els.requestAccountDeletionButton.classList.add("hidden");
+    els.cancelAccountDeletionButton.classList.remove("hidden");
+  } else {
+    els.accountDeletionStatus.textContent = deletionRequest?.status === "cancelled" ? "此前的删除申请已取消。" : "当前没有删除申请。";
+    els.requestAccountDeletionButton.classList.remove("hidden");
+    els.cancelAccountDeletionButton.classList.add("hidden");
+  }
 }
 
 async function loadPersonalHostingStatus() {
   try {
-    const { startup, events, usage } = await settingsView.loadHostingStatus(api);
-    renderPersonalHostingStatus(startup, events, usage);
+    const { startup, events, usage, deletion } = await settingsView.loadHostingStatus(api);
+    renderPersonalHostingStatus(startup, events, usage, deletion);
   } catch (error) {
     els.startupChecklist.textContent = error.message || "启动状态加载失败";
     els.securityEventsList.textContent = "安全记录加载失败";
     els.personalUsageSummary.textContent = "使用情况加载失败";
+    els.accountDeletionStatus.textContent = "删除申请状态加载失败";
   }
 }
 
@@ -1774,6 +1791,30 @@ els.exportPersonalDataButton.addEventListener("click", async () => {
     els.personalDataExportNotice.textContent = `导出已生成：${result.artifact.filename}。可前往“产物”下载。`;
   } catch (error) {
     els.personalDataExportNotice.textContent = error.message || "数据导出失败";
+  }
+});
+
+els.requestAccountDeletionButton.addEventListener("click", async () => {
+  if (!window.confirm("确认申请删除当前账号？申请会进入 7 天等待期，期间仍可取消。")) return;
+  els.accountDeletionNotice.textContent = "正在提交删除申请…";
+  try {
+    await settingsView.requestAccountDeletion(api);
+    els.accountDeletionNotice.textContent = "删除申请已提交，可在等待期内取消。";
+    await loadPersonalHostingStatus();
+  } catch (error) {
+    els.accountDeletionNotice.textContent = error.message || "删除申请提交失败";
+  }
+});
+
+els.cancelAccountDeletionButton.addEventListener("click", async () => {
+  if (!window.confirm("确认取消当前删除申请？")) return;
+  els.accountDeletionNotice.textContent = "正在取消删除申请…";
+  try {
+    await settingsView.cancelAccountDeletion(api);
+    els.accountDeletionNotice.textContent = "删除申请已取消。";
+    await loadPersonalHostingStatus();
+  } catch (error) {
+    els.accountDeletionNotice.textContent = error.message || "取消删除申请失败";
   }
 });
 

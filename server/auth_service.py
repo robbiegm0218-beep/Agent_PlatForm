@@ -17,7 +17,7 @@ def validate_new_password(password: str) -> str:
 
 
 class AuthService:
-    def __init__(self, db_factory, now, new_id, verify_password, hash_password, ttl_seconds: int, space_service=None):
+    def __init__(self, db_factory, now, new_id, verify_password, hash_password, ttl_seconds: int, space_service=None, login_failure_limit: int = 5, login_lock_seconds: int = 900):
         self.db_factory = db_factory
         self.now = now
         self.new_id = new_id
@@ -25,6 +25,8 @@ class AuthService:
         self.hash_password = hash_password
         self.ttl_seconds = ttl_seconds
         self.space_service = space_service
+        self.login_failure_limit = max(1, login_failure_limit)
+        self.login_lock_seconds = max(1, login_lock_seconds)
 
     def _event(self, conn, event_type: str, outcome: str, user_id: str = "", detail: dict | None = None) -> None:
         conn.execute(
@@ -43,12 +45,40 @@ class AuthService:
             return conn.execute("""SELECT users.* FROM users JOIN sessions ON sessions.user_id = users.id
                 WHERE sessions.token = ? AND (sessions.expires_at = 0 OR sessions.expires_at > ?)""", (token, self.now())).fetchone()
 
-    def login(self, email: str, password: str):
+    @staticmethod
+    def _source_fingerprint(source: str) -> str:
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16] if source else "unknown"
+
+    def _register_login_failure(self, conn, scopes: tuple[str, ...], current: int) -> int:
+        locked_until = 0
+        for scope in scopes:
+            row = conn.execute("SELECT failure_count FROM login_throttles WHERE scope_key = ?", (scope,)).fetchone()
+            failures = int(row["failure_count"]) + 1 if row else 1
+            until = current + self.login_lock_seconds * 1_000_000_000 if failures >= self.login_failure_limit else 0
+            conn.execute("""INSERT INTO login_throttles (scope_key, failure_count, locked_until, updated_at)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(scope_key) DO UPDATE SET failure_count = excluded.failure_count,
+                              locked_until = excluded.locked_until, updated_at = excluded.updated_at""", (scope, failures, until, current))
+            locked_until = max(locked_until, until)
+        return locked_until
+
+    def login(self, email: str, password: str, source: str = ""):
         with self.db_factory() as conn:
+            current = self.now()
+            email_hash = self._email_fingerprint(email)
+            source_hash = self._source_fingerprint(source)
+            scopes = (f"email:{email_hash}", f"source:{source_hash}")
+            locks = [conn.execute("SELECT locked_until FROM login_throttles WHERE scope_key = ?", (scope,)).fetchone() for scope in scopes]
+            if any(row and int(row["locked_until"]) > current for row in locks):
+                self._event(conn, "login", "locked", "", {"email_hash": email_hash, "source_hash": source_hash})
+                return None, "", "登录尝试过多，请稍后再试"
             user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
             if not user or not self.verify_password(password, user["password_hash"]):
-                self._event(conn, "login", "failed", user["id"] if user else "", {"email_hash": self._email_fingerprint(email)})
-                return None, ""
+                locked_until = self._register_login_failure(conn, scopes, current)
+                outcome = "locked" if locked_until else "failed"
+                self._event(conn, "login", outcome, user["id"] if user else "", {"email_hash": email_hash, "source_hash": source_hash})
+                return None, "", "登录尝试过多，请稍后再试" if locked_until else "邮箱或密码错误"
+            conn.executemany("DELETE FROM login_throttles WHERE scope_key = ?", [(scope,) for scope in scopes])
             if self.space_service:
                 self.space_service.accept_pending_invitations(conn, user["id"], email)
             token = self.new_id("session")
@@ -56,7 +86,7 @@ class AuthService:
                 conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (self.hash_password(password), user["id"]))
             conn.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", (token, user["id"], self.now(), self.now() + self.ttl_seconds * 1_000_000_000))
             self._event(conn, "login", "succeeded", user["id"])
-            return user, token
+            return user, token, ""
 
     def logout(self, token: str) -> None:
         with self.db_factory() as conn:

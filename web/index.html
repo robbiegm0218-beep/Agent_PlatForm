@@ -235,6 +235,16 @@
               <div id="personalDataExportNotice" class="notice"></div>
             </section>
             <section class="settings-panel">
+              <h3>账号删除</h3>
+              <p class="settings-help">提交申请后进入 7 天等待期，期间可随时取消。已创建的备份不会因申请立即删除，而是按本机备份保留策略自然过期。</p>
+              <div id="accountDeletionStatus" class="notice">正在加载删除申请状态…</div>
+              <div class="settings-actions">
+                <button id="requestAccountDeletionButton" type="button" class="secondary">申请删除账号</button>
+                <button id="cancelAccountDeletionButton" type="button" class="secondary hidden">取消删除申请</button>
+              </div>
+              <div id="accountDeletionNotice" class="notice"></div>
+            </section>
+            <section class="settings-panel">
               <h3>本期使用情况</h3>
               <p class="settings-help">Token 为本地估算，仅用于观察使用趋势，不等同于模型供应商账单。</p>
               <div id="personalUsageSummary" class="startup-checklist">正在加载…</div>

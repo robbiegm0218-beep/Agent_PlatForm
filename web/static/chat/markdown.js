@@ -79,7 +79,7 @@ window.AgentMarkdown = {
       } else {
         const linkMatch = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(token);
         const link = document.createElement("a");
-        link.href = linkMatch[2]; link.target = "_blank"; link.rel = "noreferrer"; link.textContent = linkMatch[1];
+        link.href = linkMatch[2]; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = linkMatch[1];
         element.appendChild(link);
       }
       lastIndex = match.index + token.length;
