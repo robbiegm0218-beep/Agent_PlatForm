@@ -215,6 +215,64 @@ export AGENT_LOG_BACKUP_COUNT="5"      # 轮转文件数量，默认 5
 
 `GET /api/health` 不需要登录。SQLite 可用时返回 `200` 与 `database_ready: true`；不可用时返回 `503`，可直接作为部署健康探针。
 
+### 个人托管测试版部署（P46-B 预览）
+
+个人托管测试版采用“一个实例对应一个个人用户”的边界，默认不开放注册。推荐使用 Docker Compose：数据会保存在命名卷中，镜像只绑定本机回环地址，不会直接暴露到公网。
+
+```bash
+cp .env.example .env
+# 编辑 .env：至少替换 ADMIN_EMAIL、ADMIN_PASSWORD，按需填写 DEEPSEEK_API_KEY
+docker compose up -d --build
+docker compose ps
+curl http://127.0.0.1:8765/api/health
+```
+
+首次启动前或升级后可运行以下检查。它不会发送模型请求，也不会输出密钥或对话内容；必需项未通过时服务不会启动。
+
+```bash
+python3 -m server.startup_checks --create-directories
+```
+
+不使用 Docker 时，将 `.env` 放在项目根目录后执行 `scripts/start-server.sh`。可通过 `HOST`、`PORT`、`AGENT_DATABASE_PATH` 和 `AGENT_DATA_DIR` 更改监听地址和持久化位置；生产环境必须设置 `AGENT_PLATFORM_ENV=production` 以及管理员信息，生产模式不会创建默认账号。
+
+| 变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `HOST` / `PORT` | HTTP 监听地址与端口 | `127.0.0.1` / `8765` |
+| `AGENT_DATABASE_PATH` | SQLite 数据库文件 | `agent_platform.db` |
+| `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 生产环境首个管理员凭据 | 必填 |
+| `PERSONAL_DAILY_RUN_LIMIT` / `PERSONAL_MONTHLY_RUN_LIMIT` | 新任务每日 / 30 天硬上限；`0` 表示关闭该限制 | `100` / `1000` |
+
+当前开发机没有 Docker，因此仓库中的 Dockerfile 与 Compose 配置尚未完成真实镜像构建验证；部署前请在目标机器运行 `docker compose config` 与上述启动命令。
+
+### 升级快照、回滚与密码恢复
+
+数据库升级使用版本化迁移。迁移在 HTTP 服务开始监听前执行；失败时服务会退出，不会继续提供写入服务。每次升级前，先在停服务前创建包含数据库、知识库和产物的快照：
+
+```bash
+python3 -m server.upgrade prepare \
+  --database agent_platform.db \
+  --data-dir data \
+  --backup-root data/upgrade-backups
+```
+
+命令会输出快照目录和 `manifest.json`。恢复会覆盖目标数据库、知识库和产物目录，必须先停止服务，并确认快照路径无误：
+
+```bash
+python3 -m server.upgrade restore \
+  --snapshot data/upgrade-backups/<snapshot-directory> \
+  --database agent_platform.db \
+  --data-dir data
+```
+
+已登录用户可在“设置”中修改密码；修改后所有既有设备会退出。遗失密码时，管理员可在服务器本机生成一次性重置令牌：
+
+```bash
+python3 -m server.manage_account create-password-reset --email owner@example.com
+```
+
+该令牌仅在终端输出一次，默认 30 分钟有效，服务器只保存其散列。请通过安全渠道交给账号所有者，然后在登录页选择“使用一次性重置令牌”；不要将令牌写入聊天记录、日志或 Git。
+
 ## 数据、备份与部署验收
 
 运行数据默认保存在项目根目录的 `agent_platform.db`；知识库和产物位于 `data/knowledge/`、`data/artifacts/`。这些路径及 `.env` 已被 Git 忽略，应纳入部署环境的备份策略。
@@ -270,6 +328,7 @@ python3 -m server.evaluate_knowledge_retrieval
 python3 -m server.evaluate_structured_context
 python3 -m server.evaluate_memory_policy
 python3 -m server.evaluate_skill_contracts
+python3 -m server.evaluate_personal_hosting
 ```
 
 回归测试使用临时数据库与本地模型替身，覆盖流式响应、工具边界、审批与取消、运行审计、重启恢复、生产凭据、健康检查和数据库恢复演练。评测集位于 `server/evals/personal_baseline.json`，不会记录 API Key 或私有资料正文。

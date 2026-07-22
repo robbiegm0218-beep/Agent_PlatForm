@@ -31,6 +31,7 @@ async function boot() {
     try {
       await refreshAll();
       await restoreWorkspaceState();
+      await offerStartupChecklist();
       revealWorkspace();
     } catch (error) {
       showWorkspaceLoadError(error);
@@ -1122,9 +1123,72 @@ function switchView(view) {
   els.threadContextPanel.classList.toggle("hidden", view !== "chat");
   if (view === "artifacts") loadArtifacts();
   if (view === "memories") loadMemories();
+  if (view === "settings") loadPersonalHostingStatus();
   document.querySelectorAll(".nav-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
   });
+}
+
+const STARTUP_CHECK_LABELS = {
+  python: "Python 运行环境",
+  database_directory: "数据库目录",
+  knowledge_directory: "知识文件目录",
+  artifacts_directory: "产物目录",
+  model: "真实模型",
+  word_parser: "Word 解析",
+  pdf_parser: "PDF 解析",
+  excel_runtime: "Excel 生成",
+  image_ocr: "图片 OCR",
+};
+
+function renderPersonalHostingStatus(startup, events, usage = {}) {
+  const checks = Object.entries(startup.checks || {}).map(([key, item]) => `
+    <div class="startup-check">
+      <span>${escapeHtml(STARTUP_CHECK_LABELS[key] || key)}</span>
+      <strong data-ready="${Boolean(item.ok)}">${item.ok ? "可用" : (item.required === false ? "未配置" : "需要处理")}</strong>
+    </div>`).join("");
+  const schema = startup.schema || {};
+  els.startupChecklist.innerHTML = `
+    <div class="startup-check"><span>应用版本</span><strong>${escapeHtml(startup.app_version || "未知")}</strong></div>
+    <div class="startup-check"><span>数据库迁移</span><strong data-ready="${Boolean(schema.ready)}">${schema.ready ? `已是 v${schema.current_version}` : "需要处理"}</strong></div>
+    ${checks}`;
+  const eventLabels = {
+    login: "登录", logout: "退出登录", sessions_revoked: "退出所有设备",
+    password_change: "修改密码", password_reset_requested: "创建密码重置凭证", password_reset: "重置密码",
+    personal_data_export: "导出个人数据",
+  };
+  els.securityEventsList.innerHTML = events.length ? events.map((item) => {
+    const raw = Number(item.created_at || 0);
+    const milliseconds = raw > 1e15 ? raw / 1e6 : raw * 1000;
+    const time = milliseconds ? new Date(milliseconds).toLocaleString() : "时间未知";
+    return `<div class="security-event"><strong>${escapeHtml(eventLabels[item.event_type] || item.event_type)} · ${item.outcome === "succeeded" ? "成功" : item.outcome === "failed" ? "失败" : "已处理"}</strong><small>${escapeHtml(time)}</small></div>`;
+  }).join("") : "暂无安全记录";
+  const day = usage.day || {};
+  const month = usage.month || {};
+  const storageUsage = usage.storage || {};
+  const mb = (value) => `${(Number(value || 0) / 1024 / 1024).toFixed(2)} MB`;
+  els.personalUsageSummary.innerHTML = `
+    <div class="startup-check"><span>近 24 小时</span><strong>${day.runs || 0} 次任务 · ${Number(day.input_tokens_estimate || 0) + Number(day.output_tokens_estimate || 0)} Token</strong></div>
+    <div class="startup-check"><span>近 30 天</span><strong>${month.runs || 0} 次任务 · ${Number(month.input_tokens_estimate || 0) + Number(month.output_tokens_estimate || 0)} Token</strong></div>
+    <div class="startup-check"><span>知识库</span><strong>${storageUsage.knowledge_documents || 0} 份 · ${mb(storageUsage.knowledge_bytes)}</strong></div>
+    <div class="startup-check"><span>产物存储</span><strong>${mb(storageUsage.artifact_bytes)}</strong></div>`;
+}
+
+async function loadPersonalHostingStatus() {
+  try {
+    const { startup, events, usage } = await settingsView.loadHostingStatus(api);
+    renderPersonalHostingStatus(startup, events, usage);
+  } catch (error) {
+    els.startupChecklist.textContent = error.message || "启动状态加载失败";
+    els.securityEventsList.textContent = "安全记录加载失败";
+    els.personalUsageSummary.textContent = "使用情况加载失败";
+  }
+}
+
+async function offerStartupChecklist() {
+  if (window.localStorage.getItem("agent-platform-startup-check-complete") === "true") return;
+  switchView("settings");
+  await loadPersonalHostingStatus();
 }
 
 function restoreChatComposer() {
@@ -1334,12 +1398,32 @@ els.loginForm.addEventListener("submit", async (event) => {
     try {
       await refreshAll();
       await restoreWorkspaceState();
+      await offerStartupChecklist();
       revealWorkspace();
     } catch (error) {
       showWorkspaceLoadError(error);
     }
   } catch (error) {
     els.loginError.textContent = error.message;
+  }
+});
+
+els.showPasswordResetButton.addEventListener("click", () => {
+  els.passwordResetForm.classList.toggle("hidden");
+});
+
+els.passwordResetForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.passwordResetNotice.textContent = "";
+  try {
+    await api("/api/password-reset/confirm", {
+      method: "POST",
+      body: JSON.stringify({ token: els.passwordResetToken.value, new_password: els.passwordResetNewPassword.value }),
+    });
+    els.passwordResetForm.reset();
+    els.passwordResetNotice.textContent = "密码已重置，请使用新密码登录。";
+  } catch (error) {
+    els.passwordResetNotice.textContent = error.message || "密码重置失败";
   }
 });
 
@@ -1660,6 +1744,42 @@ els.settingsForm.addEventListener("submit", async (event) => {
   const data = await settingsView.save(api, els.nameInput.value);
   state.user = data.user;
   els.settingsNotice.textContent = "已保存";
+});
+
+els.changePasswordForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.passwordChangeNotice.textContent = "";
+  if (els.newPasswordInput.value !== els.confirmNewPasswordInput.value) {
+    els.passwordChangeNotice.textContent = "两次输入的新密码不一致";
+    return;
+  }
+  try {
+    await settingsView.changePassword(api, els.currentPasswordInput.value, els.newPasswordInput.value);
+    els.changePasswordForm.reset();
+    storage.clearToken();
+    state.token = "";
+    state.user = null;
+    showLogin();
+    els.loginError.textContent = "密码已修改，请重新登录。";
+  } catch (error) {
+    els.passwordChangeNotice.textContent = error.message || "密码修改失败";
+  }
+});
+
+els.exportPersonalDataButton.addEventListener("click", async () => {
+  if (!window.confirm("将生成包含对话与个人资料的导出文件，确认继续？")) return;
+  els.personalDataExportNotice.textContent = "正在生成导出文件…";
+  try {
+    const result = await settingsView.exportPersonalData(api);
+    els.personalDataExportNotice.textContent = `导出已生成：${result.artifact.filename}。可前往“产物”下载。`;
+  } catch (error) {
+    els.personalDataExportNotice.textContent = error.message || "数据导出失败";
+  }
+});
+
+els.completeStartupCheckButton.addEventListener("click", () => {
+  window.localStorage.setItem("agent-platform-startup-check-complete", "true");
+  els.settingsNotice.textContent = "启动检查已确认，后续仍可在个人设置中查看。";
 });
 
 els.logoutButton.addEventListener("click", async () => {

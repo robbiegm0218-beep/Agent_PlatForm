@@ -1,0 +1,61 @@
+{
+  "ok": true,
+  "strip": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/decoded/look-cardinals.png",
+  "directions": [
+    "000",
+    "090",
+    "180",
+    "270"
+  ],
+  "errors": [],
+  "anchors": [
+    {
+      "direction": "000",
+      "source_box": [
+        0,
+        0,
+        530,
+        742
+      ],
+      "used_pixels": 83883,
+      "edge_pixels": 0,
+      "output": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/decoded/look-anchors/000.png"
+    },
+    {
+      "direction": "090",
+      "source_box": [
+        530,
+        0,
+        1059,
+        742
+      ],
+      "used_pixels": 76970,
+      "edge_pixels": 0,
+      "output": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/decoded/look-anchors/090.png"
+    },
+    {
+      "direction": "180",
+      "source_box": [
+        1059,
+        0,
+        1588,
+        742
+      ],
+      "used_pixels": 80957,
+      "edge_pixels": 0,
+      "output": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/decoded/look-anchors/180.png"
+    },
+    {
+      "direction": "270",
+      "source_box": [
+        1588,
+        0,
+        2118,
+        742
+      ],
+      "used_pixels": 77402,
+      "edge_pixels": 0,
+      "output": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/decoded/look-anchors/270.png"
+    }
+  ]
+}

@@ -328,12 +328,44 @@
 
 .settings-panel {
   width: min(520px, calc(100% - 56px));
-  margin: 28px;
+  margin: 0;
   padding: 22px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
 }
+
+.settings-stack {
+  display: grid;
+  gap: 16px;
+  margin: 28px;
+  padding-bottom: 28px;
+}
+
+.settings-panel h3 { margin: 0 0 16px; }
+.settings-help { color: var(--muted); margin: -6px 0 14px; }
+.startup-checklist, .security-events-list { display: grid; gap: 8px; }
+.startup-check, .security-event {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+.startup-check strong[data-ready="true"] { color: var(--accent); }
+.startup-check strong[data-ready="false"] { color: #a15b28; }
+.security-event { display: grid; gap: 3px; }
+.security-event small { color: var(--muted); }
+
+.text-button {
+  margin-top: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+}
+.password-reset-form { margin-top: 18px; }
 
 .settings-actions {
   display: flex;

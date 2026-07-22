@@ -131,6 +131,117 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.request_json("/api/me", token=fresh)
         self.assertEqual(failure.exception.code, 401)
 
+    def test_personal_account_password_change_revokes_sessions_and_audits(self):
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.request_json(
+                "/api/password/change",
+                {"current_password": "wrong", "new_password": "new-password-123"},
+                self.token,
+            )
+        self.assertEqual(invalid.exception.code, 400)
+
+        result = self.request_json(
+            "/api/password/change",
+            {"current_password": "admin123", "new_password": "new-password-123"},
+            self.token,
+        )
+        self.assertTrue(result["requires_login"])
+        with self.assertRaises(urllib.error.HTTPError) as expired:
+            self.request_json("/api/me", token=self.token)
+        self.assertEqual(expired.exception.code, 401)
+        with self.assertRaises(urllib.error.HTTPError):
+            self.request_json("/api/login", {"email": "admin@example.com", "password": "admin123"})
+        fresh = self.request_json("/api/login", {"email": "admin@example.com", "password": "new-password-123"})
+        events = self.request_json("/api/security-events", token=fresh["token"])["events"]
+        self.assertTrue(any(item["event_type"] == "password_change" and item["outcome"] == "succeeded" for item in events))
+
+    def test_local_password_reset_is_single_use_and_never_stored_raw(self):
+        token = app.AUTH_SERVICE.create_password_reset("admin@example.com", ttl_seconds=60)
+        self.assertTrue(token)
+        with app.db() as conn:
+            stored = conn.execute("SELECT token_hash FROM password_reset_tokens").fetchone()["token_hash"]
+        self.assertNotEqual(stored, token)
+
+        self.request_json(
+            "/api/password-reset/confirm",
+            {"token": token, "new_password": "reset-password-123"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as reused:
+            self.request_json(
+                "/api/password-reset/confirm",
+                {"token": token, "new_password": "another-password-123"},
+            )
+        self.assertEqual(reused.exception.code, 400)
+        fresh = self.request_json("/api/login", {"email": "admin@example.com", "password": "reset-password-123"})
+        self.assertTrue(fresh["token"])
+
+    def test_startup_status_and_schema_version_are_visible_after_login(self):
+        status = self.request_json("/api/startup-status", token=self.token)
+        self.assertTrue(status["required_ready"])
+        self.assertTrue(status["schema"]["ready"])
+        self.assertIn("app_version", status)
+        health = self.request_json("/api/health")
+        self.assertTrue(health["schema"]["ready"])
+        with app.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+
+    def test_personal_data_export_requires_confirmation_and_excludes_credentials(self):
+        thread = self.request_json("/api/threads", {"title": "导出测试"}, self.token)["thread"]
+        with app.db() as conn:
+            conn.execute(
+                "INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, '', 'user', ?, ?)",
+                ("export_message", thread["id"], "需要保留的对话内容", app.now()),
+            )
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request_json("/api/data-export", {}, self.token)
+        self.assertEqual(denied.exception.code, 409)
+        with patch.object(app, "ARTIFACT_DIR", Path(self.temp_dir.name) / "artifacts"):
+            result = self.request_json("/api/data-export", {"confirmation": "EXPORT_MY_DATA"}, self.token)
+            artifact_id = result["artifact"]["id"]
+            content, content_type = self.download_artifact(artifact_id)
+        exported = json.loads(content.decode("utf-8"))
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(exported["format"], "agent-platform-personal-data-export/v1")
+        self.assertIn("需要保留的对话内容", [item["content"] for item in exported["messages"]])
+        self.assertIn("password_hash", exported["exclusions"])
+        events = self.request_json("/api/security-events", token=self.token)["events"]
+        self.assertTrue(any(item["event_type"] == "personal_data_export" for item in events))
+
+    def test_personal_usage_is_current_user_scoped_and_returns_estimates(self):
+        usage = self.request_json("/api/personal-usage", token=self.token)
+        self.assertIn("day", usage)
+        self.assertIn("month", usage)
+        self.assertIn("storage", usage)
+        self.assertEqual(usage["day"]["runs"], 0)
+        self.assertIn("Token", usage["token_note"])
+
+    def test_daily_run_budget_blocks_new_chat_but_keeps_history_available(self):
+        original_limit = app.PERSONAL_DAILY_RUN_LIMIT
+        app.PERSONAL_DAILY_RUN_LIMIT = 1
+        try:
+            thread = self.request_json("/api/threads", {"title": "预算历史"}, self.token)["thread"]
+            with app.db() as conn:
+                conn.execute(
+                    "INSERT INTO runs (id, thread_id, status, model, started_at, completed_at) VALUES (?, ?, 'completed', ?, ?, ?)",
+                    ("budget_run", thread["id"], app.DEEPSEEK_MODEL, app.now(), app.now()),
+                )
+            with self.assertRaises(urllib.error.HTTPError) as limited:
+                self.request_json("/api/chat", {"thread_id": "", "content": "新的任务"}, self.token)
+            self.assertEqual(limited.exception.code, 429)
+            self.assertTrue(self.request_json("/api/threads", token=self.token)["threads"])
+        finally:
+            app.PERSONAL_DAILY_RUN_LIMIT = original_limit
+
+    def test_account_deletion_request_requires_confirmation_and_can_be_cancelled(self):
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request_json("/api/account-deletion/request", {}, self.token)
+        self.assertEqual(denied.exception.code, 409)
+        scheduled = self.request_json("/api/account-deletion/request", {"confirmation": "DELETE_MY_ACCOUNT"}, self.token)
+        self.assertGreater(scheduled["scheduled_for"], app.now())
+        status = self.request_json("/api/account-deletion", token=self.token)["request"]
+        self.assertEqual(status["status"], "scheduled")
+        self.assertTrue(self.request_json("/api/account-deletion/cancel", {}, self.token)["ok"])
+
     def test_models_expose_provider_neutral_capabilities(self):
         result = self.request_json("/api/models", token=self.token)
         model = next(item for item in result["models"] if item["id"] == "deepseek-v4-flash")

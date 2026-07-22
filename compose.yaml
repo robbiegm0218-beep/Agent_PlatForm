@@ -1,0 +1,17 @@
+services:
+  agent-platform:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8765
+      AGENT_DATABASE_PATH: /data/agent_platform.db
+      AGENT_DATA_DIR: /data
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - agent-platform-data:/data
+
+volumes:
+  agent-platform-data:

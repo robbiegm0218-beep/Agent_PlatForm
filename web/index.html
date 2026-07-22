@@ -25,6 +25,19 @@
             <button type="submit">登录</button>
             <div id="loginError" class="form-error"></div>
           </form>
+          <button id="showPasswordResetButton" class="text-button" type="button">使用本地重置凭证</button>
+          <form id="passwordResetForm" class="password-reset-form hidden">
+            <label>
+              一次性重置凭证
+              <input id="passwordResetToken" type="password" autocomplete="one-time-code" required />
+            </label>
+            <label>
+              新密码
+              <input id="passwordResetNewPassword" type="password" minlength="10" autocomplete="new-password" required />
+            </label>
+            <button type="submit">重置密码</button>
+            <div id="passwordResetNotice" class="form-error"></div>
+          </form>
         </div>
       </section>
 
@@ -189,22 +202,54 @@
               <span>修改个人信息或退出登录</span>
             </div>
           </header>
-          <form id="settingsForm" class="settings-panel">
-            <label>
-              昵称
-              <input id="nameInput" type="text" required />
-            </label>
-            <label>
-              邮箱
-              <input id="settingsEmail" type="email" disabled />
-            </label>
-            <div class="settings-actions">
-              <button type="submit">保存</button>
-              <button id="logoutAllButton" type="button" class="secondary">退出所有设备</button>
-              <button id="logoutButton" type="button" class="secondary">退出登录</button>
-            </div>
-            <div id="settingsNotice" class="notice"></div>
-          </form>
+          <div class="settings-stack">
+            <form id="settingsForm" class="settings-panel">
+              <h3>个人资料</h3>
+              <label>
+                昵称
+                <input id="nameInput" type="text" required />
+              </label>
+              <label>
+                邮箱
+                <input id="settingsEmail" type="email" disabled />
+              </label>
+              <div class="settings-actions">
+                <button type="submit">保存</button>
+                <button id="logoutAllButton" type="button" class="secondary">退出所有设备</button>
+                <button id="logoutButton" type="button" class="secondary">退出登录</button>
+              </div>
+              <div id="settingsNotice" class="notice"></div>
+            </form>
+            <form id="changePasswordForm" class="settings-panel">
+              <h3>修改密码</h3>
+              <label>当前密码<input id="currentPasswordInput" type="password" autocomplete="current-password" required /></label>
+              <label>新密码<input id="newPasswordInput" type="password" minlength="10" autocomplete="new-password" required /></label>
+              <label>再次输入新密码<input id="confirmNewPasswordInput" type="password" minlength="10" autocomplete="new-password" required /></label>
+              <div class="settings-actions"><button type="submit">修改并退出所有设备</button></div>
+              <div id="passwordChangeNotice" class="notice"></div>
+            </form>
+            <section class="settings-panel">
+              <h3>个人数据导出</h3>
+              <p class="settings-help">导出对话、长期记忆、知识库与产物索引、运行索引和个人资料。导出不包含密码、会话、重置凭证、本地路径和知识原文件。</p>
+              <div class="settings-actions"><button id="exportPersonalDataButton" type="button" class="secondary">导出我的数据</button></div>
+              <div id="personalDataExportNotice" class="notice"></div>
+            </section>
+            <section class="settings-panel">
+              <h3>本期使用情况</h3>
+              <p class="settings-help">Token 为本地估算，仅用于观察使用趋势，不等同于模型供应商账单。</p>
+              <div id="personalUsageSummary" class="startup-checklist">正在加载…</div>
+            </section>
+            <section class="settings-panel">
+              <h3>启动检查</h3>
+              <p class="settings-help">检查数据库、数据目录、模型和本地文件解析能力。</p>
+              <div id="startupChecklist" class="startup-checklist">正在检查…</div>
+              <div class="settings-actions"><button id="completeStartupCheckButton" type="button">已完成启动检查</button></div>
+            </section>
+            <section class="settings-panel">
+              <h3>最近安全记录</h3>
+              <div id="securityEventsList" class="security-events-list">正在加载…</div>
+            </section>
+          </div>
         </section>
 
         <section id="knowledgePage" class="page hidden">

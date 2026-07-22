@@ -1,0 +1,984 @@
+{
+  "ok": false,
+  "frames_root": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1",
+  "states": [
+    "idle",
+    "running-right",
+    "running-left",
+    "waving",
+    "jumping",
+    "failed",
+    "waiting",
+    "running",
+    "review"
+  ],
+  "errors": [
+    "review frame 00 is 1536x1872; expected 192x208"
+  ],
+  "warnings": [
+    "idle frame 00 has 733 non-transparent pixels near the cell edge",
+    "review frame 00 is much larger than the row median (1485186 vs 26977)"
+  ],
+  "rows": [
+    {
+      "state": "idle",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "idle frame 00 has 733 non-transparent pixels near the cell edge"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26261,
+          "bbox": [
+            0,
+            5,
+            192,
+            203
+          ],
+          "edge_pixels": 733,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27531,
+          "bbox": [
+            7,
+            5,
+            184,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27939,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27856,
+          "bbox": [
+            6,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27590,
+          "bbox": [
+            7,
+            5,
+            184,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/idle/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27841,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "running-right",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24344,
+          "bbox": [
+            5,
+            10,
+            187,
+            197
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24923,
+          "bbox": [
+            5,
+            9,
+            187,
+            198
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25643,
+          "bbox": [
+            8,
+            5,
+            184,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27004,
+          "bbox": [
+            5,
+            5,
+            186,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25455,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23789,
+          "bbox": [
+            17,
+            5,
+            175,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 6,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27093,
+          "bbox": [
+            8,
+            5,
+            184,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 7,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-right/07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25223,
+          "bbox": [
+            12,
+            5,
+            179,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "running-left",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24016,
+          "bbox": [
+            11,
+            5,
+            180,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25097,
+          "bbox": [
+            9,
+            5,
+            183,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23140,
+          "bbox": [
+            14,
+            5,
+            178,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25943,
+          "bbox": [
+            5,
+            5,
+            186,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24390,
+          "bbox": [
+            9,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23357,
+          "bbox": [
+            16,
+            5,
+            175,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 6,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24888,
+          "bbox": [
+            10,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 7,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running-left/07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25624,
+          "bbox": [
+            5,
+            6,
+            187,
+            201
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "waving",
+      "expected_frames": 4,
+      "actual_frames": 4,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waving/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27433,
+          "bbox": [
+            5,
+            6,
+            187,
+            201
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waving/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24426,
+          "bbox": [
+            5,
+            12,
+            187,
+            196
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waving/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23544,
+          "bbox": [
+            5,
+            14,
+            187,
+            193
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waving/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27372,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "jumping",
+      "expected_frames": 5,
+      "actual_frames": 5,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/jumping/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26465,
+          "bbox": [
+            5,
+            10,
+            187,
+            197
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/jumping/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27208,
+          "bbox": [
+            5,
+            5,
+            187,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/jumping/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26282,
+          "bbox": [
+            5,
+            7,
+            187,
+            201
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/jumping/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26319,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/jumping/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26488,
+          "bbox": [
+            5,
+            10,
+            187,
+            197
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "failed",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26894,
+          "bbox": [
+            9,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27609,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27748,
+          "bbox": [
+            6,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25689,
+          "bbox": [
+            5,
+            14,
+            187,
+            194
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26270,
+          "bbox": [
+            5,
+            12,
+            187,
+            196
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27701,
+          "bbox": [
+            8,
+            5,
+            184,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 6,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26947,
+          "bbox": [
+            5,
+            9,
+            187,
+            198
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 7,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/failed/07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24620,
+          "bbox": [
+            5,
+            18,
+            187,
+            189
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "waiting",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27045,
+          "bbox": [
+            10,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26672,
+          "bbox": [
+            11,
+            5,
+            181,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26506,
+          "bbox": [
+            11,
+            5,
+            181,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26699,
+          "bbox": [
+            10,
+            5,
+            181,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25214,
+          "bbox": [
+            19,
+            5,
+            173,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/waiting/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26857,
+          "bbox": [
+            10,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "running",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": null,
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25380,
+          "bbox": [
+            12,
+            5,
+            179,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26293,
+          "bbox": [
+            10,
+            5,
+            182,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23931,
+          "bbox": [
+            14,
+            5,
+            178,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 23901,
+          "bbox": [
+            13,
+            5,
+            178,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 25681,
+          "bbox": [
+            12,
+            5,
+            179,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/running/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 24481,
+          "bbox": [
+            14,
+            5,
+            178,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    },
+    {
+      "state": "review",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": null,
+      "ok": false,
+      "errors": [
+        "review frame 00 is 1536x1872; expected 192x208"
+      ],
+      "warnings": [
+        "review frame 00 is much larger than the row median (1485186 vs 26977)"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/00.png",
+          "width": 1536,
+          "height": 1872,
+          "nontransparent_pixels": 1485186,
+          "bbox": [
+            5,
+            5,
+            1531,
+            1867
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 1,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27001,
+          "bbox": [
+            6,
+            5,
+            186,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 2,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26869,
+          "bbox": [
+            7,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 3,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26287,
+          "bbox": [
+            5,
+            7,
+            187,
+            201
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 4,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 27217,
+          "bbox": [
+            6,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        },
+        {
+          "index": 5,
+          "file": "/Users/robbie/Documents/Agent/hoops-v2-upgrade/frames-v1/review/05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 26953,
+          "bbox": [
+            6,
+            5,
+            185,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 0
+        }
+      ]
+    }
+  ]
+}

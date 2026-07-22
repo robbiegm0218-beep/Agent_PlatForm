@@ -59,6 +59,9 @@ from server.knowledge_service import KnowledgeService
 from server.space_service import SpaceService
 from server.chat_service import ChatService
 from server.http_routes import API_ROUTES
+from server.schema_migrations import apply_migrations, migration_status
+from server.startup_checks import build_startup_report
+from server.version import APP_VERSION
 
 try:
     import certifi
@@ -68,9 +71,6 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT_DIR / "web"
-DB_PATH = ROOT_DIR / "agent_platform.db"
-KNOWLEDGE_DIR = ROOT_DIR / "data" / "knowledge"
-ARTIFACT_DIR = ROOT_DIR / "data" / "artifacts"
 def resolve_artifact_node() -> str:
     """Find Node even when the macOS launchd PATH omits developer tools."""
     configured = os.environ.get("ARTIFACT_NODE", "").strip()
@@ -81,9 +81,7 @@ def resolve_artifact_node() -> str:
     return "node"
 
 
-ARTIFACT_NODE = resolve_artifact_node()
 ARTIFACT_SCRIPT = ROOT_DIR / "server" / "create_xlsx_artifact.mjs"
-TESSERACT_BINARY = next((candidate for candidate in (shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
 IMAGE_KNOWLEDGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 INTENT_PLANNER = IntentPlanner()
 
@@ -119,6 +117,13 @@ def load_env_file(path: Path) -> None:
 
 load_env_file(ROOT_DIR / ".env")
 
+DATA_DIR = Path(os.environ.get("AGENT_DATA_DIR", ROOT_DIR / "data")).expanduser()
+DB_PATH = Path(os.environ.get("AGENT_DATABASE_PATH", ROOT_DIR / "agent_platform.db")).expanduser()
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+ARTIFACT_DIR = DATA_DIR / "artifacts"
+ARTIFACT_NODE = resolve_artifact_node()
+TESSERACT_BINARY = next((candidate for candidate in (os.environ.get("TESSERACT_BINARY", "").strip(), shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
+
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -137,6 +142,8 @@ MAX_KNOWLEDGE_UPLOAD_BYTES = int(os.environ.get("MAX_KNOWLEDGE_UPLOAD_BYTES", st
 MAX_RESPONSE_TOKENS = int(os.environ.get("MAX_RESPONSE_TOKENS", "2048"))
 MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
+PERSONAL_DAILY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_DAILY_RUN_LIMIT", "100")))
+PERSONAL_MONTHLY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_MONTHLY_RUN_LIMIT", "1000")))
 AGENT_INTELLIGENCE_V2 = os.environ.get("AGENT_INTELLIGENCE_V2", "false").lower() in {"1", "true", "yes"}
 AGENT_PLANNER_MODE = os.environ.get("AGENT_PLANNER_MODE", "off").strip().lower()
 if AGENT_PLANNER_MODE not in {"off", "shadow", "active"}:
@@ -190,8 +197,8 @@ LOGGER = logging.getLogger("agent_platform")
 
 SKILLS_DIR = ROOT_DIR / "server" / "skills"
 BUILTIN_SKILL_RESOURCE_DIR = ROOT_DIR / "server" / "skill_resources"
-SKILL_HISTORY_DIR = ROOT_DIR / "data" / "skill_history"
-SKILL_PACKAGE_DIR = ROOT_DIR / "data" / "skill_packages"
+SKILL_HISTORY_DIR = DATA_DIR / "skill_history"
+SKILL_PACKAGE_DIR = DATA_DIR / "skill_packages"
 MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(256 * 1024)))
 MAX_SKILL_RESOURCE_CHARS = int(os.environ.get("MAX_SKILL_RESOURCE_CHARS", "12000"))
 EXECUTION_MODE_VALUES = {"off", "auto", "required"}
@@ -1076,6 +1083,7 @@ def init_db() -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_request_position ON run_approval_requests(run_id, position)"
         )
+        apply_migrations(conn, now)
         interrupted_runs = conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()
         for interrupted_run in interrupted_runs:
             run_id = interrupted_run["id"]
@@ -1093,7 +1101,7 @@ def init_db() -> None:
         if not user:
             user_id = new_id("user")
             conn.execute(
-                "INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (id, email, password_hash, name, created_at, is_admin) VALUES (?, ?, ?, ?, ?, 1)",
                 (user_id, admin_email, hash_password(admin_password), admin_name, now()),
             )
             for skill in skill_snapshot():
@@ -1101,6 +1109,8 @@ def init_db() -> None:
                     "INSERT INTO user_enabled_skills (user_id, skill_id, enabled, updated_at) VALUES (?, ?, ?, ?)",
                     (user_id, skill["id"], 1 if skill["default_enabled"] else 0, now()),
                 )
+        else:
+            conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user["id"],))
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -1183,7 +1193,29 @@ def active_retrieval_policy_snapshot() -> dict:
 
 
 def is_platform_admin(user: dict) -> bool:
-    return str(user.get("email", "")).lower() == bootstrap_admin_credentials()[0]
+    return bool(user.get("is_admin", 0))
+
+
+def current_startup_status(create_directories: bool = False) -> dict:
+    report = build_startup_report(
+        DB_PATH,
+        KNOWLEDGE_DIR,
+        ARTIFACT_DIR,
+        model_is_configured(DEEPSEEK_MODEL),
+        ARTIFACT_NODE,
+        TESSERACT_BINARY,
+        create_directories,
+    )
+    report["app_version"] = APP_VERSION
+    if DB_PATH.exists():
+        try:
+            with db() as conn:
+                report["schema"] = migration_status(conn)
+        except sqlite3.Error as exc:
+            report["schema"] = {"ready": False, "error": str(exc)[:160]}
+    else:
+        report["schema"] = {"current_version": 0, "ready": False}
+    return report
 
 
 def estimate_tokens(text: str) -> int:
@@ -1213,6 +1245,25 @@ def allow_request(user_id: str) -> bool:
         recent.append(current)
         REQUESTS_BY_USER[user_id] = recent
         return True
+
+
+def personal_run_budget_error(user_id: str) -> str:
+    current = now()
+    windows = (
+        ("每日", PERSONAL_DAILY_RUN_LIMIT, current - 24 * 60 * 60 * 1_000_000_000),
+        ("每月", PERSONAL_MONTHLY_RUN_LIMIT, current - 30 * 24 * 60 * 60 * 1_000_000_000),
+    )
+    with db() as conn:
+        for label, limit, since in windows:
+            if not limit:
+                continue
+            count = conn.execute(
+                "SELECT COUNT(*) FROM runs JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ? AND runs.started_at >= ?",
+                (user_id, since),
+            ).fetchone()[0]
+            if int(count) >= limit:
+                return f"已达到{label}任务上限（{limit} 次），可继续查看历史记录，稍后再试或调整服务端预算。"
+    return ""
 
 
 def infer_task_profile(content: str, requested_model: str = "auto", requested_task_mode: str = "auto") -> dict:
@@ -1768,6 +1819,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             try:
                 with db() as conn:
                     conn.execute("SELECT 1").fetchone()
+                    schema = migration_status(conn)
             except sqlite3.Error as exc:
                 LOGGER.error("health_check_failed error=%s", str(exc)[:160])
                 self.send_json({"ok": False, "database_ready": False, "database": "sqlite"}, HTTPStatus.SERVICE_UNAVAILABLE)
@@ -1782,6 +1834,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "deepseek_ssl_verify": DEEPSEEK_SSL_VERIFY,
                     "database": "sqlite",
                     "database_ready": True,
+                    "app_version": APP_VERSION,
+                    "schema": schema,
                     "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
                     "agent_intelligence": agent_intelligence_status(),
                 }
@@ -1792,6 +1846,17 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
         if self.path == "/api/me":
             self.send_json({"user": public_user(user)})
+            return
+        if self.path == "/api/startup-status":
+            self.send_json(current_startup_status())
+            return
+        if self.path == "/api/security-events":
+            events = []
+            for row in AUTH_SERVICE.security_events(user["id"]):
+                item = row_to_dict(row)
+                item["detail"] = safe_json_object(item.pop("detail_json", "{}"))
+                events.append(item)
+            self.send_json({"events": events})
             return
         if self.path == "/api/models":
             models = [{"id": "auto", "name": "自动选择", "configured": model_is_configured(DEEPSEEK_MODEL)}]
@@ -1819,6 +1884,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/metrics":
             self.get_metrics(user)
+            return
+        if self.path == "/api/personal-usage":
+            self.get_personal_usage(user)
+            return
+        if self.path == "/api/account-deletion":
+            self.get_account_deletion(user)
             return
         if self.path == "/api/agent-rollout":
             fixed = p45_fixed_report()
@@ -1907,6 +1978,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/login":
             self.login()
             return
+        if self.path == "/api/password-reset/confirm":
+            self.confirm_password_reset()
+            return
         user = self.require_user()
         if not user:
             return
@@ -1915,6 +1989,18 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/logout-all":
             self.logout_all(user)
+            return
+        if self.path == "/api/password/change":
+            self.change_password(user)
+            return
+        if self.path == "/api/data-export":
+            self.create_personal_data_export(user)
+            return
+        if self.path == "/api/account-deletion/request":
+            self.request_account_deletion(user)
+            return
+        if self.path == "/api/account-deletion/cancel":
+            self.cancel_account_deletion(user)
             return
         if self.path == "/api/skills":
             self.create_skill(user)
@@ -2076,6 +2162,24 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         AUTH_SERVICE.logout_all(user["id"])
         self.send_json({"ok": True})
 
+    def change_password(self, user: dict) -> None:
+        payload = self.read_json()
+        error = AUTH_SERVICE.change_password(
+            user["id"], str(payload.get("current_password", "")), str(payload.get("new_password", ""))
+        )
+        if error:
+            self.send_error_json(error, HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"ok": True, "requires_login": True})
+
+    def confirm_password_reset(self) -> None:
+        payload = self.read_json()
+        error = AUTH_SERVICE.reset_password(str(payload.get("token", "")), str(payload.get("new_password", "")))
+        if error:
+            self.send_error_json(error, HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"ok": True})
+
     def update_me(self, user: dict) -> None:
         payload = self.read_json()
         name = payload.get("name", "").strip()
@@ -2086,6 +2190,45 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             conn.execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"]))
             updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
         self.send_json({"user": public_user(row_to_dict(updated))})
+
+    def create_personal_data_export(self, user: dict) -> None:
+        payload = self.read_json()
+        if payload.get("confirmation") != "EXPORT_MY_DATA":
+            self.send_error_json("请确认导出个人数据后再继续", HTTPStatus.CONFLICT)
+            return
+        artifact = create_personal_data_export(user["id"])
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO security_events (id, user_id, event_type, outcome, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (new_id("security"), user["id"], "personal_data_export", "succeeded", json.dumps({"artifact_id": artifact["id"]}), now()),
+            )
+        self.send_json({"artifact": artifact}, HTTPStatus.CREATED)
+
+    def get_account_deletion(self, user: dict) -> None:
+        with db() as conn:
+            request = conn.execute("SELECT status, requested_at, scheduled_for, cancelled_at FROM account_deletion_requests WHERE user_id = ?", (user["id"],)).fetchone()
+        self.send_json({"request": row_to_dict(request) if request else None, "backup_retention": "已有备份会按部署方的备份保留策略自然过期，不因申请立即删除。"})
+
+    def request_account_deletion(self, user: dict) -> None:
+        if self.read_json().get("confirmation") != "DELETE_MY_ACCOUNT":
+            self.send_error_json("请确认删除账号后再继续", HTTPStatus.CONFLICT)
+            return
+        current = now()
+        scheduled_for = current + 7 * 24 * 60 * 60 * 1_000_000_000
+        with db() as conn:
+            conn.execute("INSERT INTO account_deletion_requests (user_id, status, requested_at, scheduled_for, cancelled_at) VALUES (?, 'scheduled', ?, ?, 0) ON CONFLICT(user_id) DO UPDATE SET status = 'scheduled', requested_at = excluded.requested_at, scheduled_for = excluded.scheduled_for, cancelled_at = 0", (user["id"], current, scheduled_for))
+            conn.execute("INSERT INTO security_events (id, user_id, event_type, outcome, detail_json, created_at) VALUES (?, ?, 'account_deletion_requested', 'scheduled', '{}', ?)", (new_id("security"), user["id"], current))
+        self.send_json({"scheduled_for": scheduled_for, "message": "删除申请已记录；在 7 天等待期内可取消。"})
+
+    def cancel_account_deletion(self, user: dict) -> None:
+        with db() as conn:
+            result = conn.execute("UPDATE account_deletion_requests SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'scheduled'", (now(), user["id"])).rowcount
+            if result:
+                conn.execute("INSERT INTO security_events (id, user_id, event_type, outcome, detail_json, created_at) VALUES (?, ?, 'account_deletion_cancelled', 'succeeded', '{}', ?)", (new_id("security"), user["id"], now()))
+        if not result:
+            self.send_error_json("没有可取消的删除申请", HTTPStatus.CONFLICT)
+            return
+        self.send_json({"ok": True})
 
     def list_threads(self, user: dict) -> None:
         with db() as conn:
@@ -2704,6 +2847,40 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 conn.execute("INSERT INTO manual_tool_invocations (id, user_id, tool_id, argument_keys, status, duration_ms, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (invocation_id, user["id"], tool_id, json.dumps(sorted(arguments)) if isinstance(arguments, dict) else "[]", "failed", duration_ms, str(exc)[:500], now()))
             self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
 
+    def get_personal_usage(self, user: dict) -> None:
+        current = now()
+        day_start = current - 24 * 60 * 60 * 1_000_000_000
+        month_start = current - 30 * 24 * 60 * 60 * 1_000_000_000
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT runs.started_at, runs.input_tokens_estimate, runs.output_tokens_estimate
+                   FROM runs JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ?""",
+                (user["id"],),
+            ).fetchall()
+            knowledge = conn.execute(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM knowledge_documents WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()
+            artifacts = conn.execute("SELECT storage_path FROM artifacts WHERE user_id = ?", (user["id"],)).fetchall()
+        def period(since: int) -> dict:
+            selected = [row for row in rows if int(row["started_at"] or 0) >= since]
+            return {
+                "runs": len(selected),
+                "input_tokens_estimate": sum(int(row["input_tokens_estimate"] or 0) for row in selected),
+                "output_tokens_estimate": sum(int(row["output_tokens_estimate"] or 0) for row in selected),
+            }
+        artifact_bytes = 0
+        allowed_root = ARTIFACT_DIR.resolve()
+        for row in artifacts:
+            path = Path(row["storage_path"])
+            if path.is_file() and path.resolve().is_relative_to(allowed_root):
+                artifact_bytes += path.stat().st_size
+        self.send_json({
+            "day": period(day_start), "month": period(month_start),
+            "storage": {"knowledge_documents": int(knowledge["count"]), "knowledge_bytes": int(knowledge["bytes"]), "artifact_bytes": artifact_bytes},
+            "token_note": "Token 为本地估算值，不等同于模型供应商账单。",
+        })
+
     def get_metrics(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute(
@@ -3017,7 +3194,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
             self.send_error_json("文件产物不可用", HTTPStatus.NOT_FOUND)
             return
-        content_type = "text/markdown; charset=utf-8" if artifact["kind"] == "markdown" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        content_types = {
+            "markdown": "text/markdown; charset=utf-8",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "json": "application/json; charset=utf-8",
+        }
+        content_type = content_types.get(artifact["kind"], "application/octet-stream")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Disposition", f'attachment; filename="{artifact["filename"]}"')
@@ -3323,6 +3505,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not allow_request(user["id"]):
             self.send_error_json("请求过于频繁，请稍后再试", HTTPStatus.TOO_MANY_REQUESTS)
             return
+        budget_error = personal_run_budget_error(user["id"])
+        if budget_error:
+            self.send_error_json(budget_error, HTTPStatus.TOO_MANY_REQUESTS)
+            return
         payload = self.read_json()
         try:
             request = CHAT_SERVICE.validate_request(payload, MODEL_CATALOG, resolve_execution_modes)
@@ -3565,6 +3751,7 @@ def public_user(user: dict) -> dict:
         "email": user["email"],
         "name": user["name"],
         "avatar_url": user.get("avatar_url", ""),
+        "is_admin": bool(user.get("is_admin", 0)),
     }
 
 
@@ -3872,6 +4059,67 @@ def artifact_source_from_conversation(thread_id: str, command: str) -> tuple[str
             ORDER BY created_at DESC, id DESC LIMIT 1""", (thread_id,)).fetchone()
     content = str(previous["content"]).strip() if previous else ""
     return (content, True) if content else (command, False)
+
+
+def create_personal_data_export(user_id: str) -> dict:
+    """Write a user-scoped, portable JSON export without exposing local paths or credentials."""
+    with db() as conn:
+        profile = conn.execute("SELECT id, email, name, avatar_url, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not profile:
+            raise ValueError("用户不存在")
+        threads = conn.execute("SELECT id, folder_id, title, created_at, updated_at FROM threads WHERE user_id = ? ORDER BY created_at, id", (user_id,)).fetchall()
+        messages = conn.execute(
+            """SELECT messages.id, messages.thread_id, messages.run_id, messages.role, messages.content, messages.created_at
+               FROM messages JOIN threads ON threads.id = messages.thread_id
+               WHERE threads.user_id = ? ORDER BY messages.created_at, messages.id""",
+            (user_id,),
+        ).fetchall()
+        memories = conn.execute(
+            "SELECT id, kind, content, scope_type, scope_id, confidence, status, expires_at, created_at, updated_at FROM memories WHERE user_id = ? ORDER BY created_at, id",
+            (user_id,),
+        ).fetchall()
+        knowledge = conn.execute(
+            "SELECT id, filename, mime_type, content_hash, size_bytes, chunk_count, scope, project_space_id, upload_origin, created_at FROM knowledge_documents WHERE user_id = ? ORDER BY created_at, id",
+            (user_id,),
+        ).fetchall()
+        artifacts = conn.execute(
+            "SELECT id, run_id, filename, kind, summary, created_at FROM artifacts WHERE user_id = ? ORDER BY created_at, id",
+            (user_id,),
+        ).fetchall()
+        runs = conn.execute(
+            """SELECT runs.id, runs.thread_id, runs.status, runs.model, runs.started_at, runs.completed_at,
+                      runs.input_tokens_estimate, runs.output_tokens_estimate, runs.tool_call_count
+               FROM runs JOIN threads ON threads.id = runs.thread_id
+               WHERE threads.user_id = ? ORDER BY runs.started_at, runs.id""",
+            (user_id,),
+        ).fetchall()
+    exported_at = now()
+    payload = {
+        "format": "agent-platform-personal-data-export/v1",
+        "exported_at": exported_at,
+        "profile": row_to_dict(profile),
+        "threads": [row_to_dict(row) for row in threads],
+        "messages": [row_to_dict(row) for row in messages],
+        "memories": [row_to_dict(row) for row in memories],
+        "knowledge_index": [row_to_dict(row) for row in knowledge],
+        "artifact_index": [row_to_dict(row) for row in artifacts],
+        "run_index": [row_to_dict(row) for row in runs],
+        "exclusions": ["password_hash", "session_tokens", "password_reset_tokens", "local_storage_paths", "knowledge_original_files"],
+    }
+    artifact_id = new_id("artifact")
+    storage_dir = ARTIFACT_DIR / user_id
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    path = (storage_dir / f"{artifact_id}.json").resolve()
+    if storage_dir.resolve() not in path.parents or path.exists():
+        raise ValueError("个人数据导出路径无效")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    filename = f"agent-platform-data-export-{exported_at}.json"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, '', ?, 'json', ?, ?, ?)",
+            (artifact_id, user_id, filename, str(path), "个人数据导出（不含凭据、本地路径与知识原文件）", exported_at),
+        )
+    return {"id": artifact_id, "filename": filename, "kind": "json", "summary": "个人数据导出已生成"}
 
 
 def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, answer: str, *, title_content: str = "") -> dict:
@@ -4405,10 +4653,14 @@ def chunk_text(text: str, size: int):
 
 
 def main() -> None:
+    startup = current_startup_status(create_directories=True)
+    if not startup["required_ready"]:
+        raise RuntimeError("启动检查失败：数据库或数据目录不可写")
     init_db()
     port = int(os.environ.get("PORT", "8765"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), AgentPlatformHandler)
-    print(f"Agent_Platform running at http://localhost:{port}")
+    host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
+    server = ThreadingHTTPServer((host, port), AgentPlatformHandler)
+    print(f"Agent_Platform {APP_VERSION} running at http://{host}:{port}")
     server.serve_forever()
 
 

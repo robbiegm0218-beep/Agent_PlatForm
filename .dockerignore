@@ -1,0 +1,10 @@
+.git
+.env
+__pycache__
+*.pyc
+agent_platform.db
+data
+node_modules
+sites-frontend
+hoops-v2-upgrade
+*.png
