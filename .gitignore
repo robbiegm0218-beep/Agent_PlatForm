@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .env
 agent_platform.db
+data/
+node_modules/
+hoops-v2-upgrade/
+shangjie-*.png
 data/knowledge/
 data/evaluations/
 data/artifacts/

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Research Brief"
-  short_description: "Create concise evidence-based research briefs."
-  default_prompt: "Create a concise research brief for this topic."
