@@ -144,6 +144,8 @@ MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
 PERSONAL_DAILY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_DAILY_RUN_LIMIT", "100")))
 PERSONAL_MONTHLY_RUN_LIMIT = max(0, int(os.environ.get("PERSONAL_MONTHLY_RUN_LIMIT", "1000")))
+PERSONAL_DAILY_TOKEN_LIMIT = max(0, int(os.environ.get("PERSONAL_DAILY_TOKEN_LIMIT", "200000")))
+PERSONAL_MONTHLY_TOKEN_LIMIT = max(0, int(os.environ.get("PERSONAL_MONTHLY_TOKEN_LIMIT", "2000000")))
 AGENT_INTELLIGENCE_V2 = os.environ.get("AGENT_INTELLIGENCE_V2", "false").lower() in {"1", "true", "yes"}
 AGENT_PLANNER_MODE = os.environ.get("AGENT_PLANNER_MODE", "off").strip().lower()
 if AGENT_PLANNER_MODE not in {"off", "shadow", "active"}:
@@ -1247,22 +1249,24 @@ def allow_request(user_id: str) -> bool:
         return True
 
 
-def personal_run_budget_error(user_id: str) -> str:
+def personal_run_budget_error(user_id: str, reserved_tokens: int = 0) -> str:
     current = now()
     windows = (
-        ("每日", PERSONAL_DAILY_RUN_LIMIT, current - 24 * 60 * 60 * 1_000_000_000),
-        ("每月", PERSONAL_MONTHLY_RUN_LIMIT, current - 30 * 24 * 60 * 60 * 1_000_000_000),
+        ("每日", PERSONAL_DAILY_RUN_LIMIT, PERSONAL_DAILY_TOKEN_LIMIT, current - 24 * 60 * 60 * 1_000_000_000),
+        ("每月", PERSONAL_MONTHLY_RUN_LIMIT, PERSONAL_MONTHLY_TOKEN_LIMIT, current - 30 * 24 * 60 * 60 * 1_000_000_000),
     )
     with db() as conn:
-        for label, limit, since in windows:
-            if not limit:
+        for label, run_limit, token_limit, since in windows:
+            if not run_limit and not token_limit:
                 continue
-            count = conn.execute(
-                "SELECT COUNT(*) FROM runs JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ? AND runs.started_at >= ?",
+            totals = conn.execute(
+                "SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens_estimate + output_tokens_estimate), 0) AS tokens FROM runs JOIN threads ON threads.id = runs.thread_id WHERE threads.user_id = ? AND runs.started_at >= ?",
                 (user_id, since),
-            ).fetchone()[0]
-            if int(count) >= limit:
-                return f"已达到{label}任务上限（{limit} 次），可继续查看历史记录，稍后再试或调整服务端预算。"
+            ).fetchone()
+            if run_limit and int(totals["runs"]) >= run_limit:
+                return f"已达到{label}任务上限（{run_limit} 次），可继续查看历史记录，稍后再试或调整服务端预算。"
+            if token_limit and int(totals["tokens"]) + reserved_tokens > token_limit:
+                return f"已达到{label} Token 预算上限（{token_limit}），可继续查看历史记录，稍后再试或调整服务端预算。"
     return ""
 
 
@@ -3505,11 +3509,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not allow_request(user["id"]):
             self.send_error_json("请求过于频繁，请稍后再试", HTTPStatus.TOO_MANY_REQUESTS)
             return
-        budget_error = personal_run_budget_error(user["id"])
+        payload = self.read_json()
+        budget_error = personal_run_budget_error(user["id"], estimate_tokens(str(payload.get("content", ""))) + MAX_RESPONSE_TOKENS)
         if budget_error:
             self.send_error_json(budget_error, HTTPStatus.TOO_MANY_REQUESTS)
             return
-        payload = self.read_json()
         try:
             request = CHAT_SERVICE.validate_request(payload, MODEL_CATALOG, resolve_execution_modes)
         except ValueError as exc:
