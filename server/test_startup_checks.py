@@ -16,3 +16,4 @@ class StartupChecksTests(unittest.TestCase):
         self.assertTrue(report["required_ready"])
         self.assertFalse(report["optional_ready"])
         self.assertFalse(report["checks"]["model"]["required"])
+        self.assertIn("free_bytes", report["checks"]["disk_space"])

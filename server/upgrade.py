@@ -67,6 +67,28 @@ def restore_snapshot(snapshot: Path, database: Path, data_dir: Path) -> None:
             destination.mkdir(parents=True, exist_ok=True)
 
 
+def restore_snapshot_isolated(snapshot: Path, restore_root: Path) -> Path:
+    """Restore into a fresh directory without changing the active instance."""
+    manifest = snapshot / "manifest.json"
+    source_database = snapshot / "agent_platform.db"
+    if not manifest.is_file() or not source_database.is_file():
+        raise ValueError("升级备份缺少 manifest.json 或数据库文件")
+    json.loads(manifest.read_text(encoding="utf-8"))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = restore_root / f"agent-platform-restore-{stamp}"
+    if destination.exists():
+        raise FileExistsError(f"隔离恢复目录已存在：{destination}")
+    destination.mkdir(parents=True)
+    _copy_database(source_database, destination / "agent_platform.db")
+    for name in ("knowledge", "artifacts"):
+        source = snapshot / name
+        if source.exists():
+            shutil.copytree(source, destination / "data" / name)
+        else:
+            (destination / "data" / name).mkdir(parents=True, exist_ok=True)
+    return destination
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="个人托管版升级前备份与恢复")
@@ -75,14 +97,19 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, default=root / "data")
     parser.add_argument("--backup-root", type=Path, default=root / "data" / "upgrade-backups")
     parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--restore-root", type=Path, default=root / "data" / "restore-previews")
+    parser.add_argument("--replace", action="store_true", help="恢复时覆盖指定数据库与数据目录（默认仅隔离恢复）")
     args = parser.parse_args()
     if args.action == "prepare":
         print(prepare_snapshot(args.database, args.data_dir, args.backup_root))
     else:
         if not args.snapshot:
             parser.error("restore 必须提供 --snapshot")
-        restore_snapshot(args.snapshot, args.database, args.data_dir)
-        print("恢复完成；请重新启动服务并检查健康状态。")
+        if args.replace:
+            restore_snapshot(args.snapshot, args.database, args.data_dir)
+            print("已覆盖恢复；请重新启动服务并检查健康状态。")
+        else:
+            print(restore_snapshot_isolated(args.snapshot, args.restore_root))
     return 0
 
 

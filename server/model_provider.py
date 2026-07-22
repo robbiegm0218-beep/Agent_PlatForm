@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -111,7 +112,7 @@ class DeepSeekProvider:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             kind = "authentication" if exc.code in {401, 403} else "rate_limited" if exc.code == 429 else "upstream"
-            safe_detail = detail[:600] if detail else "上游服务未返回错误详情"
+            safe_detail = re.sub(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+", r"\1=[REDACTED]", detail[:600]) if detail else "上游服务未返回错误详情"
             raise ProviderError(self._config.provider_name, kind, f"{self._config.provider_name} 请求失败：{exc.code} {safe_detail}", exc.code) from exc
         except urllib.error.URLError as exc:
             reason = str(exc.reason)

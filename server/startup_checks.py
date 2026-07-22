@@ -22,6 +22,15 @@ def _directory_check(path: Path, create: bool = False) -> dict:
         return {"ok": False, "exists": False, "writable": False, "error": str(exc)[:160]}
 
 
+def _disk_check(path: Path, minimum_free_bytes: int) -> dict:
+    try:
+        usage = shutil.disk_usage(path if path.exists() else path.parent)
+        free = int(usage.free)
+        return {"ok": free >= minimum_free_bytes, "free_bytes": free, "minimum_free_bytes": minimum_free_bytes}
+    except OSError as exc:
+        return {"ok": False, "free_bytes": 0, "minimum_free_bytes": minimum_free_bytes, "error": str(exc)[:160]}
+
+
 def build_startup_report(
     database: Path,
     knowledge_dir: Path,
@@ -30,12 +39,14 @@ def build_startup_report(
     node_binary: str = "",
     tesseract_binary: str = "",
     create_directories: bool = False,
+    minimum_free_disk_bytes: int = 1_073_741_824,
 ) -> dict:
     checks = {
         "python": {"ok": sys.version_info >= (3, 10), "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"},
         "database_directory": _directory_check(database.parent, create_directories),
         "knowledge_directory": _directory_check(knowledge_dir, create_directories),
         "artifacts_directory": _directory_check(artifacts_dir, create_directories),
+        "disk_space": _disk_check(database.parent, minimum_free_disk_bytes),
         "model": {"ok": model_configured, "required": False},
         "word_parser": {"ok": importlib.util.find_spec("docx") is not None, "required": False},
         "pdf_parser": {"ok": importlib.util.find_spec("pypdf") is not None, "required": False},
@@ -73,6 +84,7 @@ def main() -> int:
         shutil.which("node") or "",
         shutil.which("tesseract") or "",
         args.create_directories,
+        int(os.environ.get("MIN_FREE_DISK_BYTES", str(1_073_741_824))),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["required_ready"] else 1

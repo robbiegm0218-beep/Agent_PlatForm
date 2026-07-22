@@ -139,6 +139,10 @@ DEEPSEEK_CA_FILE = os.environ.get("DEEPSEEK_CA_FILE", "")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(14 * 24 * 60 * 60)))
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "65536"))
 MAX_KNOWLEDGE_UPLOAD_BYTES = int(os.environ.get("MAX_KNOWLEDGE_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+MAX_KNOWLEDGE_ARCHIVE_FILES = int(os.environ.get("MAX_KNOWLEDGE_ARCHIVE_FILES", "256"))
+MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES = int(os.environ.get("MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES", str(32 * 1024 * 1024)))
+MAX_KNOWLEDGE_EXTRACTED_CHARS = int(os.environ.get("MAX_KNOWLEDGE_EXTRACTED_CHARS", "200000"))
+MAX_KNOWLEDGE_PDF_PAGES = int(os.environ.get("MAX_KNOWLEDGE_PDF_PAGES", "200"))
 MAX_RESPONSE_TOKENS = int(os.environ.get("MAX_RESPONSE_TOKENS", "2048"))
 MAX_TOOL_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "4"))
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
@@ -175,6 +179,19 @@ MAX_RATE_LIMIT_USERS = int(os.environ.get("MAX_RATE_LIMIT_USERS", "10000"))
 LOG_FILE = os.environ.get("AGENT_LOG_FILE", "").strip()
 LOG_MAX_BYTES = int(os.environ.get("AGENT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.environ.get("AGENT_LOG_BACKUP_COUNT", "5"))
+MIN_FREE_DISK_BYTES = max(0, int(os.environ.get("MIN_FREE_DISK_BYTES", str(1_073_741_824))))
+SENSITIVE_LOG_VALUE = re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+")
+
+
+def redact_sensitive_text(value: object) -> str:
+    return SENSITIVE_LOG_VALUE.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(value))
+
+
+class SensitiveLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_sensitive_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 def configure_logging() -> None:
@@ -194,6 +211,8 @@ def configure_logging() -> None:
             )
         except OSError as exc:
             logging.getLogger("agent_platform").warning("file_logging_unavailable error=%s", str(exc)[:160])
+    for handler in handlers:
+        handler.addFilter(SensitiveLogFilter())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
 
@@ -1122,6 +1141,12 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}
 
 
+def public_artifact(row: sqlite3.Row) -> dict:
+    item = row_to_dict(row)
+    item.pop("storage_path", None)
+    return item
+
+
 def safe_json_object(value: object) -> dict:
     try:
         decoded = json.loads(value or "{}")
@@ -1210,6 +1235,7 @@ def current_startup_status(create_directories: bool = False) -> dict:
         ARTIFACT_NODE,
         TESSERACT_BINARY,
         create_directories,
+        MIN_FREE_DISK_BYTES,
     )
     report["app_version"] = APP_VERSION
     if DB_PATH.exists():
@@ -1372,20 +1398,92 @@ def allowed_tools_for_task(content: str) -> list[dict]:
     return TOOL_POLICY.resolve(content)
 
 
+KNOWLEDGE_FILE_TYPES = {
+    ".md": {"text/markdown", "text/plain"},
+    ".txt": {"text/plain"},
+    ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    ".pdf": {"application/pdf"},
+    ".xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    ".png": {"image/png"},
+    ".jpg": {"image/jpeg"},
+    ".jpeg": {"image/jpeg"},
+    ".webp": {"image/webp"},
+    ".tif": {"image/tiff"},
+    ".tiff": {"image/tiff"},
+}
+
+
+def validate_knowledge_archive(raw: bytes, suffix: str) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            entries = [entry for entry in archive.infolist() if not entry.is_dir()]
+            if not entries or len(entries) > MAX_KNOWLEDGE_ARCHIVE_FILES:
+                raise ValueError("Office 文件的压缩包条目数量超出限制")
+            total_size = sum(entry.file_size for entry in entries)
+            if total_size > MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES:
+                raise ValueError("Office 文件展开后超过解析大小限制")
+            for entry in entries:
+                normalized = entry.filename.replace("\\", "/")
+                if normalized.startswith("/") or ".." in Path(normalized).parts or entry.flag_bits & 0x1:
+                    raise ValueError("Office 文件包含不安全或加密条目")
+            names = set(archive.namelist())
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Office 文件不是有效压缩包") from exc
+    required = "word/document.xml" if suffix == ".docx" else "xl/workbook.xml"
+    if "[Content_Types].xml" not in names or required not in names:
+        raise ValueError("Office 文件结构与扩展名不匹配")
+
+
+def validate_knowledge_upload(filename: str, declared_mime: object, raw: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    allowed_mime = KNOWLEDGE_FILE_TYPES.get(suffix)
+    if not allowed_mime:
+        raise ValueError("仅支持 Markdown、TXT、DOCX、PDF、XLSX 和受支持图片文件")
+    mime_type = str(declared_mime or "").split(";", 1)[0].strip().lower()
+    if mime_type not in allowed_mime:
+        raise ValueError("资料扩展名与 MIME 类型不匹配")
+    if suffix in {".md", ".txt"}:
+        if b"\x00" in raw:
+            raise ValueError("文本资料包含不支持的二进制内容")
+    elif suffix == ".pdf" and not raw.startswith(b"%PDF-"):
+        raise ValueError("PDF 文件签名无效")
+    elif suffix in {".docx", ".xlsx"}:
+        if not raw.startswith(b"PK\x03\x04"):
+            raise ValueError("Office 文件签名无效")
+        validate_knowledge_archive(raw, suffix)
+    elif suffix == ".png" and not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("PNG 文件签名无效")
+    elif suffix in {".jpg", ".jpeg"} and not raw.startswith(b"\xff\xd8\xff"):
+        raise ValueError("JPEG 文件签名无效")
+    elif suffix == ".webp" and not (raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"):
+        raise ValueError("WebP 文件签名无效")
+    elif suffix in {".tif", ".tiff"} and not raw.startswith((b"II*\x00", b"MM\x00*")):
+        raise ValueError("TIFF 文件签名无效")
+    return mime_type
+
+
+def ensure_knowledge_text_budget(text: str) -> str:
+    if len(text) > MAX_KNOWLEDGE_EXTRACTED_CHARS:
+        raise ValueError("资料解析文本超过限制，请拆分后上传")
+    return text
+
+
 def extract_knowledge_text(filename: str, raw: bytes) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".md", ".txt"}:
-        return raw.decode("utf-8", errors="replace")
+        return ensure_knowledge_text_budget(raw.decode("utf-8", errors="replace"))
     if suffix == ".docx":
         if not Document:
             raise ValueError("当前环境未安装 Word 解析组件")
         document = Document(io.BytesIO(raw))
-        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+        return ensure_knowledge_text_budget("\n".join(paragraph.text for paragraph in document.paragraphs))
     if suffix == ".pdf":
         if not PdfReader:
             raise ValueError("当前环境未安装 PDF 解析组件 pypdf")
         reader = PdfReader(io.BytesIO(raw))
-        return "\n\n".join(f"【PDF 第 {index + 1} 页】\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages))
+        if len(reader.pages) > MAX_KNOWLEDGE_PDF_PAGES:
+            raise ValueError("PDF 页数超过解析限制")
+        return ensure_knowledge_text_budget("\n\n".join(f"【PDF 第 {index + 1} 页】\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages)))
     if suffix == ".xlsx":
         return extract_xlsx_knowledge_text(raw)
     if suffix in IMAGE_KNOWLEDGE_SUFFIXES:
@@ -1411,7 +1509,7 @@ def extract_image_knowledge_text(filename: str, raw: bytes) -> str:
     text = result.stdout.decode("utf-8", errors="replace").strip()
     if not text:
         raise ValueError("图片中未识别到可检索文本")
-    return f"【图片 OCR（本地）：{Path(filename).name[:120]}】\n{text[:20000]}"
+    return ensure_knowledge_text_budget(f"【图片 OCR（本地）：{Path(filename).name[:120]}】\n{text[:20000]}")
 
 
 def extract_xlsx_knowledge_text(raw: bytes) -> str:
@@ -1454,7 +1552,7 @@ def extract_xlsx_knowledge_text(raw: bytes) -> str:
         raise ValueError("无法解析 Excel 文件") from exc
     if not sheets:
         raise ValueError("Excel 文件中没有可检索的文本单元格")
-    return "\n\n".join(sheets)
+    return ensure_knowledge_text_budget("\n\n".join(sheets))
 
 
 def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list[str]:
@@ -1751,6 +1849,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
+    def request_id(self) -> str:
+        cached = getattr(self, "_request_id", "")
+        if cached:
+            return cached
+        supplied = self.headers.get("X-Request-ID", "").strip()
+        self._request_id = supplied if re.fullmatch(r"[A-Za-z0-9_-]{8,64}", supplied) else new_id("request")
+        return self._request_id
+
     def require_same_origin_for_write(self) -> bool:
         """Bearer auth prevents classic CSRF; reject cross-origin browser writes as defense in depth."""
         origin = self.headers.get("Origin", "").strip()
@@ -1800,12 +1906,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Request-ID", self.request_id())
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def send_error_json(self, message: str, status: int = 400) -> None:
-        LOGGER.warning("api_error status=%s path=%s code=%s", status, self.path.split("?")[0], message[:80])
+        LOGGER.warning("api_error request_id=%s status=%s path=%s code=%s", self.request_id(), status, self.path.split("?")[0], message[:80])
         self.send_json({"error": message}, status)
 
     def bearer_token(self) -> str:
@@ -1831,6 +1938,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         user = self.require_user() if self.path != "/api/health" else None
         if self.path == "/api/health":
+            startup = current_startup_status()
             try:
                 with db() as conn:
                     conn.execute("SELECT 1").fetchone()
@@ -1851,6 +1959,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "database_ready": True,
                     "app_version": APP_VERSION,
                     "schema": schema,
+                    "startup": {"required_ready": startup["required_ready"], "disk_space": startup["checks"]["disk_space"]},
                     "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
                     "agent_intelligence": agent_intelligence_status(),
                 }
@@ -2846,6 +2955,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not tool or not tool.enabled or tool.risk != "read_only":
             self.send_error_json("该工具不可在此处手动执行", HTTPStatus.FORBIDDEN)
             return
+        budget_error = personal_run_budget_error(user["id"])
+        if budget_error:
+            self.send_error_json(budget_error, HTTPStatus.TOO_MANY_REQUESTS)
+            return
         arguments = self.read_json().get("arguments", {})
         invocation_id = new_id("toolrun")
         started = time.monotonic_ns()
@@ -3198,7 +3311,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
     def list_artifacts(self, user: dict) -> None:
         with db() as conn:
             rows = conn.execute("SELECT * FROM artifacts WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)).fetchall()
-        self.send_json({"artifacts": [row_to_dict(row) for row in rows]})
+        self.send_json({"artifacts": [public_artifact(row) for row in rows]})
 
     def download_artifact(self, user: dict) -> None:
         artifact_id = self.path.split("/")[-2]
@@ -3239,7 +3352,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
             return
         path = Path(artifact["storage_path"])
-        path.unlink(missing_ok=True)
+        allowed_root = ARTIFACT_DIR.resolve()
+        if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
+            self.send_error_json("文件产物不可用", HTTPStatus.NOT_FOUND)
+            return
+        path.unlink()
         with db() as conn:
             conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
         self.send_json({"ok": True})
@@ -3257,7 +3374,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def create_knowledge_for_scope(self, user: dict, forced_space_id: str = "", origin: str = "knowledge_library") -> None:
         try:
-            payload = self.read_json(MAX_KNOWLEDGE_UPLOAD_BYTES)
+            payload = self.read_json(MAX_KNOWLEDGE_UPLOAD_BYTES * 2)
             filename = Path(payload.get("filename", "")).name
             encoded = payload.get("content_base64", "")
             if not filename or not isinstance(encoded, str):
@@ -3265,6 +3382,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             raw = base64.b64decode(encoded, validate=True)
             if not raw or len(raw) > MAX_KNOWLEDGE_UPLOAD_BYTES:
                 raise ValueError("资料为空或超过大小限制")
+            mime_type = validate_knowledge_upload(filename, payload.get("mime_type"), raw)
+            if Path(filename).suffix.lower() in IMAGE_KNOWLEDGE_SUFFIXES:
+                budget_error = personal_run_budget_error(user["id"])
+                if budget_error:
+                    self.send_error_json(budget_error, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
             text = extract_knowledge_text(filename, raw)
             chunks = chunk_knowledge_text(text)
             if not chunks:
@@ -3286,7 +3409,6 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 return
         document_id = new_id("knowledge")
         storage_path = KNOWLEDGE_DIR / user["id"] / f"{document_id}{Path(filename).suffix.lower()}"
-        mime_type = payload.get("mime_type", "application/octet-stream")[:120]
         KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": now(), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "raw": raw}, [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)])
         self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin}}, HTTPStatus.CREATED)
 

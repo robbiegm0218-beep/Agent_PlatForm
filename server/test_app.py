@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from server import app
+from server.account_deletion import delete_due_accounts
 from server.provider_config import ProviderConfig
 
 
@@ -100,6 +101,9 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(response.headers["Cross-Origin-Resource-Policy"], "same-origin")
+        trace_request = urllib.request.Request(f"{self.base_url}/api/health", headers={"X-Request-ID": "trace_12345"})
+        with urllib.request.urlopen(trace_request, timeout=3) as response:
+            self.assertEqual(response.headers["X-Request-ID"], "trace_12345")
         cross_origin = urllib.request.Request(
             f"{self.base_url}/api/login", data=b'{}', method="POST",
             headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
@@ -107,6 +111,13 @@ class AgentPlatformApiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(cross_origin, timeout=3)
         self.assertEqual(denied.exception.code, 403)
+
+    def test_sensitive_values_are_redacted_before_logging(self):
+        message = app.redact_sensitive_text("Authorization: Bearer abc123 password=hunter2 api_key: value")
+        self.assertNotIn("abc123", message)
+        self.assertNotIn("hunter2", message)
+        self.assertNotIn("value", message)
+        self.assertEqual(message.count("[REDACTED]"), 3)
 
     def test_agent_rollout_is_current_user_scoped(self):
         report = self.request_json("/api/agent-rollout", token=self.token)
@@ -275,6 +286,19 @@ class AgentPlatformApiTests(unittest.TestCase):
         finally:
             app.AUTH_SERVICE.login_failure_limit = original_limit
 
+    def test_manual_tools_respect_run_budget_before_execution(self):
+        original_limit = app.PERSONAL_DAILY_RUN_LIMIT
+        app.PERSONAL_DAILY_RUN_LIMIT = 1
+        try:
+            thread = self.request_json("/api/threads", {"title": "工具预算"}, self.token)["thread"]
+            with app.db() as conn:
+                conn.execute("INSERT INTO runs (id, thread_id, status, model, started_at, completed_at) VALUES (?, ?, 'completed', ?, ?, ?)", ("manual_tool_budget_run", thread["id"], app.DEEPSEEK_MODEL, app.now(), app.now()))
+            with self.assertRaises(urllib.error.HTTPError) as limited:
+                self.request_json("/api/tools/platform_status/execute", {"arguments": {}}, self.token)
+            self.assertEqual(limited.exception.code, 429)
+        finally:
+            app.PERSONAL_DAILY_RUN_LIMIT = original_limit
+
     def test_account_deletion_request_requires_confirmation_and_can_be_cancelled(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:
             self.request_json("/api/account-deletion/request", {}, self.token)
@@ -284,6 +308,33 @@ class AgentPlatformApiTests(unittest.TestCase):
         status = self.request_json("/api/account-deletion", token=self.token)["request"]
         self.assertEqual(status["status"], "scheduled")
         self.assertTrue(self.request_json("/api/account-deletion/cancel", {}, self.token)["ok"])
+
+    def test_due_account_deletion_is_dry_run_first_then_removes_personal_data(self):
+        data_dir = Path(self.temp_dir.name) / "deletion-data"
+        knowledge_file = data_dir / "knowledge" / "admin" / "source.md"
+        artifact_file = data_dir / "artifacts" / "admin" / "answer.md"
+        knowledge_file.parent.mkdir(parents=True)
+        artifact_file.parent.mkdir(parents=True)
+        knowledge_file.write_text("private knowledge", encoding="utf-8")
+        artifact_file.write_text("private artifact", encoding="utf-8")
+        with app.db() as conn:
+            user_id = conn.execute("SELECT id FROM users WHERE email = 'admin@example.com'").fetchone()["id"]
+            conn.execute("INSERT INTO threads (id, user_id, title, created_at, updated_at) VALUES ('delete_thread', ?, '删除', ?, ?)", (user_id, app.now(), app.now()))
+            conn.execute("INSERT INTO runs (id, thread_id, status, model, started_at) VALUES ('delete_run', 'delete_thread', 'completed', ?, ?)", (app.DEEPSEEK_MODEL, app.now()))
+            conn.execute("INSERT INTO knowledge_documents (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at, created_by_user_id) VALUES ('delete_doc', ?, 'source.md', ?, 'text/markdown', 'hash', 1, 1, ?, ?)", (user_id, str(knowledge_file), app.now(), user_id))
+            conn.execute("INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, created_at) VALUES ('delete_artifact', ?, 'delete_run', 'answer.md', 'markdown', ?, ?)", (user_id, str(artifact_file), app.now()))
+            conn.execute("INSERT INTO account_deletion_requests (user_id, status, requested_at, scheduled_for, cancelled_at) VALUES (?, 'scheduled', 0, 0, 0)", (user_id,))
+        preview = delete_due_accounts(app.DB_PATH, data_dir, execute=False, current_ns=1)
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["planned"][0]["user_id"], user_id)
+        with app.db() as conn:
+            self.assertIsNotNone(conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone())
+        result = delete_due_accounts(app.DB_PATH, data_dir, execute=True, current_ns=1)
+        self.assertFalse(result["dry_run"])
+        self.assertFalse(knowledge_file.exists())
+        self.assertFalse(artifact_file.exists())
+        with app.db() as conn:
+            self.assertIsNone(conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone())
 
     def test_models_expose_provider_neutral_capabilities(self):
         result = self.request_json("/api/models", token=self.token)
@@ -662,7 +713,10 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.assertEqual(result["artifact"]["kind"], "markdown")
             artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
             self.assertEqual(artifacts[0]["id"], result["artifact"]["id"])
-            self.assertTrue(Path(artifacts[0]["storage_path"]).is_file())
+            self.assertNotIn("storage_path", artifacts[0])
+            with app.db() as conn:
+                stored = conn.execute("SELECT storage_path FROM artifacts WHERE id = ?", (artifacts[0]["id"],)).fetchone()
+            self.assertTrue(Path(stored["storage_path"]).is_file())
             detail = self.request_json(f"/api/runs/{run_id}", token=self.token)
             thread_context = self.request_json(f"/api/threads/{detail['run']['thread_id']}/context", token=self.token)
             self.assertEqual(thread_context["outputs"][0]["id"], result["artifact"]["id"])
@@ -754,7 +808,10 @@ class AgentPlatformApiTests(unittest.TestCase):
             artifact = result["artifact"]
             self.assertEqual(artifact["kind"], "xlsx")
             artifacts = self.request_json("/api/artifacts", token=self.token)["artifacts"]
-            path = Path(artifacts[0]["storage_path"])
+            self.assertNotIn("storage_path", artifacts[0])
+            with app.db() as conn:
+                stored = conn.execute("SELECT storage_path FROM artifacts WHERE id = ?", (artifact["id"],)).fetchone()
+            path = Path(stored["storage_path"])
             self.assertTrue(path.is_file())
             self.assertFalse(path.with_name(path.name + ".inspect.ndjson").exists())
             downloaded, content_type = self.download_artifact(artifact["id"])
@@ -1250,6 +1307,21 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("【工作表：预算】", text)
         self.assertIn("项目 | 预算", text)
 
+    def test_knowledge_upload_validation_checks_mime_signatures_and_archive_budget(self):
+        with self.assertRaisesRegex(ValueError, "MIME"):
+            app.validate_knowledge_upload("notes.md", "application/pdf", b"plain text")
+        with self.assertRaisesRegex(ValueError, "PDF 文件签名"):
+            app.validate_knowledge_upload("notes.pdf", "application/pdf", b"not a pdf")
+        workbook = io.BytesIO()
+        with zipfile.ZipFile(workbook, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+        with patch.object(app, "MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "展开"):
+                app.validate_knowledge_upload(
+                    "budget.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", workbook.getvalue()
+                )
+
     def test_image_knowledge_uses_bounded_local_ocr_without_network(self):
         completed = subprocess.CompletedProcess(["tesseract"], 0, stdout="产品指标：42".encode("utf-8"), stderr=b"")
         with patch.object(app, "TESSERACT_BINARY", "/opt/homebrew/bin/tesseract"), patch.object(app.subprocess, "run", return_value=completed) as run:
@@ -1276,6 +1348,25 @@ class AgentPlatformApiTests(unittest.TestCase):
         )["results"]
         self.assertEqual(current_user_results, [])
         self.assertEqual(app.search_knowledge("other_user", "隔离验证标记")[0]["document_id"], "private_doc")
+
+    def test_artifact_download_rechecks_current_user_and_hides_local_path(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        foreign_file = app.ARTIFACT_DIR / "other_user" / "private.md"
+        foreign_file.parent.mkdir(parents=True)
+        foreign_file.write_text("private", encoding="utf-8")
+        try:
+            with app.db() as conn:
+                conn.execute("INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, '', ?, 'markdown', ?, '', ?)", ("foreign_artifact", "other_user", "private.md", str(foreign_file), app.now()))
+            request = urllib.request.Request(
+                f"{self.base_url}/api/artifacts/foreign_artifact/download",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(denied.exception.code, 404)
+        finally:
+            app.ARTIFACT_DIR = original_artifact_dir
 
     def test_failed_run_can_retry_without_duplicate_user_message(self):
         app.DEEPSEEK_API_KEY = "test"

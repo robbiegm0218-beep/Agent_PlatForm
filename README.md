@@ -240,14 +240,31 @@ python3 -m server.startup_checks --create-directories
 | `HOST` / `PORT` | HTTP 监听地址与端口 | `127.0.0.1` / `8765` |
 | `AGENT_DATABASE_PATH` | SQLite 数据库文件 | `agent_platform.db` |
 | `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
+| `MAX_KNOWLEDGE_UPLOAD_BYTES` | 单个知识文件原始字节上限 | `8388608`（8 MB） |
+| `MAX_KNOWLEDGE_ARCHIVE_FILES` / `MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES` | DOCX/XLSX 的条目数与展开后大小上限 | `256` / `33554432`（32 MB） |
+| `MAX_KNOWLEDGE_EXTRACTED_CHARS` / `MAX_KNOWLEDGE_PDF_PAGES` | 知识解析文本量与 PDF 页数上限 | `200000` / `200` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 生产环境首个管理员凭据 | 必填 |
 | `PERSONAL_*_RUN_LIMIT` / `PERSONAL_*_TOKEN_LIMIT` | 新任务每日 / 30 天的任务数与 Token 估算硬上限；`0` 表示关闭对应限制 | `100` / `1000`；`200000` / `2000000` |
 | `PERSONAL_SINGLE_RUN_TOKEN_LIMIT` | 单次任务的输入估算加最大输出预留上限；超过时提示拆分任务 | `16000` |
+| `MIN_FREE_DISK_BYTES` | 启动检查与健康状态的最低剩余磁盘空间阈值 | `1073741824`（1 GB） |
 | `LOGIN_FAILURE_LIMIT` / `LOGIN_LOCK_SECONDS` | 按账号散列和来源散列累计失败次数，并临时锁定登录 | `5` / `900` |
 
 当前开发机没有 Docker，因此仓库中的 Dockerfile 与 Compose 配置尚未完成真实镜像构建验证；部署前请在目标机器运行 `docker compose config` 与上述启动命令。
 
+部署或升级前可运行本地安全基线检查；它不会上传代码或数据，会验证密钥文件忽略规则、Python 依赖一致性、服务端语法与前端模块检查：
+
+```bash
+scripts/security-baseline.sh
+```
+
 ### 升级快照、回滚与密码恢复
+
+账号删除申请进入 7 天等待期后，服务不会自行进行不可逆删除。维护者可先预览到期申请，再在确认后执行；拥有其他成员的项目空间会被拒绝，必须先处理空间归属：
+
+```bash
+python3 -m server.account_deletion
+python3 -m server.account_deletion --execute --confirmation DELETE_DUE_ACCOUNTS
+```
 
 数据库升级使用版本化迁移。迁移在 HTTP 服务开始监听前执行；失败时服务会退出，不会继续提供写入服务。每次升级前，先在停服务前创建包含数据库、知识库和产物的快照：
 
@@ -258,14 +275,14 @@ python3 -m server.upgrade prepare \
   --backup-root data/upgrade-backups
 ```
 
-命令会输出快照目录和 `manifest.json`。恢复会覆盖目标数据库、知识库和产物目录，必须先停止服务，并确认快照路径无误：
+命令会输出快照目录和 `manifest.json`。默认恢复只会写入隔离目录，不会覆盖正在使用的实例：
 
 ```bash
 python3 -m server.upgrade restore \
-  --snapshot data/upgrade-backups/<snapshot-directory> \
-  --database agent_platform.db \
-  --data-dir data
+  --snapshot data/upgrade-backups/<snapshot-directory>
 ```
+
+完成数据库、知识库、产物和登录验证后，才可在停服务状态下加上 `--replace --database agent_platform.db --data-dir data` 覆盖恢复。
 
 已登录用户可在“设置”中修改密码；修改后所有既有设备会退出。遗失密码时，管理员可在服务器本机生成一次性重置令牌：
 
