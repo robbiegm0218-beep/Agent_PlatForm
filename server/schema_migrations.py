@@ -65,10 +65,23 @@ def _login_throttles(conn: sqlite3.Connection) -> None:
         )""")
 
 
+def _trial_invitations(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS trial_invitations (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            token_hash TEXT UNIQUE NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trial_invitations_email ON trial_invitations(email, expires_at DESC)")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "personal_accounts_and_security_events", _personal_accounts),
     Migration(2, "account_deletion_requests", _account_deletion_requests),
     Migration(3, "login_throttles", _login_throttles),
+    Migration(4, "trial_invitations", _trial_invitations),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

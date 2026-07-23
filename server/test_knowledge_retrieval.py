@@ -1,6 +1,7 @@
 import unittest
 
 from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, retrieval_policy_snapshot
+from server.retrieval_governance import suggestions_for_feedback
 
 
 def row(identifier, document, filename, position, content):
@@ -53,6 +54,13 @@ class KnowledgeRetrieverTests(unittest.TestCase):
         self.assertEqual(snapshot["version"], "lexical-retrieval-v1")
         self.assertEqual(snapshot["config"]["limit"], 2)
         self.assertEqual(snapshot["config"]["neighbor_radius"], 0)
+
+    def test_pilot_feedback_threshold_creates_only_an_offline_hypothesis(self):
+        config = RetrievalConfig(limit=4)
+        self.assertEqual(suggestions_for_feedback(11, {"wrong_document": 1}, config), [])
+        suggestions = suggestions_for_feedback(12, {"wrong_document": 1}, config)
+        self.assertEqual(suggestions[0]["changed_variable"], "limit")
+        self.assertEqual(suggestions[0]["target_value"], 3)
 
 
 if __name__ == "__main__":

@@ -16,16 +16,17 @@
           <form id="loginForm">
             <label>
               邮箱
-              <input id="emailInput" type="email" value="admin@example.com" autocomplete="email" required />
+              <input id="emailInput" type="email" placeholder="name@example.com" autocomplete="email" required />
             </label>
             <label>
               密码
-              <input id="passwordInput" type="password" value="admin123" autocomplete="current-password" required />
+              <input id="passwordInput" type="password" placeholder="请输入密码" autocomplete="current-password" required />
             </label>
             <button type="submit">登录</button>
             <div id="loginError" class="form-error"></div>
           </form>
           <button id="showPasswordResetButton" class="text-button" type="button">使用本地重置凭证</button>
+          <button id="showTrialInvitationButton" class="text-button" type="button">使用邀请码注册</button>
           <form id="passwordResetForm" class="password-reset-form hidden">
             <label>
               一次性重置凭证
@@ -37,6 +38,14 @@
             </label>
             <button type="submit">重置密码</button>
             <div id="passwordResetNotice" class="form-error"></div>
+          </form>
+          <form id="trialInvitationForm" class="password-reset-form hidden">
+            <label>邀请码<input id="trialInvitationToken" type="password" autocomplete="one-time-code" required /></label>
+            <label>受邀邮箱<input id="trialInvitationEmail" type="email" autocomplete="email" required /></label>
+            <label>昵称<input id="trialInvitationName" type="text" autocomplete="name" required /></label>
+            <label>设置密码<input id="trialInvitationPassword" type="password" minlength="10" autocomplete="new-password" required /></label>
+            <button type="submit">创建受邀账号</button>
+            <div id="trialInvitationNotice" class="form-error"></div>
           </form>
         </div>
       </section>
@@ -85,8 +94,9 @@
                   <div id="skillPickerMenu" class="skill-picker-menu hidden" role="menu"></div>
                 </div>
                 <details class="model-config-picker">
-                  <summary><span>模型配置</span><span id="modelConfigHint" class="model-config-hint" aria-live="polite">自动选择</span></summary>
+                  <summary><span>高级设置</span><span id="modelConfigHint" class="model-config-hint" aria-live="polite">智能选择</span></summary>
                   <div class="model-config-menu">
+                    <p class="config-menu-intro">默认由平台选择合适模型与任务深度；仅在你有明确偏好时调整。</p>
                     <label>模型
                       <select id="modelSelect" aria-label="选择模型"></select>
                     </label>
@@ -101,8 +111,9 @@
                   </div>
                 </details>
                 <details class="execution-mode-picker">
-                  <summary><span>执行方式</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">自动</span></summary>
+                  <summary><span>资料与文件</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">智能选择</span></summary>
                   <div class="execution-mode-menu">
+                    <p class="config-menu-intro">默认会根据问题决定是否检索知识库、网络或工作区文件；选择某项只是在本次对话中明确限制或优先使用它。</p>
                     <label>信息来源
                       <select id="sourceModeSelect" aria-label="选择回答依据">
                         <option value="general">自动判断</option>
@@ -157,6 +168,7 @@
           <div class="drawer-header">
             <div class="run-drawer-tabs" role="tablist" aria-label="运行记录视图">
               <button id="threadRunsTab" class="run-drawer-tab active" type="button" role="tab" aria-selected="true">运行详情</button>
+              <button id="trialMetricsButton" class="run-drawer-tab hidden" type="button" role="tab" aria-selected="false">试用概览</button>
               <button id="retrievalDiagnosticsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">检索质量</button>
               <button id="agentRolloutButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">智能发布</button>
               <button id="viewAllRunsButton" class="run-drawer-tab" type="button" role="tab" aria-selected="false">全部审计</button>

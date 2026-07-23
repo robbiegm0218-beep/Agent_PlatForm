@@ -4,8 +4,15 @@ from __future__ import annotations
 from server.knowledge_retrieval import RetrievalConfig
 
 
-MIN_FEEDBACK_FOR_SUGGESTION = 20
-MIN_REASON_COUNT = 3
+# Personal hosted pilot: the operator explicitly accepted 12 document-level
+# evaluations as the observation threshold. A candidate still needs a
+# classified issue signal and must pass offline evaluation before publish.
+MIN_FEEDBACK_FOR_SUGGESTION = 12
+# The personal-hosted pilot operator approved one explicit, classified issue as
+# enough to create an offline-only hypothesis. It never changes the active
+# policy automatically: candidate creation, evaluation, and publish stay
+# separate administrator actions.
+MIN_REASON_COUNT = 1
 
 
 def config_from_json(value: object, fallback: RetrievalConfig | None = None) -> RetrievalConfig:
@@ -47,7 +54,7 @@ def suggestions_for_feedback(document_feedback_count: int, reason_counts: dict[s
             "changed_variable": "limit",
             "target_value": target,
             "title": "扩大候选资料数量",
-            "rationale": "多次反馈显示缺少应有资料；只增加返回数量以验证是否改善覆盖。",
+            "rationale": "反馈显示缺少应有资料；只增加返回数量以验证是否改善覆盖。",
             "evidence": {"document_feedback_count": document_feedback_count, "reason_code": "missing_evidence", "count": missing},
             "risk": "可能增加不相关资料，需要通过离线质量门。",
         }]
@@ -58,7 +65,7 @@ def suggestions_for_feedback(document_feedback_count: int, reason_counts: dict[s
             "changed_variable": "limit",
             "target_value": target,
             "title": "收紧候选资料数量",
-            "rationale": "多次反馈显示命中了不相关文档；只减少返回数量以验证是否降低误召回。",
+            "rationale": "反馈显示命中了不相关文档；只减少返回数量以验证是否降低误召回。",
             "evidence": {"document_feedback_count": document_feedback_count, "reason_code": "wrong_document", "count": wrong_document},
             "risk": "可能遗漏相关资料，需要通过离线质量门。",
         }]

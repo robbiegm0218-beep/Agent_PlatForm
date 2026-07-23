@@ -1,6 +1,7 @@
 import json
 import base64
 import io
+import os
 import subprocess
 import tempfile
 import threading
@@ -19,11 +20,58 @@ from server.provider_config import ProviderConfig
 
 
 class AgentPlatformApiTests(unittest.TestCase):
+    def test_trial_invitation_is_email_bound_and_single_use(self):
+        token = app.create_trial_invitation("tester@example.com", 600)
+        created = self.request_json("/api/trial-invitations/accept", {
+            "token": token, "email": "tester@example.com", "name": "测试用户", "password": "a-strong-password",
+        })
+        self.assertEqual(created["user"]["email"], "tester@example.com")
+        self.assertTrue(created["token"])
+        request = urllib.request.Request(
+            f"{self.base_url}/api/trial-invitations/accept",
+            data=json.dumps({"token": token, "email": "tester@example.com", "name": "测试用户", "password": "a-strong-password"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(error.exception.code, 400)
+
+    def test_trial_metrics_are_admin_only_and_content_free(self):
+        token = app.create_trial_invitation("trial@example.com", 600)
+        trial = self.request_json("/api/trial-invitations/accept", {
+            "token": token, "email": "trial@example.com", "name": "试用用户", "password": "a-strong-password",
+        })
+        overview = self.request_json("/api/trial-metrics", token=self.token)
+        self.assertEqual(overview["scope"], "administrator_aggregate_metadata_only")
+        self.assertEqual(overview["total"]["testers"], 1)
+        self.assertEqual(overview["testers"][0]["email"], "trial@example.com")
+        self.assertEqual(overview["citation_issue_reasons"], {})
+        self.assertNotIn("content", overview["testers"][0])
+        request = urllib.request.Request(
+            f"{self.base_url}/api/trial-metrics",
+            headers={"Authorization": f"Bearer {trial['token']}"}, method="GET",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(error.exception.code, 403)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         self.original_api_key = app.DEEPSEEK_API_KEY
         self.original_base_url = app.DEEPSEEK_BASE_URL
+        self.original_bootstrap_environment = {
+            name: os.environ.get(name)
+            for name in ("AGENT_PLATFORM_ENV", "ADMIN_EMAIL", "ADMIN_PASSWORD", "ADMIN_NAME")
+        }
+        # API tests own their bootstrap identity. They must not inherit the
+        # personal production administrator configured in the local .env file.
+        os.environ.update({
+            "AGENT_PLATFORM_ENV": "development",
+            "ADMIN_EMAIL": "",
+            "ADMIN_PASSWORD": "",
+            "ADMIN_NAME": "",
+        })
         app.DB_PATH = Path(self.temp_dir.name) / "agent_platform.db"
         app.DEEPSEEK_API_KEY = ""
         app.init_db()
@@ -40,6 +88,11 @@ class AgentPlatformApiTests(unittest.TestCase):
         app.DB_PATH = self.original_db_path
         app.DEEPSEEK_API_KEY = self.original_api_key
         app.DEEPSEEK_BASE_URL = self.original_base_url
+        for name, value in self.original_bootstrap_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         self.temp_dir.cleanup()
 
     def request_json(self, path, payload=None, token=None, method=None, timeout=3):
@@ -975,6 +1028,14 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(document["scope"], "project")
         self.assertEqual(document["project_space_id"], space["id"])
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('项目专属指标')}", token=self.token)["results"], [])
+        project_results = self.request_json(
+            f"/api/knowledge/search?query={quote('项目专属指标')}&project_space_id={quote(space['id'])}", token=self.token
+        )["results"]
+        self.assertEqual(project_results[0]["document_id"], document["id"])
+        all_project_results = self.request_json(
+            f"/api/knowledge/search?query={quote('项目专属指标')}&project_scope=all", token=self.token
+        )["results"]
+        self.assertEqual(all_project_results[0]["document_id"], document["id"])
         general = self.request_json("/api/knowledge", {
             "filename": "通用资料.md", "mime_type": "text/markdown",
             "content_base64": base64.b64encode("通用指标是 99".encode("utf-8")).decode("ascii"),
@@ -1057,6 +1118,19 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(preview["modes"]["file"], "off")
         self.assertFalse(any(tool["id"] == "search_workspace_files" for tool in preview["allowed_tools"]))
         self.assertEqual(self.request_json("/api/threads", token=self.token)["threads"], [])
+
+    def test_auto_knowledge_mode_probes_and_uses_a_real_local_match(self):
+        payload = {
+            "filename": "研究院说明.md", "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("易碳研究院的核心成员包括研究员、市拓人员和知识文档支持角色。".encode("utf-8")).decode("ascii"),
+        }
+        self.request_json("/api/knowledge", payload, self.token)
+        preview = self.request_json("/api/route-preview", {"content": "易碳研究院的核心成员包括哪些？", "knowledge_mode": "auto"}, self.token)
+        self.assertTrue(preview["intent_plan"]["knowledge_needed"])
+        self.assertTrue(preview["intent_plan"]["automatic_probe"])
+        self.assertTrue(preview["retrieval_trace"]["automatic_probe"])
+        self.assertTrue(preview["retrieval_trace"]["selected"])
+        self.assertGreater(preview["knowledge_matches"], 0)
 
     def test_task_router_keeps_structured_short_tasks_out_of_quick_mode(self):
         self.assertEqual(app.infer_task_profile("请改写这段通知")["task_tier"], "standard")
@@ -1269,16 +1343,22 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(answer, "回答\n\n参考资料：通用资料.md、项目资料.md")
 
     def test_retrieval_policy_candidate_evaluation_publish_and_rollback(self):
-        user_id = self.request_json("/api/me", token=self.token)["user"]["id"]
+        with app.db() as conn:
+            conn.execute("INSERT INTO users (id, email, password_hash, name, is_admin, created_at) VALUES (?, ?, ?, ?, 0, ?)", (
+                "trial_feedback_user", "trial-feedback@example.com", app.hash_password("member123"), "试用反馈用户", app.now(),
+            ))
         timestamp = app.now()
         with app.db() as conn:
             conn.executemany("""INSERT INTO citation_feedback_items
                 (id, run_id, user_id, document_id, position, citation_correct, reason_code, note, retrieval_policy_version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 0, 1, ?, '', 'lexical-retrieval-v1', ?, ?)""", [
-                (f"feedback_{index}", f"run_{index}", user_id, f"doc_{index}", "missing_evidence" if index < 3 else "", timestamp, timestamp)
+                (f"feedback_{index}", f"run_{index}", "trial_feedback_user", f"doc_{index}", "missing_evidence" if index < 3 else "", timestamp, timestamp)
                 for index in range(20)
             ])
-        suggestions = self.request_json("/api/retrieval-suggestions", token=self.token)["suggestions"]
+        suggestion_data = self.request_json("/api/retrieval-suggestions", token=self.token)
+        self.assertEqual(suggestion_data["evidence"]["source"], "trial_feedback_aggregate")
+        self.assertEqual(suggestion_data["evidence"]["document_feedback_count"], 20)
+        suggestions = suggestion_data["suggestions"]
         self.assertEqual(suggestions[0]["changed_variable"], "limit")
         candidate = self.request_json(f"/api/retrieval-suggestions/{suggestions[0]['id']}/candidate", {}, self.token)["policy"]
         self.assertEqual(candidate["config"]["limit"], 5)
@@ -1312,6 +1392,12 @@ class AgentPlatformApiTests(unittest.TestCase):
             app.validate_knowledge_upload("notes.md", "application/pdf", b"plain text")
         with self.assertRaisesRegex(ValueError, "PDF 文件签名"):
             app.validate_knowledge_upload("notes.pdf", "application/pdf", b"not a pdf")
+        # GIF is intentionally outside the local OCR upload surface. This
+        # keeps a transitive giflib CVE unreachable from knowledge uploads.
+        with self.assertRaisesRegex(ValueError, "仅支持"):
+            app.validate_knowledge_upload("unsafe.gif", "image/gif", b"GIF89a")
+        with self.assertRaisesRegex(ValueError, "PNG 文件签名"):
+            app.validate_knowledge_upload("unsafe.png", "image/png", b"GIF89a")
         workbook = io.BytesIO()
         with zipfile.ZipFile(workbook, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types/>")

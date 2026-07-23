@@ -60,12 +60,11 @@ class ChatService:
         structured_context = dependencies["refresh_structured_context"](conn, thread_id)
         active_skills = requested_active_skills if requested_active_skills is not None else dependencies["enabled_skills"](user_id, thread_id)
         intent_plan = dependencies["plan_intent"](content, task_profile)
-        needs_knowledge = execution_modes["knowledge"] == "required" or (
-            execution_modes["knowledge"] == "auto" and intent_plan["knowledge_needed"]
-        )
         project_row = conn.execute("SELECT folder_id FROM threads WHERE id = ?", (thread_id,)).fetchone()
         project_space_id = project_row["folder_id"] if project_row else ""
-        knowledge_refs, retrieval_trace = dependencies["retrieve_knowledge"](user_id, content, intent_plan, project_space_id) if needs_knowledge else ([], {})
+        intent_plan, knowledge_refs, retrieval_trace = dependencies["resolve_knowledge"](
+            user_id, content, intent_plan, execution_modes["knowledge"], project_space_id,
+        )
         memories = dependencies["load_memories"](conn, user_id, thread_id, content)
         execution_context = dependencies["build_execution_context"](
             user_id, task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes, intent_plan,

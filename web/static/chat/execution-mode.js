@@ -22,14 +22,14 @@ window.AgentExecutionMode = function createExecutionMode({ state, els, api, getC
   function renderModelConfigHint() {
     const modeLabels = { auto: "深度自动", quick: "快速", standard: "标准", deep: "深度" };
     const model = state.models.find((item) => item.id === els.modelSelect.value);
-    const modelLabel = model?.id === "auto" || !model ? "自动选模型" : model.name;
-    els.modelConfigHint.textContent = `${modelLabel} · ${modeLabels[els.taskModeSelect.value] || "深度自动"}`;
+    const modelLabel = model?.id === "auto" || !model ? "智能选择" : model.name;
+    els.modelConfigHint.textContent = `${modelLabel} · ${modeLabels[els.taskModeSelect.value] || "自动"}`;
   }
 
   function renderExecutionModeHint() {
     syncEvidenceModeControls();
-    const fileLabels = { off: "不查文件", auto: "按需查找", required: "优先查找" };
-    const sourceLabels = { general: "自动判断", local_only: "只查知识库", web_only: "只查网络", mixed: "知识库和网络" };
+    const fileLabels = { off: "不读取工作区", auto: "按需读取文件", required: "优先读取文件" };
+    const sourceLabels = { general: "智能选择", local_only: "只用知识库", web_only: "只用网络", mixed: "知识库和网络" };
     els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · ${fileLabels[els.fileModeSelect.value]}`;
   }
 

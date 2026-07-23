@@ -17,6 +17,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import replace
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
@@ -33,7 +34,7 @@ except ImportError:
 from server.local_extensions import LocalTool, LocalToolRegistry, LocalWorkflowRunner
 from server.agent_runtime import AgentRuntimeStore, RuntimeDependencies
 from server.agent_loop import AgentLoopDependencies, SingleAgentLoop
-from server.model_provider import DeepSeekConfig, DeepSeekProvider
+from server.model_provider import DeepSeekConfig, DeepSeekProvider, ProviderError
 from server.model_registry import ModelCapabilities, ModelInfo, ModelRegistry, ProviderInfo
 from server.provider_config import ProviderConfig, parse_provider_configs
 from server.web_search import WebSearchClient, WebSearchConfig
@@ -41,7 +42,7 @@ from server.mcp_client import McpServerConfig, McpToolManager
 from server.tool_policy import ToolPolicy
 from server.task_router import TaskRouter, classify_knowledge_intent
 from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, query_terms, retrieval_policy_snapshot
-from server.retrieval_governance import apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
+from server.retrieval_governance import MIN_FEEDBACK_FOR_SUGGESTION, apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
 from server.evaluate_knowledge_retrieval import DEFAULT_FIXTURE as RETRIEVAL_EVAL_FIXTURE, evaluate as evaluate_retrieval, validate_cases as validate_retrieval_cases
 from server.evaluate_p45_rollout import fixed_report as p45_fixed_report, recommend as recommend_p45_rollout, shadow_report as p45_shadow_report
 from server.structured_context import StructuredContextBuilder
@@ -54,12 +55,13 @@ from server.evidence_service import append_authorized_observations, build_knowle
 from server.agent_orchestrator import AgentOrchestrator, OrchestrationError, OrchestratorState, BUDGETS, validate_next_action
 from server.task_verifier import verify as verify_task
 from server.decision_quality import policy_snapshot
-from server.auth_service import AuthService
+from server.auth_service import AuthService, validate_new_password
 from server.knowledge_service import KnowledgeService
 from server.space_service import SpaceService
 from server.chat_service import ChatService
 from server.http_routes import API_ROUTES
 from server.schema_migrations import apply_migrations, migration_status
+from server.upgrade import prepare_automatic_upgrade, record_automatic_upgrade
 from server.startup_checks import build_startup_report
 from server.version import APP_VERSION
 
@@ -179,6 +181,7 @@ MAX_RATE_LIMIT_USERS = int(os.environ.get("MAX_RATE_LIMIT_USERS", "10000"))
 LOG_FILE = os.environ.get("AGENT_LOG_FILE", "").strip()
 LOG_MAX_BYTES = int(os.environ.get("AGENT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.environ.get("AGENT_LOG_BACKUP_COUNT", "5"))
+LOG_FORMAT = os.environ.get("AGENT_LOG_FORMAT", "json").strip().lower()
 MIN_FREE_DISK_BYTES = max(0, int(os.environ.get("MIN_FREE_DISK_BYTES", str(1_073_741_824))))
 SENSITIVE_LOG_VALUE = re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+")
 
@@ -192,6 +195,23 @@ class SensitiveLogFilter(logging.Filter):
         record.msg = redact_sensitive_text(record.getMessage())
         record.args = ()
         return True
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Dependency-free structured logs for local collection tools."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "message": redact_sensitive_text(record.getMessage()),
+        }
+        for key in ("request_id", "run_id", "thread_id", "event", "error_code"):
+            value = getattr(record, key, None)
+            if value not in (None, ""):
+                payload[key] = redact_sensitive_text(value)[:240]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def configure_logging() -> None:
@@ -213,7 +233,8 @@ def configure_logging() -> None:
             logging.getLogger("agent_platform").warning("file_logging_unavailable error=%s", str(exc)[:160])
     for handler in handlers:
         handler.addFilter(SensitiveLogFilter())
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+        handler.setFormatter(JsonLogFormatter() if LOG_FORMAT == "json" else logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
 
 
 configure_logging()
@@ -1464,7 +1485,7 @@ def validate_knowledge_upload(filename: str, declared_mime: object, raw: bytes) 
 
 def ensure_knowledge_text_budget(text: str) -> str:
     if len(text) > MAX_KNOWLEDGE_EXTRACTED_CHARS:
-        raise ValueError("资料解析文本超过限制，请拆分后上传")
+        raise ValueError("资料解析出的文字超过当前限制，请拆分为更小的文件后重新上传")
     return text
 
 
@@ -1474,15 +1495,15 @@ def extract_knowledge_text(filename: str, raw: bytes) -> str:
         return ensure_knowledge_text_budget(raw.decode("utf-8", errors="replace"))
     if suffix == ".docx":
         if not Document:
-            raise ValueError("当前环境未安装 Word 解析组件")
+            raise ValueError("当前环境暂不能读取 Word 文件；请让部署者安装 Word 解析组件，或先转为 Markdown、TXT 后上传")
         document = Document(io.BytesIO(raw))
         return ensure_knowledge_text_budget("\n".join(paragraph.text for paragraph in document.paragraphs))
     if suffix == ".pdf":
         if not PdfReader:
-            raise ValueError("当前环境未安装 PDF 解析组件 pypdf")
+            raise ValueError("当前环境暂不能读取 PDF；请让部署者安装 PDF 解析组件，或先转为文本后上传")
         reader = PdfReader(io.BytesIO(raw))
         if len(reader.pages) > MAX_KNOWLEDGE_PDF_PAGES:
-            raise ValueError("PDF 页数超过解析限制")
+            raise ValueError("PDF 页数超过当前解析限制，请拆分为更小的文件后重新上传")
         return ensure_knowledge_text_budget("\n\n".join(f"【PDF 第 {index + 1} 页】\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages)))
     if suffix == ".xlsx":
         return extract_xlsx_knowledge_text(raw)
@@ -1503,9 +1524,9 @@ def extract_image_knowledge_text(filename: str, raw: bytes) -> str:
             input=raw, text=False, capture_output=True, timeout=25,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ValueError("图片 OCR 超时") from exc
+        raise ValueError("图片文字识别超时，请裁剪图片、提高文字清晰度后重试") from exc
     if result.returncode != 0:
-        raise ValueError("图片 OCR 解析失败")
+        raise ValueError("未能从图片识别出文字，请确认图片清晰且包含可识别文本")
     text = result.stdout.decode("utf-8", errors="replace").strip()
     if not text:
         raise ValueError("图片中未识别到可检索文本")
@@ -1549,7 +1570,7 @@ def extract_xlsx_knowledge_text(raw: bytes) -> str:
                 if rows:
                     sheets.append(f"【工作表：{sheet.attrib.get('name', '未命名')}】\n" + "\n".join(rows))
     except (KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
-        raise ValueError("无法解析 Excel 文件") from exc
+        raise ValueError("无法读取 Excel 文件，请确认文件未加密、未损坏，并重新导出为 .xlsx 后上传") from exc
     if not sheets:
         raise ValueError("Excel 文件中没有可检索的文本单元格")
     return ensure_knowledge_text_budget("\n\n".join(sheets))
@@ -1576,8 +1597,8 @@ def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list
     return chunks
 
 
-def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "") -> list[dict]:
-    rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id)
+def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "", include_all_projects: bool = False) -> list[dict]:
+    rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id, include_all_projects)
     _, active_config = active_retrieval_policy()
     retriever = KnowledgeRetriever(active_config)
     if limit != retriever.config.limit:
@@ -1608,6 +1629,44 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
             merged.append(reference)
     trace.update({"retry_query": retry_query, "retry_matches": len(retry), "sufficient": bool(merged)})
     return merged[:4], trace
+
+
+def resolve_knowledge_for_execution(user_id: str, content: str, intent_plan: dict,
+                                    knowledge_mode: str, project_space_id: str = "") -> tuple[dict, list[dict], dict]:
+    """Resolve explicit retrieval and a bounded, local-only automatic probe.
+
+    Auto mode must not require users to know the literal phrase “知识库”.  It
+    first uses the deterministic intent plan; when that is inconclusive, it
+    performs the same local lexical search and only upgrades the route if a
+    real match is found.  No document content leaves the platform during this
+    probe, and a non-match is not injected into the model context.
+    """
+    explicit = knowledge_mode == "required" or (
+        knowledge_mode == "auto" and bool(intent_plan.get("knowledge_needed"))
+    )
+    if knowledge_mode == "off":
+        return intent_plan, [], {"automatic_probe": False, "selected": False}
+    if explicit:
+        references, trace = retrieve_knowledge_with_fallback(user_id, content, intent_plan, project_space_id)
+        trace.update({"automatic_probe": False, "selected": bool(references)})
+        return intent_plan, references, trace
+    if knowledge_mode != "auto" or not query_terms(content):
+        return intent_plan, [], {"automatic_probe": False, "selected": False}
+    probe_plan = {**intent_plan, "knowledge_needed": True}
+    references, trace = retrieve_knowledge_with_fallback(user_id, content, probe_plan, project_space_id)
+    trace.update({"automatic_probe": True, "selected": bool(references)})
+    if not references:
+        return intent_plan, [], trace
+    reasons = list(intent_plan.get("reasons", []))
+    reasons.append("自动探测命中本地资料")
+    selected_plan = {
+        **intent_plan,
+        "knowledge_needed": True,
+        "confidence": "medium" if intent_plan.get("confidence") == "high" else intent_plan.get("confidence", "medium"),
+        "reasons": reasons,
+        "automatic_probe": True,
+    }
+    return selected_plan, references, trace
 
 
 def assess_knowledge_evidence(user_id: str, content: str, intent_plan: dict, project_space_id: str,
@@ -2009,6 +2068,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/metrics":
             self.get_metrics(user)
             return
+        if self.path == "/api/trial-metrics":
+            self.get_trial_metrics(user)
+            return
         if self.path == "/api/personal-usage":
             self.get_personal_usage(user)
             return
@@ -2101,6 +2163,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/login":
             self.login()
+            return
+        if self.path == "/api/trial-invitations/accept":
+            self.accept_trial_invitation()
             return
         if self.path == "/api/password-reset/confirm":
             self.confirm_password_reset()
@@ -2277,6 +2342,17 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json(error or "邮箱或密码错误", HTTPStatus.TOO_MANY_REQUESTS if error != "邮箱或密码错误" else HTTPStatus.UNAUTHORIZED)
             return
         self.send_json({"token": token, "user": public_user(row_to_dict(user))})
+
+    def accept_trial_invitation(self) -> None:
+        payload = self.read_json()
+        user, token, error = accept_trial_invitation(
+            str(payload.get("token", "")), str(payload.get("email", "")),
+            str(payload.get("name", "")), str(payload.get("password", "")),
+        )
+        if error:
+            self.send_error_json(error, HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"token": token, "user": public_user(user)}, HTTPStatus.CREATED)
 
     def logout(self) -> None:
         AUTH_SERVICE.logout(self.bearer_token())
@@ -3040,6 +3116,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
             feedback = conn.execute("SELECT rating, citation_correct FROM run_feedback WHERE user_id = ?", (user["id"],)).fetchall()
             citation_items = conn.execute("SELECT citation_correct, reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
+            activated = conn.execute("SELECT created_at FROM users WHERE id = ?", (user["id"],)).fetchone()
         buckets: dict[str, dict] = {}
         routes: dict[str, int] = {}
         knowledge = {"runs": 0, "with_matches": 0, "required_no_match": 0, "insufficient": 0, "retried": 0}
@@ -3111,7 +3188,86 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             "minimum_citation_samples": 20,
             "sufficient_for_retrieval_claim": len(citation_items) >= 20,
         }
-        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "model_roles": model_roles, "feedback": feedback_metrics, "retrieval_policy": active_retrieval_policy_snapshot()})
+        completed_rows = [row for row in rows if row["status"] == "completed" and row["completed_at"] and row["started_at"]]
+        durations = sorted(max(0.0, (int(row["completed_at"]) - int(row["started_at"])) / 1_000_000_000) for row in completed_rows)
+        first_completed = min((int(row["completed_at"]) for row in completed_rows), default=0)
+        activated_at = int(activated["created_at"] or 0) if activated else 0
+        trial = {
+            "scope": "current_user_metadata_only",
+            "activated_at": activated_at,
+            "first_effective_task_at": first_completed or None,
+            "time_to_first_effective_task_seconds": round(max(0, first_completed - activated_at) / 1_000_000_000, 3) if first_completed and activated_at else None,
+            "run_completion_rate": round(len(completed_rows) / len(rows), 4) if rows else None,
+            "p95_seconds": round(durations[max(0, (len(durations) * 95 + 99) // 100 - 1)], 3) if durations else None,
+            "helpful_rate": round(feedback_metrics["positive"] / feedback_metrics["count"], 4) if feedback_metrics["count"] else None,
+            "token_estimate": sum(int(row["input_tokens_estimate"] or 0) + int(row["output_tokens_estimate"] or 0) for row in rows),
+            "cost_note": "仅提供 Token 估算；未配置供应商单价时不推导模型费用。",
+        }
+        self.send_json({"tiers": buckets, "sample_size": len(rows), "tools": tool_metrics, "routes": routes, "knowledge": knowledge, "decisions": decisions, "model_roles": model_roles, "feedback": feedback_metrics, "trial": trial, "retrieval_policy": active_retrieval_policy_snapshot()})
+
+    def get_trial_metrics(self, user: dict) -> None:
+        """Return administrator-only, cross-user trial metadata without content."""
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以查看试用汇总", HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            testers = [row_to_dict(row) for row in conn.execute(
+                "SELECT id, email, name, created_at FROM users WHERE is_admin = 0 ORDER BY created_at DESC"
+            ).fetchall()]
+            runs = [row_to_dict(row) for row in conn.execute("""SELECT threads.user_id, runs.status, runs.started_at,
+                runs.completed_at, runs.input_tokens_estimate, runs.output_tokens_estimate
+                FROM runs JOIN threads ON threads.id = runs.thread_id
+                JOIN users ON users.id = threads.user_id WHERE users.is_admin = 0""").fetchall()]
+            feedback = [row_to_dict(row) for row in conn.execute("""
+                SELECT run_feedback.user_id, run_feedback.rating FROM run_feedback
+                JOIN users ON users.id = run_feedback.user_id WHERE users.is_admin = 0""").fetchall()]
+            citations = [row_to_dict(row) for row in conn.execute("""
+                SELECT citation_feedback_items.user_id, citation_feedback_items.citation_correct, citation_feedback_items.reason_code
+                FROM citation_feedback_items JOIN users ON users.id = citation_feedback_items.user_id
+                WHERE users.is_admin = 0""").fetchall()]
+
+        def summary(user_id: str) -> dict:
+            user_runs = [item for item in runs if item["user_id"] == user_id]
+            completed = [item for item in user_runs if item["status"] == "completed" and item["started_at"] and item["completed_at"]]
+            durations = sorted(max(0.0, (int(item["completed_at"]) - int(item["started_at"])) / 1_000_000_000) for item in completed)
+            user_feedback = [item for item in feedback if item["user_id"] == user_id]
+            user_citations = [item for item in citations if item["user_id"] == user_id]
+            return {
+                "runs": len(user_runs),
+                "completed": len(completed),
+                "failed": sum(item["status"] == "failed" for item in user_runs),
+                "completion_rate": round(len(completed) / len(user_runs), 4) if user_runs else None,
+                "p95_seconds": round(durations[max(0, (len(durations) * 95 + 99) // 100 - 1)], 3) if durations else None,
+                "token_estimate": sum(int(item["input_tokens_estimate"] or 0) + int(item["output_tokens_estimate"] or 0) for item in user_runs),
+                "feedback_count": len(user_feedback),
+                "helpful_rate": round(sum(item["rating"] == 1 for item in user_feedback) / len(user_feedback), 4) if user_feedback else None,
+                "citation_feedback_count": len(user_citations),
+                "citation_accuracy": round(sum(item["citation_correct"] == 1 for item in user_citations) / len(user_citations), 4) if user_citations else None,
+            }
+
+        items = [{"name": tester["name"], "email": tester["email"], "activated_at": tester["created_at"], **summary(tester["id"])} for tester in testers]
+        total = summary("")
+        total.update({
+            "testers": len(items),
+            "runs": sum(item["runs"] for item in items),
+            "completed": sum(item["completed"] for item in items),
+            "failed": sum(item["failed"] for item in items),
+            "token_estimate": sum(item["token_estimate"] for item in items),
+            "feedback_count": sum(item["feedback_count"] for item in items),
+            "citation_feedback_count": sum(item["citation_feedback_count"] for item in items),
+        })
+        all_completed = [item for item in runs if item["status"] == "completed" and item["started_at"] and item["completed_at"]]
+        all_durations = sorted(max(0.0, (int(item["completed_at"]) - int(item["started_at"])) / 1_000_000_000) for item in all_completed)
+        total["completion_rate"] = round(total["completed"] / total["runs"], 4) if total["runs"] else None
+        total["p95_seconds"] = round(all_durations[max(0, (len(all_durations) * 95 + 99) // 100 - 1)], 3) if all_durations else None
+        total["helpful_rate"] = round(sum(item["rating"] == 1 for item in feedback) / len(feedback), 4) if feedback else None
+        total["citation_accuracy"] = round(sum(item["citation_correct"] == 1 for item in citations) / len(citations), 4) if citations else None
+        citation_issue_reasons = {reason: sum(item["citation_correct"] == 0 and item["reason_code"] == reason for item in citations)
+                                  for reason in sorted(CITATION_FEEDBACK_REASON_CODES)}
+        citation_issue_reasons = {reason: count for reason, count in citation_issue_reasons.items() if count}
+        self.send_json({"scope": "administrator_aggregate_metadata_only", "testers": items, "total": total,
+                        "citation_issue_reasons": citation_issue_reasons,
+                        "privacy": "不包含对话、知识库、附件、反馈备注或引用文档名称。"})
 
     def get_retrieval_diagnostics(self, user: dict) -> None:
         """Return aggregate, user-isolated retrieval feedback without source text."""
@@ -3170,7 +3326,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             item["reference"] = reference_context.get(item["document_id"], {})
             document_rows.append(item)
         document_feedback_count = len(items)
-        sample_state = "ready" if document_feedback_count >= 20 else "insufficient"
+        sample_state = "ready" if document_feedback_count >= MIN_FEEDBACK_FOR_SUGGESTION else "insufficient"
         self.send_json({
             "retrieval_policy": active_retrieval_policy_snapshot(),
             "sample": {
@@ -3178,7 +3334,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "retrieval_attempted": retrieval_attempted,
                 "document_feedback_count": document_feedback_count,
                 "run_citation_feedback_count": len(run_feedback),
-                "minimum_document_feedback": 20,
+                "minimum_document_feedback": MIN_FEEDBACK_FOR_SUGGESTION,
                 "state": sample_state,
                 "message": "样本量达到诊断门槛，可用于比较候选策略" if sample_state == "ready" else "样本不足，仅展示观察结果，不得宣称检索已改善",
             },
@@ -3201,10 +3357,22 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def _retrieval_suggestion_data(self, user: dict) -> tuple[dict, list[dict]]:
         with db() as conn:
-            rows = conn.execute("SELECT reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
+            if is_platform_admin(user):
+                # Administrators turn invited-trial feedback into an offline
+                # policy hypothesis. Only aggregate reason codes are exposed:
+                # no question, answer, document text, or tester identity.
+                rows = conn.execute("""SELECT feedback.reason_code
+                    FROM citation_feedback_items AS feedback
+                    JOIN users AS feedback_user ON feedback_user.id = feedback.user_id
+                    WHERE feedback_user.is_admin = 0""").fetchall()
+                source = "trial_feedback_aggregate"
+            else:
+                rows = conn.execute("SELECT reason_code FROM citation_feedback_items WHERE user_id = ?", (user["id"],)).fetchall()
+                source = "own_feedback"
         reasons = {reason: sum(row["reason_code"] == reason for row in rows) for reason in CITATION_FEEDBACK_REASON_CODES}
         version, config = active_retrieval_policy()
-        return {"version": version, "document_feedback_count": len(rows), "reason_counts": reasons}, suggestions_for_feedback(len(rows), reasons, config)
+        evidence = {"version": version, "source": source, "document_feedback_count": len(rows), "reason_counts": reasons}
+        return evidence, suggestions_for_feedback(len(rows), reasons, config)
 
     def list_retrieval_suggestions(self, user: dict) -> None:
         if not is_platform_admin(user):
@@ -3362,8 +3530,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True})
 
     def search_knowledge_api(self, user: dict) -> None:
-        query = parse_qs(urlparse(self.path).query).get("query", [""])[0].strip()
-        self.send_json({"results": search_knowledge(user["id"], query) if query else []})
+        params = parse_qs(urlparse(self.path).query)
+        query = params.get("query", [""])[0].strip()
+        project_space_id = params.get("project_space_id", [""])[0].strip()
+        include_all_projects = params.get("project_scope", [""])[0] == "all"
+        self.send_json({"results": search_knowledge(user["id"], query, project_space_id=project_space_id, include_all_projects=include_all_projects) if query else []})
 
     def create_knowledge(self, user: dict) -> None:
         self.create_knowledge_for_scope(user)
@@ -3381,7 +3552,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 raise ValueError("资料文件无效")
             raw = base64.b64decode(encoded, validate=True)
             if not raw or len(raw) > MAX_KNOWLEDGE_UPLOAD_BYTES:
-                raise ValueError("资料为空或超过大小限制")
+                raise ValueError(f"资料为空或超过大小限制（单个文件最多 {MAX_KNOWLEDGE_UPLOAD_BYTES // 1024 // 1024} MB），请拆分后上传")
             mime_type = validate_knowledge_upload(filename, payload.get("mime_type"), raw)
             if Path(filename).suffix.lower() in IMAGE_KNOWLEDGE_SUFFIXES:
                 budget_error = personal_run_budget_error(user["id"])
@@ -3409,7 +3580,11 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 return
         document_id = new_id("knowledge")
         storage_path = KNOWLEDGE_DIR / user["id"] / f"{document_id}{Path(filename).suffix.lower()}"
-        KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": now(), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "raw": raw}, [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)])
+        try:
+            KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": now(), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "raw": raw}, [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)])
+        except OSError:
+            self.send_error_json("资料无法保存到本机磁盘，请释放空间或确认 data/knowledge 目录可写后重试", HTTPStatus.INSUFFICIENT_STORAGE)
+            return
         self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin}}, HTTPStatus.CREATED)
 
     def delete_knowledge(self, user: dict) -> None:
@@ -3627,8 +3802,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         ):
             raise ValueError("技能参数无效")
         active_skills = enabled_skills(user["id"], thread_id, requested_skill_ids=requested_skill_ids)
-        needs_knowledge = modes["knowledge"] == "required" or (modes["knowledge"] == "auto" and intent_plan["knowledge_needed"])
-        knowledge_refs, retrieval_trace = retrieve_knowledge_with_fallback(user["id"], content, intent_plan) if needs_knowledge else ([], {})
+        intent_plan, knowledge_refs, retrieval_trace = resolve_knowledge_for_execution(user["id"], content, intent_plan, modes["knowledge"])
         context = build_execution_context(user["id"], task_profile, active_skills, requested_skill_ids, content, knowledge_refs, modes, intent_plan)
         self.send_json({
             "ready": True,
@@ -3749,7 +3923,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                     "refresh_structured_context": refresh_structured_context,
                     "enabled_skills": enabled_skills,
                     "plan_intent": plan_intent,
-                    "retrieve_knowledge": retrieve_knowledge_with_fallback,
+                    "resolve_knowledge": resolve_knowledge_for_execution,
                     "load_memories": load_relevant_memories,
                     "build_execution_context": build_execution_context,
                     "plan_task_frame": plan_task_frame,
@@ -3872,6 +4046,12 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.write_event("cancelled", {"run_id": run_id})
             LOGGER.info("run_cancelled run_id=%s thread_id=%s", run_id, thread_id)
         except Exception as exc:
+            if isinstance(exc, ProviderError):
+                CHAT_SERVICE.record_runtime_event(run_id, "model_error", {
+                    "provider": exc.provider,
+                    "kind": exc.kind,
+                    "status_code": exc.status_code,
+                }, {"runtime": RUNTIME_STORE, "append_event": append_run_event})
             failed = CHAT_SERVICE.fail_run(run_id, str(exc), {"runtime": RUNTIME_STORE, "append_event": append_run_event, "json": json})
             if not failed:
                 self.write_event("cancelled", {"run_id": run_id})
@@ -4202,6 +4382,51 @@ def artifact_source_from_conversation(thread_id: str, command: str) -> tuple[str
             ORDER BY created_at DESC, id DESC LIMIT 1""", (thread_id,)).fetchone()
     content = str(previous["content"]).strip() if previous else ""
     return (content, True) if content else (command, False)
+
+
+def create_trial_invitation(email: str, ttl_seconds: int = 7 * 24 * 60 * 60) -> str:
+    """Create a single-use, email-bound code; the raw value is only returned once."""
+    email = email.strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("邮箱格式无效")
+    if not 300 <= ttl_seconds <= 30 * 24 * 60 * 60:
+        raise ValueError("邀请码有效期必须在 5 分钟到 30 天之间")
+    token = secrets.token_urlsafe(24)
+    current = now()
+    with db() as conn:
+        conn.execute("UPDATE trial_invitations SET used_at = ? WHERE email = ? AND used_at = 0", (current, email))
+        conn.execute(
+            "INSERT INTO trial_invitations (id, email, token_hash, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+            (new_id("trial_invite"), email, hashlib.sha256(token.encode("utf-8")).hexdigest(), current + ttl_seconds * 1_000_000_000, current),
+        )
+    return token
+
+
+def accept_trial_invitation(token: str, email: str, name: str, password: str) -> tuple[dict, str, str]:
+    email, name = email.strip().lower(), name.strip()
+    password_error = validate_new_password(password)
+    if not email or "@" not in email or not name or password_error:
+        return {}, "", password_error or "请填写有效的邮箱和昵称"
+    token_hash = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+    current = now()
+    with db() as conn:
+        invitation = conn.execute(
+            "SELECT id FROM trial_invitations WHERE email = ? AND token_hash = ? AND used_at = 0 AND expires_at > ?",
+            (email, token_hash, current),
+        ).fetchone()
+        if not invitation:
+            return {}, "", "邀请码无效、已使用或已过期"
+        if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+            return {}, "", "该邮箱已存在，请直接登录或使用重置凭证"
+        user_id = new_id("user")
+        conn.execute("INSERT INTO users (id, email, password_hash, name, created_at, is_admin) VALUES (?, ?, ?, ?, ?, 0)", (user_id, email, hash_password(password), name, current))
+        for skill in skill_snapshot():
+            conn.execute("INSERT INTO user_enabled_skills (user_id, skill_id, enabled, updated_at) VALUES (?, ?, ?, ?)", (user_id, skill["id"], 1 if skill["default_enabled"] else 0, current))
+        conn.execute("UPDATE trial_invitations SET used_at = ? WHERE id = ?", (current, invitation["id"]))
+        conn.execute("INSERT INTO security_events (id, user_id, event_type, outcome, detail_json, created_at) VALUES (?, ?, 'trial_invitation_accepted', 'succeeded', '{}', ?)", (new_id("security"), user_id, current))
+        session = new_id("session")
+        conn.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", (session, user_id, current, current + SESSION_TTL_SECONDS * 1_000_000_000))
+    return {"id": user_id, "email": email, "name": name, "avatar_url": "", "is_admin": False}, session, ""
 
 
 def create_personal_data_export(user_id: str) -> dict:
@@ -4799,7 +5024,20 @@ def main() -> None:
     startup = current_startup_status(create_directories=True)
     if not startup["required_ready"]:
         raise RuntimeError("启动检查失败：数据库或数据目录不可写")
-    init_db()
+    upgrade_attempt = prepare_automatic_upgrade(DB_PATH, DATA_DIR, DATA_DIR / "upgrade-backups")
+    try:
+        init_db()
+        with db() as conn:
+            schema = migration_status(conn)
+        if upgrade_attempt["required"] or upgrade_attempt["reason"] == "new_database":
+            record_automatic_upgrade(
+                DATA_DIR, upgrade_attempt, success=True,
+                after_schema_version=schema["current_version"],
+            )
+    except Exception as exc:
+        if upgrade_attempt["required"] or upgrade_attempt["reason"] == "new_database":
+            record_automatic_upgrade(DATA_DIR, upgrade_attempt, success=False, error=str(exc))
+        raise
     port = int(os.environ.get("PORT", "8765"))
     host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
     server = ThreadingHTTPServer((host, port), AgentPlatformHandler)

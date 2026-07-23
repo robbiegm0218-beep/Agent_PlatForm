@@ -131,15 +131,15 @@ window.AgentAuditView = {
       panel.append(Object.assign(document.createElement("p"), { textContent: "暂无文档级评价。" }));
     } else {
       const list = document.createElement("div"); list.className = "diagnostic-document-list";
-      documents.forEach((document) => {
-        const item = document.createElement(document.reference?.run_id ? "button" : "div"); item.className = "diagnostic-document";
-        if (item instanceof HTMLButtonElement) { item.type = "button"; item.title = "查看这份资料对应的运行详情"; item.addEventListener("click", () => onSelectRun?.(document.reference.run_id)); }
-        const name = document.createElement("strong"); name.textContent = document.filename;
-        const detail = document.createElement("small"); detail.textContent = `${document.assessed_count} 条评价 · 有误 ${document.incorrect_count} 条 · ${document.risk_level === "high" ? "高风险" : "持续观察"}`;
-        const breakdown = document.reference?.score_breakdown || {};
-        const score = document.reference?.score;
+      documents.forEach((documentItem) => {
+        const item = globalThis.document.createElement(documentItem.reference?.run_id ? "button" : "div"); item.className = "diagnostic-document";
+        if (item instanceof HTMLButtonElement) { item.type = "button"; item.title = "查看这份资料对应的运行详情"; item.addEventListener("click", () => onSelectRun?.(documentItem.reference.run_id)); }
+        const name = globalThis.document.createElement("strong"); name.textContent = documentItem.filename;
+        const detail = globalThis.document.createElement("small"); detail.textContent = `${documentItem.assessed_count} 条评价 · 有误 ${documentItem.incorrect_count} 条 · ${documentItem.risk_level === "high" ? "高风险" : "持续观察"}`;
+        const breakdown = documentItem.reference?.score_breakdown || {};
+        const score = documentItem.reference?.score;
         const scoreText = typeof score === "number" ? `命中分 ${score.toFixed(2)} · 短语 ${breakdown.phrase ?? 0} / 标题 ${breakdown.title ?? 0} / 词汇 ${breakdown.lexical ?? 0} / 覆盖 ${breakdown.coverage ?? 0}` : "尚无可回看的命中评分";
-        const trace = document.createElement("small"); trace.textContent = scoreText;
+        const trace = globalThis.document.createElement("small"); trace.textContent = scoreText;
         item.append(name, detail, trace); list.appendChild(item);
       });
       panel.append(list);
@@ -151,6 +151,9 @@ window.AgentAuditView = {
     if (governance) {
       const adminTitle = document.createElement("h4"); adminTitle.textContent = "管理员策略控制"; panel.append(adminTitle);
       const admin = document.createElement("div"); admin.className = "retrieval-governance";
+      if (governance.evidence?.source === "trial_feedback_aggregate") {
+        admin.append(Object.assign(document.createElement("p"), { textContent: `试用汇总信号：${governance.evidence.document_feedback_count || 0} 条引用评价。仅用于生成离线候选，不展示测试用户或文档内容。` }));
+      }
       const suggestions = governance.suggestions || [];
       if (!suggestions.length) {
         admin.append(Object.assign(document.createElement("p"), { textContent: "当前没有满足样本门槛的单变量优化建议。" }));
@@ -205,6 +208,41 @@ window.AgentAuditView = {
     modes.textContent = `Planner：${intelligence.planner || "off"}；证据：${intelligence.evidence || "off"}；编排：${intelligence.orchestrator || "off"}；验收：${intelligence.verifier || "off"}`;
     panel.append(modes);
     panel.append(Object.assign(document.createElement("small"), { textContent: "报告只统计当前账号的运行元数据，不读取对话或资料正文。达到门槛前不会自动开启 Active。" }));
+    els.runDetail.append(panel);
+  },
+  renderTrialMetrics(els, data) {
+    const { total = {}, testers = [], citation_issue_reasons: issueReasons = {}, privacy = "" } = data;
+    const percent = (value) => value == null ? "暂无数据" : `${(value * 100).toFixed(1)}%`;
+    const metric = (value, suffix = "") => value == null ? "暂无数据" : `${value}${suffix}`;
+    els.runDetail.replaceChildren();
+    const panel = document.createElement("section"); panel.className = "retrieval-diagnostics";
+    panel.append(Object.assign(document.createElement("h3"), { textContent: "试用概览" }));
+    panel.append(Object.assign(document.createElement("p"), { textContent: "仅管理员可见，用于观察邀请制试用的稳定性和反馈质量。" }));
+    const grid = document.createElement("div"); grid.className = "diagnostic-metrics";
+    [["测试用户", total.testers || 0], ["Run", total.runs || 0], ["完成率", percent(total.completion_rate)], ["P95 时延", metric(total.p95_seconds, " 秒")], ["有帮助率", percent(total.helpful_rate)], ["引用准确率", percent(total.citation_accuracy)], ["回答反馈", total.feedback_count || 0], ["Token 估算", total.token_estimate || 0]].forEach(([label, value]) => {
+      const item = document.createElement("div"); item.className = "diagnostic-metric";
+      item.append(Object.assign(document.createElement("span"), { textContent: label }), Object.assign(document.createElement("strong"), { textContent: value })); grid.append(item);
+    });
+    panel.append(grid);
+    const reasonLabels = { wrong_document: "文档不相关", wrong_passage: "命中片段不相关", outdated: "资料已过期", answer_misused: "回答误用了资料", missing_evidence: "缺少应有资料" };
+    const reasons = document.createElement("p");
+    reasons.textContent = Object.keys(issueReasons).length ? `引用问题：${Object.entries(issueReasons).map(([code, count]) => `${reasonLabels[code] || code} ${count} 条`).join("；")}` : "引用问题：暂无";
+    panel.append(reasons);
+    const title = document.createElement("h4"); title.textContent = "受邀用户"; panel.append(title);
+    if (!testers.length) {
+      panel.append(Object.assign(document.createElement("p"), { textContent: "暂时没有完成注册的受邀用户。" }));
+    } else {
+      const list = document.createElement("div"); list.className = "diagnostic-document-list";
+      testers.forEach((tester) => {
+        const item = document.createElement("div"); item.className = "diagnostic-document";
+        const name = document.createElement("strong"); name.textContent = `${tester.name} · ${tester.email}`;
+        const runs = document.createElement("small"); runs.textContent = `Run ${tester.runs} · 完成率 ${percent(tester.completion_rate)} · P95 ${metric(tester.p95_seconds, " 秒")}`;
+        const feedback = document.createElement("small"); feedback.textContent = `有帮助率 ${percent(tester.helpful_rate)}（${tester.feedback_count} 条）· 引用准确率 ${percent(tester.citation_accuracy)}（${tester.citation_feedback_count} 条）· Token ${tester.token_estimate}`;
+        item.append(name, runs, feedback); list.append(item);
+      });
+      panel.append(list);
+    }
+    panel.append(Object.assign(document.createElement("small"), { textContent: privacy }));
     els.runDetail.append(panel);
   },
 };

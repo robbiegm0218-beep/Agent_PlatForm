@@ -132,6 +132,14 @@
   font-weight: 650;
 }
 
+.starter-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 .message {
   width: min(var(--conversation-width), 100%);
   margin: 0 auto 28px;
@@ -493,6 +501,8 @@
 .model-config-picker[open] summary::after, .execution-mode-picker[open] summary::after { transform: rotate(225deg); }
 .model-config-hint, .execution-mode-hint { max-width: 155px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 400; }
 .model-config-menu, .execution-mode-menu { position: absolute; z-index: 6; right: auto; bottom: calc(100% + 8px); left: 0; display: grid; grid-template-columns: repeat(2, minmax(132px, 1fr)); gap: 8px; width: 300px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
+.config-menu-intro { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.startup-check small { grid-column: 1 / -1; color: var(--muted); line-height: 1.45; }
 .model-config-menu label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .model-config-menu select { width: 100%; max-width: none; border: 1px solid var(--line); background: var(--panel-soft); }
 .execution-mode-menu label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }

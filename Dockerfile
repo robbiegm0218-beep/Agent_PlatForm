@@ -1,4 +1,13 @@
-FROM python:3.13-slim
+FROM node:22-alpine AS node-dependencies
+
+WORKDIR /node-dependencies
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+
+# Pinned after Docker Scout verified this Python 3.13 Alpine manifest has no
+# Critical/High CVEs. Refresh intentionally through the image-security task.
+FROM python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -7,18 +16,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8765
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm tesseract-ocr tesseract-ocr-chi-sim \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+        nodejs \
+        tesseract-ocr \
+        tesseract-ocr-data-chi_sim \
+        tesseract-ocr-data-eng \
+        tesseract-ocr-data-osd
 
 WORKDIR /app
-COPY requirements.txt package.json package-lock.json ./
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
-    && npm ci --omit=dev \
-    && useradd --create-home --uid 10001 agent \
+    && adduser -D -u 10001 agent \
     && mkdir -p /data \
     && chown -R agent:agent /app /data
 
+# Alpine's nodejs runtime is installed without npm. Only the application-level
+# Excel dependency is copied from the build stage.
+COPY --from=node-dependencies --chown=agent:agent /node-dependencies/node_modules ./node_modules
 COPY --chown=agent:agent server ./server
 COPY --chown=agent:agent web ./web
 COPY --chown=agent:agent scripts ./scripts

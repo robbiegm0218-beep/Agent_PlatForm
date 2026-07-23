@@ -24,6 +24,104 @@ def _tree_stats(path: Path) -> dict:
     return {"files": len(files), "bytes": sum(item.stat().st_size for item in files)}
 
 
+def current_schema_version(database: Path) -> int:
+    """Read the recorded migration version without changing the source database."""
+    if not database.is_file():
+        return 0
+    with sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if not exists:
+            return 0
+        row = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()
+    return int(row[0] or 0)
+
+
+def _upgrade_state_path(data_dir: Path) -> Path:
+    return data_dir / "upgrade-state.json"
+
+
+def _read_upgrade_state(data_dir: Path) -> dict:
+    path = _upgrade_state_path(data_dir)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_upgrade_state(data_dir: Path, payload: dict) -> None:
+    """Persist only operational metadata, atomically, never database contents."""
+    path = _upgrade_state_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def prepare_automatic_upgrade(database: Path, data_dir: Path, backup_root: Path) -> dict:
+    """Create one pre-upgrade snapshot when app/schema state actually changes.
+
+    This is deliberately called by the service entrypoint rather than ``init_db``:
+    test setup and one-off maintenance commands must not create backups of arbitrary
+    databases.  A new, empty instance needs no snapshot; an existing instance with
+    no state file is protected once before its first managed startup.
+    """
+    if not database.is_file():
+        return {"required": False, "reason": "new_database", "before_schema_version": 0}
+    before_schema = current_schema_version(database)
+    state = _read_upgrade_state(data_dir)
+    previous = state.get("last_success") if isinstance(state.get("last_success"), dict) else {}
+    version_changed = not previous or previous.get("app_version") != APP_VERSION
+    migration_pending = before_schema < LATEST_SCHEMA_VERSION
+    if not version_changed and not migration_pending:
+        return {
+            "required": False,
+            "reason": "up_to_date",
+            "before_schema_version": before_schema,
+            "previous_app_version": previous.get("app_version", APP_VERSION),
+        }
+    snapshot = prepare_snapshot(database, data_dir, backup_root)
+    return {
+        "required": True,
+        "reason": "app_version_changed" if version_changed else "migration_pending",
+        "snapshot": str(snapshot),
+        "before_schema_version": before_schema,
+        "previous_app_version": previous.get("app_version", ""),
+    }
+
+
+def record_automatic_upgrade(data_dir: Path, attempt: dict, *, success: bool, after_schema_version: int | None = None, error: str = "") -> dict:
+    """Record the outcome needed for recovery without recording user data or secrets."""
+    previous = _read_upgrade_state(data_dir)
+    event = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "success": bool(success),
+        "app_version": APP_VERSION,
+        "before_schema_version": int(attempt.get("before_schema_version", 0)),
+        "after_schema_version": int(after_schema_version or 0),
+        "reason": str(attempt.get("reason", "")),
+        "snapshot": str(attempt.get("snapshot", "")),
+        "error": str(error)[:300],
+    }
+    history = previous.get("history") if isinstance(previous.get("history"), list) else []
+    payload = {"format": "agent-platform-upgrade-state/v1", "history": (history + [event])[-20:]}
+    if success:
+        payload["last_success"] = {
+            "app_version": APP_VERSION,
+            "schema_version": event["after_schema_version"],
+            "at": event["at"],
+            "snapshot": event["snapshot"],
+        }
+    elif isinstance(previous.get("last_success"), dict):
+        payload["last_success"] = previous["last_success"]
+    _write_upgrade_state(data_dir, payload)
+    return event
+
+
 def prepare_snapshot(database: Path, data_dir: Path, backup_root: Path) -> Path:
     if not database.is_file():
         raise FileNotFoundError(f"数据库不存在：{database}")
@@ -39,6 +137,7 @@ def prepare_snapshot(database: Path, data_dir: Path, backup_root: Path) -> Path:
             shutil.copytree(source, snapshot / name)
     manifest = {
         "app_version": APP_VERSION,
+        "source_schema_version": current_schema_version(database),
         "target_schema_version": LATEST_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "database_bytes": (snapshot / "agent_platform.db").stat().st_size,

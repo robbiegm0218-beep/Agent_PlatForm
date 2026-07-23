@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from server.model_provider import DeepSeekConfig
-from server.recovery_drill import run_drill
+from server.recovery_drill import run_drill, run_full_drill
 from server.smoke_deepseek import run_smoke
 
 
@@ -31,6 +31,23 @@ class OperationsTests(unittest.TestCase):
                 conn.execute("INSERT INTO users (id) VALUES ('user_1')")
             result = run_drill(database)
 
-        self.assertTrue(result["ok"])
+            self.assertTrue(result["ok"])
+
+    def test_full_recovery_drill_includes_knowledge_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "agent.db"
+            data = root / "data"
+            (data / "knowledge").mkdir(parents=True)
+            (data / "artifacts").mkdir()
+            (data / "knowledge" / "note.md").write_text("note", encoding="utf-8")
+            (data / "artifacts" / "answer.md").write_text("answer", encoding="utf-8")
+            with sqlite3.connect(database) as conn:
+                conn.execute("CREATE TABLE users (id TEXT)")
+                conn.execute("INSERT INTO users VALUES ('u1')")
+            result = run_full_drill(database, data)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["knowledge_files"], 1)
+            self.assertEqual(result["artifact_files"], 1)
         self.assertEqual(result["fingerprint"]["integrity"], "ok")
         self.assertEqual(result["fingerprint"]["counts"]["users"], 1)

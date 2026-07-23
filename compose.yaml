@@ -9,7 +9,7 @@ services:
       AGENT_DATABASE_PATH: /data/agent_platform.db
       AGENT_DATA_DIR: /data
     ports:
-      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:${HOST_PORT:-8765}:8765"
     volumes:
       - agent-platform-data:/data
 

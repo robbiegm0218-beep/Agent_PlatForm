@@ -30,7 +30,9 @@ def run_smoke(config: DeepSeekConfig, model: str, dry_run: bool = False) -> dict
         [{"role": "user", "content": "请回复 OK"}],
         [],
         model,
-        32,
+        # Reasoning-capable models can consume a few dozen tokens before the
+        # final answer. Keep this inexpensive while leaving room for `OK`.
+        128,
     )
     content = result.get("content", "").strip()
     if not content:

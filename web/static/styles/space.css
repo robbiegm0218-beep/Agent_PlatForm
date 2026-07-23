@@ -12,6 +12,7 @@
 .space-side-panel .space-card { margin-bottom: 14px; background: var(--panel); }
 .space-side-list { max-height: 260px; overflow-y: auto; padding-right: 3px; scrollbar-gutter: stable; }
 .space-knowledge-search { width: 100%; height: 32px; margin: 0 0 7px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-soft); font: inherit; font-size: 12px; }
+.space-knowledge-notice { min-height: 0; margin: 0 0 7px; color: var(--accent-dark); font-size: 12px; }
 .space-knowledge-edit, .space-knowledge-delete { justify-self: start; min-width: auto !important; height: auto !important; margin-top: 3px; margin-right: 8px; padding: 2px 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; font-size: 11px !important; font-weight: 500 !important; }
 .space-knowledge-edit { color: var(--accent) !important; }
 .space-knowledge-delete { color: var(--danger) !important; }

@@ -46,6 +46,7 @@ context.fetch = async () => ({ ok: false, status: 401, json: async () => ({ erro
 await assert.rejects(() => context.AgentApi("/api/me"), (error) => error.status === 401 && error.message === "未授权");
 
 const app = readFileSync(new URL("../web/static/app.js", import.meta.url), "utf8");
+const loginPage = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
 const composer = readFileSync(new URL("../web/static/chat/composer.js", import.meta.url), "utf8");
 const stream = readFileSync(new URL("../web/static/chat/stream.js", import.meta.url), "utf8");
 const executionMode = readFileSync(new URL("../web/static/chat/execution-mode.js", import.meta.url), "utf8");
@@ -61,6 +62,22 @@ const auditView = readFileSync(new URL("../web/static/views/audit.js", import.me
 assert.match(app, /storage\.saveWorkspace\(UI_STATE_KEY/);
 assert.match(app, /storage\.loadWorkspace\(UI_STATE_KEY\)/);
 assert.match(app, /storage\.clearToken\(\)/);
+assert.match(app, /\/api\/trial-metrics/);
+assert.match(app, /trialMetricsButton/);
+assert.match(app, /uploadedDocument/);
+assert.match(app, /refreshKnowledgeAfterUpload/);
+assert.match(app, /spaceKnowledgeList/);
+assert.match(app, /loadKnowledge\(\)\.then/);
+assert.match(app, /spaceOpenEpoch/);
+assert.match(app, /requestEpoch !== spaceOpenEpoch/);
+assert.match(app, /showSpaceError/);
+assert.match(app, /spaceId: state\.activeView === "space"/);
+assert.match(auditView, /citation_issue_reasons/);
+assert.doesNotMatch(app, /offerStartupChecklist\(\) \{[\s\S]{0,220}switchView\("settings"\)/);
+assert.match(loginPage, /使用邀请码注册/);
+assert.match(loginPage, /id="trialInvitationForm"/);
+assert.doesNotMatch(loginPage, /value="admin@example\.com"/);
+assert.doesNotMatch(loginPage, /value="admin123"/);
 assert.match(composer, /window\.AgentChatComposer/);
 assert.match(stream, /window\.AgentChatStream/);
 assert.match(executionMode, /window\.AgentExecutionMode/);

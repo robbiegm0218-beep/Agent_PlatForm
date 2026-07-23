@@ -215,7 +215,7 @@ export AGENT_LOG_BACKUP_COUNT="5"      # 轮转文件数量，默认 5
 
 `GET /api/health` 不需要登录。SQLite 可用时返回 `200` 与 `database_ready: true`；不可用时返回 `503`，可直接作为部署健康探针。
 
-### 个人托管测试版部署（P46-B 预览）
+### 个人托管测试版部署
 
 个人托管测试版采用“一个实例对应一个个人用户”的边界，默认不开放注册。推荐使用 Docker Compose：数据会保存在命名卷中，镜像只绑定本机回环地址，不会直接暴露到公网。
 
@@ -227,9 +227,15 @@ docker compose ps
 curl http://127.0.0.1:8765/api/health
 ```
 
+如需在同一台机器进行隔离启动演练，可通过 `HOST_PORT=8766 docker compose -p agent-release-smoke up -d --build` 使用独立项目名、数据卷和本机端口。
+
 首次启动前或升级后可运行以下检查。它不会发送模型请求，也不会输出密钥或对话内容；必需项未通过时服务不会启动。
 
 ```bash
+# Docker Compose 部署
+docker compose exec -T agent-platform python -m server.startup_checks --create-directories
+
+# 非 Docker 本地部署
 python3 -m server.startup_checks --create-directories
 ```
 
@@ -247,15 +253,45 @@ python3 -m server.startup_checks --create-directories
 | `PERSONAL_*_RUN_LIMIT` / `PERSONAL_*_TOKEN_LIMIT` | 新任务每日 / 30 天的任务数与 Token 估算硬上限；`0` 表示关闭对应限制 | `100` / `1000`；`200000` / `2000000` |
 | `PERSONAL_SINGLE_RUN_TOKEN_LIMIT` | 单次任务的输入估算加最大输出预留上限；超过时提示拆分任务 | `16000` |
 | `MIN_FREE_DISK_BYTES` | 启动检查与健康状态的最低剩余磁盘空间阈值 | `1073741824`（1 GB） |
+| `AGENT_LOG_FORMAT` | 本机日志格式；默认 `json`，可设为 `text` 便于直接阅读 | `json` |
 | `LOGIN_FAILURE_LIMIT` / `LOGIN_LOCK_SECONDS` | 按账号散列和来源散列累计失败次数，并临时锁定登录 | `5` / `900` |
 
-当前开发机没有 Docker，因此仓库中的 Dockerfile 与 Compose 配置尚未完成真实镜像构建验证；部署前请在目标机器运行 `docker compose config` 与上述启动命令。
+Docker Compose 已在 macOS ARM64 Docker Desktop 完成真实构建、登录、模型对话、知识库、文件产物、重启持久化和监控验证。运行镜像使用固定的 Python 3.13 Alpine 基础镜像；最近一次 Docker Scout 扫描结果为 0 Critical、1 个受控 High 例外，详见 [安全风险例外记录](docs/security-exceptions.md)。部署前仍应在目标机器运行 `docker compose config` 与上述启动命令。
+
+### 源码、本地运行与 Docker 的关系
+
+Docker 不维护另一套代码：`docker compose up -d --build` 会将当前工作区的 `server/`、`web/` 和 `scripts/` 构建为运行镜像。因此，源码测试与 Docker 验收验证的是同一版本；差别仅在运行环境和数据位置。
+
+- 直接本地运行：`scripts/start-server.sh`，使用工作区的 `agent_platform.db` 与 `data/`。
+- Docker Compose：`docker compose up -d --build`，使用命名卷 `agent-platform-data` 中的 `/data`。
+- 两种运行方式不要同时绑定同一端口。修改代码后，选择当前使用的一种方式重启即可；Docker 使用前者命令重建，直接本地运行则重启脚本启动的服务。
+
+知识库的“自动”模式会先做受限的本地命中探测，实际命中才把资料片段注入模型；项目资料在对话中按当前项目空间检索，在知识库页面可选择指定项目或“全部项目”（仅限当前账号有权限访问的项目）。
+
+### 检索反馈与策略发布
+
+回答评价与逐文档引用评价会保存为用户隔离的 Run 元数据和审计事件。管理员只可使用匿名的试用反馈原因计数生成单变量候选策略；流程固定为“创建候选 → 固定离线集评测 → 管理员确认发布”，不会因单条反馈自动修改线上策略。当前发布策略会记录在每个 Run 中，上一稳定版本可在“检索质量”页回滚。
 
 部署或升级前可运行本地安全基线检查；它不会上传代码或数据，会验证密钥文件忽略规则、Python 依赖一致性、服务端语法与前端模块检查：
 
 ```bash
 scripts/security-baseline.sh
 ```
+
+可用本地运行检查接入 cron、launchd 或系统通知。它只读取 Run 数值、事件类型、Token 估算、磁盘与备份时间，不读取对话或知识正文；会检查失败率、P95、模型错误率和每日/月度预算接近阈值。`0` 表示正常、`1` 表示警告、`2` 表示阻断：
+
+```bash
+scripts/operational-check.sh
+```
+
+Docker 部署版可安装 macOS 定时维护：每天 02:00 在 Docker 数据卷中创建升级快照，09:00 检查容器、磁盘、备份时效、失败率、模型错误率和预算。它不会自动删除备份；请定期检查磁盘容量后再按保留策略清理：
+
+```bash
+chmod +x scripts/docker-operational-check.sh scripts/docker-upgrade-snapshot.sh scripts/install-macos-launchd.sh
+scripts/install-macos-launchd.sh
+```
+
+维护脚本会安装到 `~/Library/Application Support/Agent_Platform/`，日志写入 `~/Library/Logs/Agent_Platform/`，避免 macOS 后台任务访问“文稿”目录时被隐私权限阻止。可用 `launchctl print gui/$(id -u)/com.agent-platform.daily-check` 查看任务状态。
 
 ### 升级快照、回滚与密码恢复
 
@@ -266,7 +302,7 @@ python3 -m server.account_deletion
 python3 -m server.account_deletion --execute --confirmation DELETE_DUE_ACCOUNTS
 ```
 
-数据库升级使用版本化迁移。迁移在 HTTP 服务开始监听前执行；失败时服务会退出，不会继续提供写入服务。每次升级前，先在停服务前创建包含数据库、知识库和产物的快照：
+数据库升级使用版本化迁移。迁移在 HTTP 服务开始监听前执行；失败时服务会退出，不会继续提供写入服务。服务会在检测到应用版本或数据库迁移变化时，自动创建包含数据库、知识库和产物的快照，并把版本、迁移结果和快照位置记录在 `data/upgrade-state.json`；普通重启不会重复创建。高风险维护仍可手动创建快照：
 
 ```bash
 python3 -m server.upgrade prepare \
@@ -290,11 +326,23 @@ python3 -m server.upgrade restore \
 python3 -m server.manage_account create-password-reset --email owner@example.com
 ```
 
+个人试用保持关闭公共注册。管理员仅可在服务器本机创建受邀账号，并应通过独立安全渠道交付初始密码：
+
+```bash
+python3 -m server.manage_account create-invited-user --email tester@example.com --name 测试用户 --password '请使用强且唯一的初始密码'
+```
+
+更多受控写入操作（创建测试用户、升级快照、隔离恢复、到期删除）见 [个人托管操作指南](docs/operations-guide.md)。
+
+首次试用可从 [示例任务与资料边界](docs/demo-tasks.md) 开始；示例不会自动写入知识库或长期记忆。
+
+创建测试用户前，请按 [个人试用准入清单](docs/personal-trial-checklist.md) 完成部署、恢复、预算和隐私确认。
+
 该令牌仅在终端输出一次，默认 30 分钟有效，服务器只保存其散列。请通过安全渠道交给账号所有者，然后在登录页选择“使用一次性重置令牌”；不要将令牌写入聊天记录、日志或 Git。
 
 ## 数据、备份与部署验收
 
-运行数据默认保存在项目根目录的 `agent_platform.db`；知识库和产物位于 `data/knowledge/`、`data/artifacts/`。这些路径及 `.env` 已被 Git 忽略，应纳入部署环境的备份策略。
+非 Docker 本地运行时，数据默认保存在项目根目录的 `agent_platform.db`，知识库和产物位于 `data/knowledge/`、`data/artifacts/`。Docker Compose 运行时，这些数据统一保存在命名卷 `agent-platform-data` 的 `/data` 中；两种方式的 `.env` 和数据目录均已被 Git 忽略，应纳入部署环境的备份策略。
 
 ```bash
 # 创建或恢复一致性的 SQLite 备份
@@ -302,7 +350,7 @@ python3 server/backup.py backup ~/Agent_Backups/agent-platform.db
 python3 server/backup.py restore ~/Agent_Backups/agent-platform.db
 
 # 在临时目录执行备份→恢复→完整性与关键表计数校验，不修改源数据库
-python3 server/recovery_drill.py --database agent_platform.db
+python3 -m server.recovery_drill --database agent_platform.db --data-dir data
 
 # 仅校验 DeepSeek 配置，不发送网络请求
 python3 server/smoke_deepseek.py --dry-run

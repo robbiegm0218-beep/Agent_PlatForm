@@ -90,6 +90,7 @@ function showWorkspace(reveal = true) {
   els.workspaceView.classList.remove("hidden");
   els.nameInput.value = state.user?.name || "";
   els.settingsEmail.value = state.user?.email || "";
+  els.trialMetricsButton.classList.toggle("hidden", !state.user?.is_admin);
   renderThreadContext();
 }
 
@@ -103,6 +104,7 @@ function persistWorkspaceState() {
   storage.saveWorkspace(UI_STATE_KEY, {
     view: state.activeView,
     threadId: state.currentThreadId,
+    spaceId: state.activeView === "space" ? state.currentSpaceId : "",
   });
 }
 
@@ -118,6 +120,10 @@ async function restoreWorkspaceState() {
     els.threadTitle.textContent = "新对话";
     renderThreads();
     renderMessages();
+  }
+  if (view === "space" && saved.spaceId && state.folders.some((folder) => folder.id === saved.spaceId)) {
+    await openSpace(saved.spaceId);
+    return;
   }
   switchView(view);
 }
@@ -321,7 +327,30 @@ function renderKnowledge(documents) {
 
 async function refreshKnowledgeViews() {
   await loadKnowledge();
-  if (state.activeView === "space" && state.currentSpaceId) await openSpace(state.currentSpaceId);
+}
+
+function refreshKnowledgeAfterUpload(spaceId, document, retry = true) {
+  // Do not rerender the complete project workspace after an upload: that moves
+  // the shared composer DOM and can invalidate the current page interaction.
+  window.setTimeout(() => {
+    loadKnowledge().then(() => {
+      if (state.activeView !== "space" || state.currentSpaceId !== spaceId) return;
+      const list = els.spaceDetail.querySelector("#spaceKnowledgeList");
+      const notice = els.spaceDetail.querySelector("#spaceKnowledgeNotice");
+      if (!list) return;
+      if (!list.querySelector(`[data-knowledge-id="${document.id}"]`)) {
+        list.querySelector(".space-empty")?.remove();
+        const item = window.document.createElement("div"); item.className = "space-list-item space-knowledge-item"; item.dataset.knowledgeId = document.id;
+        const name = window.document.createElement("span"); name.textContent = document.filename;
+        const detail = window.document.createElement("small"); detail.textContent = `${document.chunk_count} 个检索片段 · 刚刚上传`;
+        item.append(name, detail); list.prepend(item);
+      }
+      if (notice) notice.textContent = `已上传：${document.filename}`;
+    }).catch((error) => {
+      console.warn("knowledge_view_refresh_failed", error);
+      if (retry) window.setTimeout(() => refreshKnowledgeAfterUpload(spaceId, document, false), 500);
+    });
+  }, 0);
 }
 
 async function editKnowledge(document) {
@@ -345,6 +374,17 @@ async function editKnowledge(document) {
   }
 }
 
+let spaceOpenEpoch = 0;
+
+function showSpaceError(spaceId, error) {
+  if (state.currentSpaceId !== spaceId) return;
+  els.spaceDetail.replaceChildren();
+  const notice = window.document.createElement("div"); notice.className = "empty-state";
+  notice.append(Object.assign(window.document.createElement("h2"), { textContent: "项目空间暂时无法加载" }), Object.assign(window.document.createElement("p"), { textContent: error.message || "请稍后重试。" }));
+  const retry = window.document.createElement("button"); retry.type = "button"; retry.textContent = "重新加载";
+  retry.addEventListener("click", () => openSpace(spaceId)); notice.append(retry); els.spaceDetail.append(notice);
+}
+
 async function searchKnowledge() {
   const query = els.knowledgeSearch.value.trim();
   if (!query) {
@@ -352,7 +392,12 @@ async function searchKnowledge() {
     els.knowledgeResults.innerHTML = "";
     return;
   }
-  const data = await api(`/api/knowledge/search?query=${encodeURIComponent(query)}`);
+  const params = new URLSearchParams({ query });
+  if (els.knowledgeScopeSelect.value === "project") {
+    if (els.knowledgeProjectSelect.value) params.set("project_space_id", els.knowledgeProjectSelect.value);
+    else params.set("project_scope", "all");
+  }
+  const data = await api(`/api/knowledge/search?${params}`);
   knowledgeLibrary.renderSearchResults(els, data.results, escapeHtml);
 }
 
@@ -552,24 +597,35 @@ function createThreadRow(thread) {
 }
 
 async function openSpace(spaceId) {
+  const requestEpoch = ++spaceOpenEpoch;
   state.currentSpaceId = spaceId;
-  const data = await api(`/api/folders/${spaceId}`);
-  els.spaceTitle.textContent = data.space.name;
-  spaceWorkspace.render({ data, state, spaceId, userId: state.user?.id, escape: escapeHtml, detail: els.spaceDetail });
-  mountSpaceComposer(data.space);
+  switchView("space");
+  try {
+    const data = await api(`/api/folders/${spaceId}`);
+    if (requestEpoch !== spaceOpenEpoch || state.currentSpaceId !== spaceId) return;
+    els.spaceTitle.textContent = data.space.name;
+    spaceWorkspace.render({ data, state, spaceId, userId: state.user?.id, escape: escapeHtml, detail: els.spaceDetail });
+    mountSpaceComposer(data.space);
   els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
   els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
   els.spaceDetail.querySelectorAll(".remove-space-member").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("移除该成员？")) return;
-    if (button.dataset.demo === "true") state.demoMembersBySpace[spaceId] = state.demoMembersBySpace[spaceId].filter((member) => member.id !== button.dataset.memberId);
-    else await api(`/api/folders/${spaceId}/members/${button.dataset.memberId}`, { method: "DELETE" });
-    await openSpace(spaceId);
+    button.disabled = true;
+    try {
+      if (button.dataset.demo === "true") state.demoMembersBySpace[spaceId] = state.demoMembersBySpace[spaceId].filter((member) => member.id !== button.dataset.memberId);
+      else await api(`/api/folders/${spaceId}/members/${button.dataset.memberId}`, { method: "DELETE" });
+      await openSpace(spaceId);
+    } catch (error) { window.alert(error.message || "移除成员失败"); button.disabled = false; }
   }));
   els.spaceDetail.querySelector("#inviteSpaceMember")?.addEventListener("click", async () => {
     const email = window.prompt("输入成员邮箱");
     if (!email?.trim()) return;
-    await api(`/api/folders/${spaceId}/invitations`, { method: "POST", body: JSON.stringify({ email }) });
-    await openSpace(spaceId);
+    const button = els.spaceDetail.querySelector("#inviteSpaceMember");
+    button.disabled = true;
+    try {
+      await api(`/api/folders/${spaceId}/invitations`, { method: "POST", body: JSON.stringify({ email }) });
+      await openSpace(spaceId);
+    } catch (error) { window.alert(error.message || "邀请成员失败"); button.disabled = false; }
   });
   els.spaceDetail.querySelector("#uploadSpaceKnowledge")?.addEventListener("click", () => {
     state.knowledgeUploadSpaceId = spaceId;
@@ -581,15 +637,22 @@ async function openSpace(spaceId) {
   });
   els.spaceDetail.querySelectorAll(".space-knowledge-delete").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("删除该项目资料？资料会同步从知识库移除。")) return;
-    await api(`/api/knowledge/${button.closest(".space-knowledge-item").dataset.knowledgeId}`, { method: "DELETE" });
-    await loadKnowledge();
-    await openSpace(spaceId);
+    const item = button.closest(".space-knowledge-item");
+    button.disabled = true;
+    try {
+      await api(`/api/knowledge/${item.dataset.knowledgeId}`, { method: "DELETE" });
+      item.remove();
+      await loadKnowledge();
+      if (!els.spaceDetail.querySelector(".space-knowledge-item")) els.spaceDetail.querySelector("#spaceKnowledgeList").textContent = "该项目空间暂未上传知识资料";
+    } catch (error) { window.alert(error.message || "删除资料失败"); button.disabled = false; }
   }));
   els.spaceDetail.querySelectorAll(".space-knowledge-edit").forEach((button) => button.addEventListener("click", () => {
     const document = (data.knowledge_documents || []).find((item) => item.id === button.closest(".space-knowledge-item").dataset.knowledgeId);
     if (document) editKnowledge({ ...document, scope: "project", project_space_id: spaceId });
   }));
-  switchView("space");
+  } catch (error) {
+    if (requestEpoch === spaceOpenEpoch) showSpaceError(spaceId, error);
+  }
 }
 
 async function manageThread(thread) {
@@ -858,6 +921,7 @@ async function loadRetrievalDiagnostics() {
     };
     governance = {
       suggestions: suggestionData.suggestions,
+      evidence: suggestionData.evidence,
       policies: policyData.policies,
       onCreateCandidate: (id, button) => reload(() => api(`/api/retrieval-suggestions/${id}/candidate`, { method: "POST", body: "{}" }), button),
       onEvaluate: (version, button) => reload(() => api(`/api/retrieval-policies/${version}/evaluate`, { method: "POST", body: "{}" }), button),
@@ -876,12 +940,27 @@ async function loadAgentRollout() {
   auditView.renderAgentRollout(els, data);
 }
 
+async function loadTrialMetrics() {
+  els.runList.innerHTML = "";
+  const data = await api("/api/trial-metrics");
+  auditView.renderTrialMetrics(els, data);
+}
+
 function renderMessages() {
   els.messages.innerHTML = "";
   if (!state.messages.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.innerHTML = "<h1>今天要完成什么？</h1><p>输入任务后，Agent 会根据已启用的技能回复。</p>";
+    const hasKnowledge = state.knowledgeDocuments?.length > 0;
+    empty.innerHTML = `<h1>从一个具体任务开始</h1><p>${hasKnowledge ? "可以直接描述目标、背景和期待结果。" : "还没有资料也可以直接提问；如需基于自己的资料回答，可先上传到知识库。"}</p><div class="starter-prompts">${hasKnowledge ? "" : '<button type="button" class="secondary" data-action="upload-knowledge">上传第一份资料</button>'}<button type="button" class="secondary" data-prompt="帮我把今天的工作整理成待办清单">整理待办</button><button type="button" class="secondary" data-prompt="请为我制定一个可执行的项目计划">制定项目计划</button><button type="button" class="secondary" data-prompt="请总结这段内容，并给出下一步建议">总结并给建议</button></div>`;
+    empty.querySelectorAll("[data-prompt]").forEach((button) => button.addEventListener("click", () => {
+      els.chatInput.textContent = button.dataset.prompt || "";
+      els.chatInput.focus();
+    }));
+    empty.querySelector("[data-action='upload-knowledge']")?.addEventListener("click", () => {
+      switchView("knowledge");
+      els.uploadKnowledgeButton.click();
+    });
     els.messages.appendChild(empty);
     els.threadTitle.textContent = state.currentThreadId ? els.threadTitle.textContent : "新对话";
     return;
@@ -1134,6 +1213,7 @@ const STARTUP_CHECK_LABELS = {
   database_directory: "数据库目录",
   knowledge_directory: "知识文件目录",
   artifacts_directory: "产物目录",
+  disk_space: "剩余磁盘空间",
   model: "真实模型",
   word_parser: "Word 解析",
   pdf_parser: "PDF 解析",
@@ -1141,12 +1221,28 @@ const STARTUP_CHECK_LABELS = {
   image_ocr: "图片 OCR",
 };
 
+const STARTUP_CHECK_ACTIONS = {
+  model: "要获得真实 AI 回答，请在部署机器的 .env 填写模型 API Key 后重启服务。未配置时仍可使用本地演示回复。",
+  image_ocr: "如需识别 PNG、JPG 等图片资料，请在部署机器安装 Tesseract OCR；不影响其他文档上传。",
+  word_parser: "如需解析 Word 文档，请安装项目依赖；不影响已有资料和普通对话。",
+  pdf_parser: "如需解析 PDF 文档，请安装项目依赖；不影响已有资料和普通对话。",
+  excel_runtime: "如需生成 Excel 文件，请在部署机器安装 Node.js；不影响 Markdown 文件和普通对话。",
+  disk_space: "请释放磁盘空间或调整最低空间阈值，再重启服务。",
+  database_directory: "请确认运行账号对项目目录拥有读写权限。",
+  knowledge_directory: "请确认运行账号对 data/knowledge 目录拥有读写权限。",
+  artifacts_directory: "请确认运行账号对 data/artifacts 目录拥有读写权限。",
+};
+
 function renderPersonalHostingStatus(startup, events, usage = {}, deletion = {}) {
-  const checks = Object.entries(startup.checks || {}).map(([key, item]) => `
+  const checks = Object.entries(startup.checks || {}).map(([key, item]) => {
+    const action = !item.ok ? STARTUP_CHECK_ACTIONS[key] : "";
+    return `
     <div class="startup-check">
       <span>${escapeHtml(STARTUP_CHECK_LABELS[key] || key)}</span>
       <strong data-ready="${Boolean(item.ok)}">${item.ok ? "可用" : (item.required === false ? "未配置" : "需要处理")}</strong>
-    </div>`).join("");
+      ${action ? `<small>${escapeHtml(action)}</small>` : ""}
+    </div>`;
+  }).join("");
   const schema = startup.schema || {};
   els.startupChecklist.innerHTML = `
     <div class="startup-check"><span>应用版本</span><strong>${escapeHtml(startup.app_version || "未知")}</strong></div>
@@ -1204,8 +1300,8 @@ async function loadPersonalHostingStatus() {
 
 async function offerStartupChecklist() {
   if (window.localStorage.getItem("agent-platform-startup-check-complete") === "true") return;
-  switchView("settings");
-  await loadPersonalHostingStatus();
+  // Do not override the restored page. The checklist remains available when
+  // the user opens Personal Settings from the navigation.
 }
 
 function restoreChatComposer() {
@@ -1429,6 +1525,10 @@ els.showPasswordResetButton.addEventListener("click", () => {
   els.passwordResetForm.classList.toggle("hidden");
 });
 
+els.showTrialInvitationButton.addEventListener("click", () => {
+  els.trialInvitationForm.classList.toggle("hidden");
+});
+
 els.passwordResetForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.passwordResetNotice.textContent = "";
@@ -1441,6 +1541,26 @@ els.passwordResetForm.addEventListener("submit", async (event) => {
     els.passwordResetNotice.textContent = "密码已重置，请使用新密码登录。";
   } catch (error) {
     els.passwordResetNotice.textContent = error.message || "密码重置失败";
+  }
+});
+
+els.trialInvitationForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.trialInvitationNotice.textContent = "";
+  try {
+    const data = await api("/api/trial-invitations/accept", {
+      method: "POST",
+      body: JSON.stringify({ token: els.trialInvitationToken.value, email: els.trialInvitationEmail.value, name: els.trialInvitationName.value, password: els.trialInvitationPassword.value }),
+    });
+    state.token = data.token;
+    state.user = data.user;
+    storage.setToken(state.token);
+    els.trialInvitationForm.reset();
+    showWorkspace();
+    await refreshAll();
+    await restoreWorkspaceState();
+  } catch (error) {
+    els.trialInvitationNotice.textContent = error.message || "邀请码注册失败";
   }
 });
 
@@ -1522,7 +1642,7 @@ els.newThreadButton.addEventListener("click", () => {
 els.threadSearch.addEventListener("input", renderThreads);
 
 function setRunDrawerTab(tab) {
-  [[els.threadRunsTab, "thread"], [els.retrievalDiagnosticsButton, "diagnostics"], [els.agentRolloutButton, "rollout"], [els.viewAllRunsButton, "audit"]].forEach(([button, name]) => {
+  [[els.threadRunsTab, "thread"], [els.trialMetricsButton, "trial"], [els.retrievalDiagnosticsButton, "diagnostics"], [els.agentRolloutButton, "rollout"], [els.viewAllRunsButton, "audit"]].forEach(([button, name]) => {
     const active = name === tab;
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
@@ -1547,6 +1667,14 @@ async function showThreadRuns() {
 
 els.runDetailsButton.addEventListener("click", () => showThreadRuns().catch((error) => { els.runDetail.textContent = error.message || "无法加载运行详情"; }));
 els.threadRunsTab.addEventListener("click", () => showThreadRuns().catch((error) => { els.runDetail.textContent = error.message || "无法加载运行详情"; }));
+
+els.trialMetricsButton.addEventListener("click", async () => {
+  els.runDrawer.classList.remove("hidden");
+  els.runFilters.classList.add("hidden");
+  setRunDrawerTab("trial");
+  try { await loadTrialMetrics(); }
+  catch (error) { els.runDetail.textContent = error.message || "无法加载试用概览"; }
+});
 
 els.closeRunDrawer.addEventListener("click", () => els.runDrawer.classList.add("hidden"));
 els.viewAllRunsButton.addEventListener("click", async () => {
@@ -1668,18 +1796,24 @@ els.knowledgeFileInput.addEventListener("change", async () => {
     els.knowledgeFileInput.value = "";
     return;
   }
+  let uploadedDocument = null;
+  let uploadSpaceId = "";
   try {
     const contentBase64 = await fileAsBase64(file);
-    const projectSpaceId = state.knowledgeUploadSpaceId || (els.knowledgeScopeSelect.value === "project" ? els.knowledgeProjectSelect.value : "");
+    uploadSpaceId = state.knowledgeUploadSpaceId;
+    const projectSpaceId = uploadSpaceId || (els.knowledgeScopeSelect.value === "project" ? els.knowledgeProjectSelect.value : "");
     if (els.knowledgeScopeSelect.value === "project" && !projectSpaceId) throw new Error("请先选择项目空间");
-    await api(state.knowledgeUploadSpaceId ? `/api/folders/${state.knowledgeUploadSpaceId}/knowledge` : "/api/knowledge", {
+    const result = await api(uploadSpaceId ? `/api/folders/${uploadSpaceId}/knowledge` : "/api/knowledge", {
       method: "POST",
       body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId }),
     });
-    await loadKnowledge();
-    if (state.knowledgeUploadSpaceId) await openSpace(state.knowledgeUploadSpaceId);
+    uploadedDocument = result.document;
+    // The POST is the durable upload boundary. Refresh independently so a
+    // transient view problem never turns a successful upload into a blocking
+    // error dialog.
+    refreshKnowledgeAfterUpload(uploadSpaceId, uploadedDocument);
   } catch (error) {
-    window.alert(error.message);
+    if (!uploadedDocument) window.alert(error.message || "资料上传失败");
   } finally {
     els.knowledgeFileInput.value = "";
     state.knowledgeUploadSpaceId = "";
@@ -1687,7 +1821,7 @@ els.knowledgeFileInput.addEventListener("change", async () => {
 });
 
 els.knowledgeScopeSelect.addEventListener("change", syncKnowledgeScopeControls);
-els.knowledgeProjectSelect.addEventListener("change", () => renderKnowledge(state.knowledgeDocuments));
+els.knowledgeProjectSelect.addEventListener("change", () => { renderKnowledge(state.knowledgeDocuments); searchKnowledge(); });
 
 function fileAsBase64(file) {
   return new Promise((resolve, reject) => {
