@@ -305,6 +305,8 @@ function knowledgePreviewResource(document) {
     kind: document.file_kind || document.kind || "knowledge",
     previewable: document.previewable !== false,
     preview_url: `/api/knowledge/${id}/preview`,
+    highlight_excerpt: document.excerpt || "",
+    highlight_position: Number(document.position || 0),
   };
 }
 
@@ -1050,7 +1052,7 @@ async function appendSavedConversationRun(wrapper, runId) {
   if (data.artifact && !wrapper.querySelector(".artifact-link")) {
     appendArtifactLink(wrapper, data.artifact);
   }
-  appendKnowledgeSourceLinks(wrapper, data.knowledge_sources || []);
+  bindKnowledgeSourceButtons(wrapper, data.knowledge_sources || []);
   appendChatAnswerFeedback(wrapper, runId, data);
   await appendChatCitationFeedback(wrapper, runId, data);
 }
@@ -1174,9 +1176,16 @@ function renderMessageContent(element, content, role = "assistant") {
       .trim()
       .replace(/^【|】$/g, "")
       .replace(/（片段\s*\d+(?:\s*·\s*摘录：[\s\S]*)?）$/, "");
+    const positionMatch = sourceLabel.match(/（片段\s*(\d+)/);
     source.textContent = sourceLabel;
+    source.dataset.knowledgeFilename = filename;
+    source.dataset.knowledgePosition = String(Math.max(0, Number(positionMatch?.[1] || 1) - 1));
     source.title = `预览本地资料：${filename}`;
     source.addEventListener("click", async () => {
+      if (source._knowledgeSource) {
+        await openKnowledge(source._knowledgeSource);
+        return;
+      }
       const knowledgeDocument = state.knowledgeDocuments.find((item) => item.filename === filename);
       if (knowledgeDocument) {
         await openKnowledge(knowledgeDocument);
@@ -1459,7 +1468,7 @@ async function sendMessage(content, { retry = false } = {}) {
     state.messages.push({ role: "assistant", content: assistantContent, run_id: completedRunId });
     if (completedRunId) {
       const runDetail = await api(`/api/runs/${completedRunId}`);
-      appendKnowledgeSourceLinks(assistant.wrapper, runDetail.knowledge_sources || []);
+      bindKnowledgeSourceButtons(assistant.wrapper, runDetail.knowledge_sources || []);
       appendChatAnswerFeedback(assistant.wrapper, completedRunId, runDetail);
       await appendChatCitationFeedback(assistant.wrapper, completedRunId, runDetail);
     }
@@ -1491,7 +1500,7 @@ function appendConfirmationActions(assistant, confirmation, sourceContent) {
     appendArtifact: appendArtifactLink,
     appendCompletedFeedback: async (wrapper, runId) => {
       const detail = await api(`/api/runs/${runId}`);
-      appendKnowledgeSourceLinks(wrapper, detail.knowledge_sources || []);
+      bindKnowledgeSourceButtons(wrapper, detail.knowledge_sources || []);
       appendChatAnswerFeedback(wrapper, runId, detail);
       await appendChatCitationFeedback(wrapper, runId, detail);
     },
@@ -1543,24 +1552,18 @@ function appendArtifactLink(wrapper, artifact) {
   wrapper.appendChild(link);
 }
 
-function appendKnowledgeSourceLinks(wrapper, sources) {
-  (sources || []).forEach((source) => {
-    const resource = knowledgePreviewResource(source);
-    if (!resource.id || wrapper.querySelector(`[data-knowledge-preview-id="${resource.id}"]`)) return;
-    const link = document.createElement("a");
-    link.className = "artifact-link knowledge-preview-link";
-    link.href = "#";
-    link.dataset.kind = String(resource.kind || "knowledge").toUpperCase();
-    link.dataset.knowledgePreviewId = resource.id;
-    link.textContent = `调用资料：${resource.filename}`;
-    link.title = source.excerpt
-      ? `预览本次回答调用的资料：${source.excerpt}`
-      : "预览本次回答调用的知识库文件";
-    link.addEventListener("click", async (event) => {
-      event.preventDefault();
-      await openKnowledge(resource);
-    });
-    wrapper.appendChild(link);
+function bindKnowledgeSourceButtons(wrapper, sources) {
+  const available = (sources || []).map(knowledgePreviewResource);
+  wrapper.querySelectorAll(".knowledge-source-link").forEach((button) => {
+    const filename = button.dataset.knowledgeFilename || "";
+    const position = Number(button.dataset.knowledgePosition || 0);
+    const source = available.find((item) => item.filename === filename && item.highlight_position === position)
+      || available.find((item) => item.filename === filename);
+    if (!source) return;
+    button._knowledgeSource = source;
+    button.title = source.highlight_excerpt
+      ? `预览并高亮命中片段：${source.highlight_excerpt}`
+      : `预览本地资料：${source.filename}`;
   });
 }
 
@@ -1694,6 +1697,10 @@ executionMode.renderExecutionModeHint();
 
 els.chatInput.addEventListener("input", () => {
   executionMode.scheduleRoutePreview();
+});
+
+els.chatInput.addEventListener("paste", (event) => {
+  if (composer.pastePlainText(event, els)) executionMode.scheduleRoutePreview();
 });
 
 els.chatInput.addEventListener("keydown", (event) => {

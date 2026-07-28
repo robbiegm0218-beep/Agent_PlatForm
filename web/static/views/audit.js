@@ -99,7 +99,7 @@ window.AgentAuditView = {
   },
 
   renderRetrievalDiagnostics(els, data, { onSelectRun, governance } = {}) {
-    const { sample = {}, metrics = {}, reason_counts: reasonCounts = {}, documents = [], policy_feedback: policyFeedback = [], retrieval_policy: policy = {} } = data;
+    const { sample = {}, metrics = {}, auto_route_stages: autoStages = {}, reason_counts: reasonCounts = {}, documents = [], policy_feedback: policyFeedback = [], retrieval_policy: policy = {} } = data;
     const percent = (value) => value == null ? "暂无数据" : `${(value * 100).toFixed(1)}%`;
     const metricLabels = [
       ["检索触发率", metrics.retrieval_trigger_rate, "对话中实际发起知识库检索的比例"],
@@ -121,6 +121,22 @@ window.AgentAuditView = {
       metricGrid.appendChild(item);
     });
     panel.append(metricGrid);
+    const autoTitle = document.createElement("h4"); autoTitle.textContent = "自动资料门控"; panel.append(autoTitle);
+    const autoSummary = document.createElement("p");
+    autoSummary.textContent = `V2 ${autoStages.gate_enabled ? "已启用" : "未启用"}；以下仅统计当前账号使用自动模式的 V2 Run，不包含问题或资料正文。`;
+    panel.append(autoSummary);
+    const autoGrid = document.createElement("div"); autoGrid.className = "diagnostic-metrics";
+    [
+      ["可判定输入", autoStages.decidable_inputs, "V2 已完成明确、隐式候选或无需资料分类的自动模式 Run"],
+      ["执行探测", autoStages.probes_executed, "进入隐式候选本地探测的 Run"],
+      ["拒绝候选", autoStages.candidates_rejected, "有候选但未通过充分性、强锚点或排序置信门禁的 Run"],
+      ["最终注入", autoStages.final_injections, "通过门禁并实际注入资料片段的 Run"],
+    ].forEach(([label, value, description]) => {
+      const item = document.createElement("div"); item.className = "diagnostic-metric"; item.title = description;
+      item.append(Object.assign(document.createElement("span"), { textContent: label }), Object.assign(document.createElement("strong"), { textContent: String(value ?? 0) }));
+      autoGrid.appendChild(item);
+    });
+    panel.append(autoGrid);
     const reasonTitle = document.createElement("h4"); reasonTitle.textContent = "问题原因"; panel.append(reasonTitle);
     const reasons = document.createElement("p");
     const reasonLabels = { wrong_document: "文档不相关", wrong_passage: "片段不相关", outdated: "资料已过期", answer_misused: "回答误用资料", missing_evidence: "缺少应有资料" };

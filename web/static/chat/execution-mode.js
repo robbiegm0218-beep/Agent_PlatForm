@@ -29,7 +29,7 @@ window.AgentExecutionMode = function createExecutionMode({ state, els, api, getC
   function renderExecutionModeHint() {
     syncEvidenceModeControls();
     const fileLabels = { off: "不读取工作区", auto: "按需读取文件", required: "优先读取文件" };
-    const sourceLabels = { general: "智能选择", local_only: "只用知识库", web_only: "只用网络", mixed: "知识库和网络" };
+    const sourceLabels = { general: "自动判断（仅明确相关时读取）", local_only: "只用知识库", web_only: "只用网络", mixed: "知识库和网络" };
     els.executionModeHint.textContent = `${sourceLabels[els.sourceModeSelect.value]} · ${fileLabels[els.fileModeSelect.value]}`;
   }
 

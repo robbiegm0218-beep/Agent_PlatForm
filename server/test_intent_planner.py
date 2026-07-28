@@ -27,6 +27,20 @@ class IntentPlannerTests(unittest.TestCase):
         plan = self.planner.plan("把项目里已有的材料归纳一下", {"needs_knowledge": False})
         self.assertTrue(plan.knowledge_needed)
 
+    def test_v2_plan_preserves_implicit_route_without_making_it_explicit(self):
+        with patch.object(app, "AUTO_KNOWLEDGE_GATE_V2", True):
+            profile = app.infer_task_profile("Acme 新人培训包含哪些阶段")
+            plan = app.plan_intent("Acme 新人培训包含哪些阶段", profile)
+        self.assertFalse(plan["knowledge_needed"])
+        self.assertEqual(plan["knowledge_intent"]["route"], "implicit_candidate")
+
+    def test_v2_planner_local_reference_is_recorded_as_implicit_candidate(self):
+        with patch.object(app, "AUTO_KNOWLEDGE_GATE_V2", True):
+            profile = app.infer_task_profile("总结当前空间里已有资料的风险")
+            plan = app.plan_intent("总结当前空间里已有资料的风险", profile)
+        self.assertTrue(plan["knowledge_needed"])
+        self.assertEqual(plan["knowledge_intent"]["route"], "implicit_candidate")
+
     def test_empty_knowledge_base_keeps_insufficient_trace(self):
         with patch.object(app, "search_knowledge", return_value=[]):
             results, trace = app.retrieve_knowledge_with_fallback("user", "根据公司制度回答报销流程", {"knowledge_needed": True})
@@ -54,3 +68,45 @@ class IntentPlannerTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(trace["retry_query"])
         self.assertEqual(search.call_count, 2)
+
+    def test_retry_candidate_is_not_marked_sufficient_only_because_it_exists(self):
+        weak = [{
+            "document_id": "doc",
+            "filename": "弱匹配.md",
+            "position": 0,
+            "excerpt": "培训资料",
+            "matched_terms": ["培训", "资料"],
+            "score": 1.0,
+        }]
+        with patch.object(app, "search_knowledge", side_effect=[[], weak]):
+            results, trace = app.retrieve_knowledge_with_fallback(
+                "user",
+                "总结公司培训资料",
+                {"knowledge_needed": True},
+            )
+        self.assertEqual(results, weak)
+        self.assertFalse(trace["sufficient"])
+
+    def test_v2_ambiguous_implicit_candidate_is_not_selected(self):
+        intent = {
+            "knowledge_needed": False,
+            "confidence": "medium",
+            "reasons": [],
+            "knowledge_intent": {"route": "implicit_candidate"},
+        }
+        trace = {
+            "sufficient": True,
+            "strong_anchor": True,
+            "rank_confident": False,
+        }
+        with patch.object(app, "AUTO_KNOWLEDGE_GATE_V2", True), patch.object(
+            app,
+            "retrieve_knowledge_with_fallback",
+            return_value=([{"document_id": "doc"}], trace),
+        ):
+            _, references, resolved_trace = app.resolve_knowledge_for_execution(
+                "user", "Acme 指标是多少", intent, "auto",
+            )
+        self.assertEqual(references, [])
+        self.assertEqual(resolved_trace["decision"], "candidate_rejected")
+        self.assertEqual(resolved_trace["reason_code"], "implicit_candidate_ambiguous")

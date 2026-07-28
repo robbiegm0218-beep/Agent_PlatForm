@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent_Platform</title>
-    <link rel="stylesheet" href="/static/styles.css?v=p48-4-4" />
+    <link rel="stylesheet" href="/static/styles.css?v=p50-4-2" />
   </head>
   <body class="booting">
     <main id="app">
@@ -113,10 +113,10 @@
                 <details class="execution-mode-picker">
                   <summary><span>资料与文件</span><span id="executionModeHint" class="execution-mode-hint" aria-live="polite">智能选择</span></summary>
                   <div class="execution-mode-menu">
-                    <p class="config-menu-intro">默认会根据问题决定是否检索知识库、网络或工作区文件；选择某项只是在本次对话中明确限制或优先使用它。</p>
+                    <p class="config-menu-intro">自动模式仅在明确要求资料，或专有名称、文件线索与知识库高度相关时读取；普通写作、计划、代码和闲聊不会主动调用知识库。</p>
                     <label>信息来源
                       <select id="sourceModeSelect" aria-label="选择回答依据">
-                        <option value="general">自动判断</option>
+                        <option value="general">自动判断（仅明确相关时读取）</option>
                         <option value="local_only">只查知识库</option>
                         <option value="web_only">只查网络</option>
                         <option value="mixed">知识库和网络</option>
@@ -357,14 +357,14 @@
     <script src="/static/views/resources.js?v=p48-4-3"></script>
     <script src="/static/views/capabilities.js?v=p48-4-3"></script>
     <script src="/static/views/settings.js?v=p48-4-3"></script>
-    <script src="/static/views/audit.js?v=p48-4-3"></script>
-    <script src="/static/chat/composer.js?v=p48-4-3"></script>
+    <script src="/static/views/audit.js?v=p50-3-1"></script>
+    <script src="/static/chat/composer.js?v=p50-4-1"></script>
     <script src="/static/chat/stream.js?v=p48-4-3"></script>
-    <script src="/static/chat/execution-mode.js?v=p48-4-3"></script>
+    <script src="/static/chat/execution-mode.js?v=p50-3-1"></script>
     <script src="/static/chat/markdown.js?v=p48-4-3"></script>
     <script src="/static/chat/interactions.js?v=p48-4-3"></script>
     <script src="/static/chat/run-trace.js?v=p48-4-3"></script>
-    <script src="/static/chat/artifact-preview.js?v=p48-4-3"></script>
-    <script src="/static/app.js?v=p48-4-3"></script>
+    <script src="/static/chat/artifact-preview.js?v=p50-4-2"></script>
+    <script src="/static/app.js?v=p50-4-2"></script>
   </body>
 </html>

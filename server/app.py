@@ -41,7 +41,13 @@ from server.web_search import WebSearchClient, WebSearchConfig
 from server.mcp_client import McpServerConfig, McpToolManager
 from server.tool_policy import ToolPolicy
 from server.task_router import TaskRouter, classify_knowledge_intent
-from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, query_terms, retrieval_policy_snapshot
+from server.knowledge_retrieval import (
+    assess_candidate_relevance,
+    KnowledgeRetriever,
+    RetrievalConfig,
+    query_terms,
+    retrieval_policy_snapshot,
+)
 from server.retrieval_governance import MIN_FEEDBACK_FOR_SUGGESTION, apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
 from server.evaluate_knowledge_retrieval import DEFAULT_FIXTURE as RETRIEVAL_EVAL_FIXTURE, evaluate as evaluate_retrieval, validate_cases as validate_retrieval_cases
 from server.evaluate_p45_rollout import fixed_report as p45_fixed_report, recommend as recommend_p45_rollout, shadow_report as p45_shadow_report
@@ -134,6 +140,7 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 ARTIFACT_DIR = DATA_DIR / "artifacts"
 ARTIFACT_NODE = resolve_artifact_node()
 HTML_ARTIFACT_PREVIEW_ENABLED = os.environ.get("HTML_ARTIFACT_PREVIEW_ENABLED", "false").lower() in {"1", "true", "yes"}
+AUTO_KNOWLEDGE_GATE_V2 = os.environ.get("AUTO_KNOWLEDGE_GATE_V2", "false").lower() in {"1", "true", "yes"}
 TESSERACT_BINARY = next((candidate for candidate in (os.environ.get("TESSERACT_BINARY", "").strip(), shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -771,7 +778,15 @@ LOCAL_TOOLS = LocalToolRegistry([
     ),
 ])
 TOOL_POLICY = ToolPolicy(LOCAL_TOOLS)
-TASK_ROUTER = TaskRouter(MODEL_CATALOG, DEEPSEEK_MODEL, DEEPSEEK_DEEP_MODEL, TOOL_POLICY.decide)
+TASK_ROUTER = TaskRouter(
+    MODEL_CATALOG,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_DEEP_MODEL,
+    TOOL_POLICY.decide,
+    knowledge_classifier=lambda content: classify_knowledge_intent(
+        content, gate_v2=AUTO_KNOWLEDGE_GATE_V2,
+    ),
+)
 WORKFLOW_RUNNER = LocalWorkflowRunner()
 KNOWLEDGE_RETRIEVER = KnowledgeRetriever()
 STRUCTURED_CONTEXT = StructuredContextBuilder()
@@ -1440,7 +1455,17 @@ def infer_task_profile(content: str, requested_model: str = "auto", requested_ta
 
 
 def plan_intent(content: str, task_profile: dict) -> dict:
-    return INTENT_PLANNER.plan(content, task_profile).as_dict()
+    plan = INTENT_PLANNER.plan(content, task_profile).as_dict()
+    knowledge_intent = dict(task_profile.get("knowledge_intent") or {})
+    route = str(knowledge_intent.get("route", ""))
+    if plan["knowledge_needed"] and route == "none":
+        knowledge_intent = {
+            **knowledge_intent,
+            "route": "implicit_candidate",
+            "reason": "implicit_local_reference",
+        }
+    plan["knowledge_intent"] = knowledge_intent
+    return plan
 
 
 def plan_task_frame(content: str, task_profile: dict, intent_plan: dict, execution_modes: dict, structured_context: dict) -> dict | None:
@@ -1717,18 +1742,24 @@ def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id:
     retriever = KnowledgeRetriever(active_config)
     if limit != retriever.config.limit:
         retriever = KnowledgeRetriever(replace(retriever.config, limit=min(max(limit, 1), 20)))
-    return retriever.search(query, rows)
+    return retriever.search(query, rows, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
 
 
 def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: dict, project_space_id: str = "") -> tuple[list[dict], dict]:
     """Retrieve once, then make at most one explainable lexical retry."""
     primary = search_knowledge(user_id, content, project_space_id=project_space_id)
-    terms = query_terms(content)
-    expected_matches = 1 if len(terms) <= 1 else 2
-    top = primary[0] if primary else None
-    sufficient = bool(top and len(top.get("matched_terms", [])) >= expected_matches and top.get("score", 0) >= 2.0)
-    trace = {"initial_query": content[:300], "initial_matches": len(primary), "sufficient": sufficient, "retry_query": "", "retry_matches": 0}
-    if sufficient or not intent_plan.get("knowledge_needed"):
+    terms = query_terms(content, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
+    assessment = assess_candidate_relevance(
+        content, primary, gate_v2=AUTO_KNOWLEDGE_GATE_V2,
+    )
+    trace = {
+        "initial_query": content[:300],
+        "initial_matches": len(primary),
+        **assessment,
+        "retry_query": "",
+        "retry_matches": 0,
+    }
+    if assessment["sufficient"] or not intent_plan.get("knowledge_needed"):
         return primary, trace
     retry_query = " ".join(terms[:8]).strip()
     if not retry_query or retry_query == content:
@@ -1741,8 +1772,16 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
         if key not in seen:
             seen.add(key)
             merged.append(reference)
-    trace.update({"retry_query": retry_query, "retry_matches": len(retry), "sufficient": bool(merged)})
-    return merged[:4], trace
+    merged = merged[:4]
+    assessment = assess_candidate_relevance(
+        content, merged, gate_v2=AUTO_KNOWLEDGE_GATE_V2,
+    )
+    trace.update({
+        "retry_query": retry_query,
+        "retry_matches": len(retry),
+        **assessment,
+    })
+    return merged, trace
 
 
 def resolve_knowledge_for_execution(user_id: str, content: str, intent_plan: dict,
@@ -1759,7 +1798,78 @@ def resolve_knowledge_for_execution(user_id: str, content: str, intent_plan: dic
         knowledge_mode == "auto" and bool(intent_plan.get("knowledge_needed"))
     )
     if knowledge_mode == "off":
-        return intent_plan, [], {"automatic_probe": False, "selected": False}
+        return intent_plan, [], {
+            "automatic_probe": False,
+            "selected": False,
+            "decision": "probe_skipped",
+            "reason_code": "knowledge_mode_off",
+        }
+    if AUTO_KNOWLEDGE_GATE_V2:
+        knowledge_intent = intent_plan.get("knowledge_intent") or {}
+        intent_route = str(knowledge_intent.get("route") or (
+            "explicit" if intent_plan.get("knowledge_needed") else "none"
+        ))
+        if knowledge_mode == "required" or intent_route == "explicit":
+            references, trace = retrieve_knowledge_with_fallback(
+                user_id, content, {**intent_plan, "knowledge_needed": True}, project_space_id,
+            )
+            trace.update({
+                "automatic_probe": False,
+                "selected": bool(references),
+                "decision": "required_retrieval" if knowledge_mode == "required" else "explicit_retrieval",
+                "reason_code": "knowledge_mode_required" if knowledge_mode == "required" else "explicit_local_source",
+                "intent_route": intent_route,
+                "gate_version": "v2",
+            })
+            return intent_plan, references, trace
+        if knowledge_mode != "auto" or intent_route != "implicit_candidate":
+            return intent_plan, [], {
+                "automatic_probe": False,
+                "selected": False,
+                "decision": "probe_skipped",
+                "reason_code": "intent_not_knowledge",
+                "intent_route": intent_route,
+                "gate_version": "v2",
+            }
+        probe_plan = {**intent_plan, "knowledge_needed": True}
+        references, trace = retrieve_knowledge_with_fallback(
+            user_id, content, probe_plan, project_space_id,
+        )
+        selected = bool(
+            references
+            and trace.get("sufficient")
+            and trace.get("strong_anchor")
+            and trace.get("rank_confident")
+        )
+        if not references:
+            reason_code = "implicit_candidate_no_match"
+        elif not trace.get("sufficient"):
+            reason_code = "implicit_candidate_insufficient"
+        elif not trace.get("strong_anchor"):
+            reason_code = "implicit_candidate_weak_anchor"
+        elif not trace.get("rank_confident"):
+            reason_code = "implicit_candidate_ambiguous"
+        else:
+            reason_code = "implicit_candidate_selected"
+        trace.update({
+            "automatic_probe": True,
+            "selected": selected,
+            "decision": "selected" if selected else "candidate_rejected",
+            "reason_code": reason_code,
+            "intent_route": intent_route,
+            "gate_version": "v2",
+        })
+        if not selected:
+            return intent_plan, [], trace
+        reasons = list(intent_plan.get("reasons", []))
+        reasons.append("隐式资料候选命中本地资料")
+        return {
+            **intent_plan,
+            "knowledge_needed": True,
+            "confidence": "medium",
+            "reasons": reasons,
+            "automatic_probe": True,
+        }, references, trace
     if explicit:
         references, trace = retrieve_knowledge_with_fallback(user_id, content, intent_plan, project_space_id)
         trace.update({"automatic_probe": False, "selected": bool(references)})
@@ -3426,9 +3536,33 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
         total_runs = len(runs)
         retrieval_attempted = evidence_found = no_evidence = 0
+        auto_route_stages = {
+            "scope": "auto_v2_metadata_only",
+            "gate_enabled": AUTO_KNOWLEDGE_GATE_V2,
+            "decidable_inputs": 0,
+            "probes_executed": 0,
+            "candidates_rejected": 0,
+            "final_injections": 0,
+        }
         reference_context: dict[str, dict] = {}
         for row in runs:
             context = safe_json_object(row["execution_context"])
+            trace = context.get("retrieval_trace") or {}
+            modes = context.get("execution_modes") or {}
+            trace = trace if isinstance(trace, dict) else {}
+            modes = modes if isinstance(modes, dict) else {}
+            if (
+                modes.get("knowledge") == "auto"
+                and trace.get("gate_version") == "v2"
+                and trace.get("intent_route") in {"explicit", "implicit_candidate", "none"}
+            ):
+                auto_route_stages["decidable_inputs"] += 1
+                if trace.get("automatic_probe"):
+                    auto_route_stages["probes_executed"] += 1
+                if trace.get("decision") == "candidate_rejected":
+                    auto_route_stages["candidates_rejected"] += 1
+                if trace.get("selected") and context.get("knowledge_refs"):
+                    auto_route_stages["final_injections"] += 1
             route = str(context.get("knowledge_route", "not_needed"))
             if route in {"retrieved", "required_no_match", "insufficient"}:
                 retrieval_attempted += 1
@@ -3480,6 +3614,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "answer_citation_accuracy": round(sum(row["citation_correct"] == 1 for row in run_feedback) / len(run_feedback), 4) if run_feedback else None,
                 "missing_evidence_rate": round(reason_counts.get("missing_evidence", 0) / document_feedback_count, 4) if document_feedback_count else None,
             },
+            "auto_route_stages": auto_route_stages,
             "reason_counts": reason_counts,
             "documents": document_rows,
             "policy_feedback": [{

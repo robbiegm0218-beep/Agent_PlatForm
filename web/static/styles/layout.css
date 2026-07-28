@@ -292,6 +292,15 @@
   font-size: 14px;
 }
 
+.artifact-preview-surface .knowledge-hit-highlight {
+  margin-inline: -8px;
+  padding-inline: 8px;
+  border-radius: 5px;
+  outline: 2px solid #e2b93b;
+  background: #fff1a8;
+  box-shadow: 0 0 0 4px rgba(226, 185, 59, 0.14);
+}
+
 .artifact-preview-surface .image-document img {
   display: block;
   max-width: 100%;

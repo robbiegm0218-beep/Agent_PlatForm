@@ -23,6 +23,30 @@ window.AgentChatComposer = {
     selection.addRange(range);
   },
 
+  pastePlainText(event, els) {
+    const text = event.clipboardData?.getData("text/plain");
+    if (typeof text !== "string") return false;
+    event.preventDefault();
+
+    const normalized = text.replace(/\r\n?/g, "\n");
+    const selection = window.getSelection();
+    if (!selection.rangeCount || !els.chatInput.contains(selection.getRangeAt(0).commonAncestorContainer)) {
+      els.chatInput.appendChild(document.createTextNode(normalized));
+      this.focus(els);
+      return true;
+    }
+
+    const range = selection.getRangeAt(0);
+    range.deleteContents();
+    const textNode = document.createTextNode(normalized);
+    range.insertNode(textNode);
+    range.setStartAfter(textNode);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  },
+
   renderSkills(state, els) {
     const prompt = this.getPromptText(els);
     const selected = state.skills.filter((skill) => state.selectedSkillIds.includes(skill.id) && skill.enabled);

@@ -1326,16 +1326,196 @@ class AgentPlatformApiTests(unittest.TestCase):
 
     def test_auto_knowledge_mode_probes_and_uses_a_real_local_match(self):
         payload = {
-            "filename": "研究院说明.md", "mime_type": "text/markdown",
+            "filename": "易碳研究院报告.md", "mime_type": "text/markdown",
             "content_base64": base64.b64encode("易碳研究院的核心成员包括研究员、市拓人员和知识文档支持角色。".encode("utf-8")).decode("ascii"),
         }
         self.request_json("/api/knowledge", payload, self.token)
-        preview = self.request_json("/api/route-preview", {"content": "易碳研究院的核心成员包括哪些？", "knowledge_mode": "auto"}, self.token)
+        preview = self.request_json("/api/route-preview", {"content": "易碳研究院报告包含哪些核心成员？", "knowledge_mode": "auto"}, self.token)
         self.assertTrue(preview["intent_plan"]["knowledge_needed"])
         self.assertTrue(preview["intent_plan"]["automatic_probe"])
         self.assertTrue(preview["retrieval_trace"]["automatic_probe"])
         self.assertTrue(preview["retrieval_trace"]["selected"])
         self.assertGreater(preview["knowledge_matches"], 0)
+
+    def test_v2_auto_knowledge_gate_preserves_modes_and_skips_general_tasks(self):
+        payload = {
+            "filename": "Acme新人培训手册.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(
+                "Acme 新人培训包含账号准备、产品学习和结业复盘。项目计划包含执行步骤和页面交付。".encode("utf-8")
+            ).decode("ascii"),
+        }
+        self.request_json("/api/knowledge", payload, self.token)
+        original_gate = app.AUTO_KNOWLEDGE_GATE_V2
+        app.AUTO_KNOWLEDGE_GATE_V2 = True
+        try:
+            general = self.request_json("/api/route-preview", {
+                "content": "请制定一个减重十斤的可执行项目计划",
+                "knowledge_mode": "auto",
+            }, self.token)
+            self.assertFalse(general["intent_plan"]["knowledge_needed"])
+            self.assertFalse(general["retrieval_trace"]["automatic_probe"])
+            self.assertFalse(general["retrieval_trace"]["selected"])
+            self.assertEqual(general["retrieval_trace"]["reason_code"], "intent_not_knowledge")
+            self.assertEqual(general["knowledge_matches"], 0)
+
+            explicit = self.request_json("/api/route-preview", {
+                "content": "请根据上传资料总结 Acme 新人培训流程",
+                "knowledge_mode": "auto",
+            }, self.token)
+            self.assertTrue(explicit["intent_plan"]["knowledge_needed"])
+            self.assertFalse(explicit["retrieval_trace"]["automatic_probe"])
+            self.assertTrue(explicit["retrieval_trace"]["selected"])
+            self.assertEqual(explicit["retrieval_trace"]["decision"], "explicit_retrieval")
+
+            implicit = self.request_json("/api/route-preview", {
+                "content": "Acme 新人培训包含哪些阶段",
+                "knowledge_mode": "auto",
+            }, self.token)
+            self.assertTrue(implicit["intent_plan"]["knowledge_needed"])
+            self.assertTrue(implicit["retrieval_trace"]["automatic_probe"])
+            self.assertTrue(implicit["retrieval_trace"]["selected"])
+            self.assertEqual(implicit["retrieval_trace"]["intent_route"], "implicit_candidate")
+
+            disabled = self.request_json("/api/route-preview", {
+                "content": "请根据上传资料总结 Acme 新人培训流程",
+                "knowledge_mode": "off",
+            }, self.token)
+            self.assertFalse(disabled["retrieval_trace"]["selected"])
+            self.assertEqual(disabled["retrieval_trace"]["reason_code"], "knowledge_mode_off")
+
+            required = self.request_json("/api/route-preview", {
+                "content": "Acme 新人培训包含哪些阶段",
+                "knowledge_mode": "required",
+            }, self.token)
+            self.assertTrue(required["retrieval_trace"]["selected"])
+            self.assertEqual(required["retrieval_trace"]["decision"], "required_retrieval")
+        finally:
+            app.AUTO_KNOWLEDGE_GATE_V2 = original_gate
+
+    def test_v2_implicit_candidate_requires_a_matching_named_anchor(self):
+        payload = {
+            "filename": "客户培训资料.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(
+                "客户培训包含产品介绍和结业复盘两个阶段。".encode("utf-8")
+            ).decode("ascii"),
+        }
+        self.request_json("/api/knowledge", payload, self.token)
+        original_gate = app.AUTO_KNOWLEDGE_GATE_V2
+        app.AUTO_KNOWLEDGE_GATE_V2 = True
+        try:
+            implicit = self.request_json("/api/route-preview", {
+                "content": "Beta 客户培训方案包含哪些阶段",
+                "knowledge_mode": "auto",
+            }, self.token)
+            self.assertTrue(implicit["retrieval_trace"]["automatic_probe"])
+            self.assertGreater(implicit["retrieval_trace"]["initial_matches"], 0)
+            self.assertTrue(implicit["retrieval_trace"]["sufficient"])
+            self.assertFalse(implicit["retrieval_trace"]["strong_anchor"])
+            self.assertEqual(
+                implicit["retrieval_trace"]["unmatched_named_anchor_count"],
+                1,
+            )
+            self.assertFalse(implicit["retrieval_trace"]["selected"])
+            self.assertEqual(implicit["retrieval_trace"]["decision"], "candidate_rejected")
+            self.assertEqual(
+                implicit["retrieval_trace"]["reason_code"],
+                "implicit_candidate_weak_anchor",
+            )
+            self.assertEqual(implicit["knowledge_matches"], 0)
+
+            required = self.request_json("/api/route-preview", {
+                "content": "Beta 客户培训方案包含哪些阶段",
+                "knowledge_mode": "required",
+            }, self.token)
+            self.assertGreater(required["retrieval_trace"]["initial_matches"], 0)
+            self.assertFalse(required["retrieval_trace"]["strong_anchor"])
+            self.assertTrue(required["retrieval_trace"]["selected"])
+            self.assertEqual(required["retrieval_trace"]["decision"], "required_retrieval")
+        finally:
+            app.AUTO_KNOWLEDGE_GATE_V2 = original_gate
+
+    def test_retrieval_diagnostics_exposes_content_free_v2_funnel_counts(self):
+        thread = self.request_json(
+            "/api/threads",
+            {"title": "V2 门控诊断"},
+            self.token,
+        )["thread"]
+        contexts = [
+            {
+                "execution_modes": {"knowledge": "auto"},
+                "knowledge_refs": [],
+                "knowledge_route": "not_needed",
+                "retrieval_trace": {
+                    "gate_version": "v2", "intent_route": "none",
+                    "automatic_probe": False, "decision": "probe_skipped", "selected": False,
+                },
+            },
+            {
+                "execution_modes": {"knowledge": "auto"},
+                "knowledge_refs": [],
+                "knowledge_route": "not_needed",
+                "retrieval_trace": {
+                    "gate_version": "v2", "intent_route": "implicit_candidate",
+                    "automatic_probe": True, "decision": "candidate_rejected", "selected": False,
+                },
+            },
+            {
+                "execution_modes": {"knowledge": "auto"},
+                "knowledge_refs": [{"document_id": "private-doc-a", "filename": "不得出现在诊断中.md"}],
+                "knowledge_route": "retrieved",
+                "retrieval_trace": {
+                    "gate_version": "v2", "intent_route": "implicit_candidate",
+                    "automatic_probe": True, "decision": "selected", "selected": True,
+                },
+            },
+            {
+                "execution_modes": {"knowledge": "auto"},
+                "knowledge_refs": [{"document_id": "private-doc-b", "filename": "同样不得展示.md"}],
+                "knowledge_route": "retrieved",
+                "retrieval_trace": {
+                    "gate_version": "v2", "intent_route": "explicit",
+                    "automatic_probe": False, "decision": "explicit_retrieval", "selected": True,
+                },
+            },
+            {
+                "execution_modes": {"knowledge": "required"},
+                "knowledge_refs": [{"document_id": "private-doc-c", "filename": "required不计入.md"}],
+                "knowledge_route": "retrieved",
+                "retrieval_trace": {
+                    "gate_version": "v2", "intent_route": "implicit_candidate",
+                    "automatic_probe": False, "decision": "required_retrieval", "selected": True,
+                },
+            },
+        ]
+        with app.db() as conn:
+            for index, context in enumerate(contexts):
+                conn.execute(
+                    """INSERT INTO runs
+                    (id, thread_id, status, model, started_at, completed_at, execution_context)
+                    VALUES (?, ?, 'completed', 'test', ?, ?, ?)""",
+                    (
+                        f"diagnostic_v2_{index}",
+                        thread["id"],
+                        app.now() + index,
+                        app.now() + index + 1,
+                        json.dumps(context, ensure_ascii=False),
+                    ),
+                )
+        diagnostics = self.request_json("/api/retrieval-diagnostics", token=self.token)
+        self.assertEqual(diagnostics["auto_route_stages"], {
+            "scope": "auto_v2_metadata_only",
+            "gate_enabled": app.AUTO_KNOWLEDGE_GATE_V2,
+            "decidable_inputs": 4,
+            "probes_executed": 2,
+            "candidates_rejected": 1,
+            "final_injections": 2,
+        })
+        rendered = json.dumps(diagnostics, ensure_ascii=False)
+        self.assertNotIn("不得出现在诊断中", rendered)
+        self.assertNotIn("同样不得展示", rendered)
+        self.assertNotIn("required不计入", rendered)
 
     def test_task_router_keeps_structured_short_tasks_out_of_quick_mode(self):
         self.assertEqual(app.infer_task_profile("请改写这段通知")["task_tier"], "standard")
@@ -1468,7 +1648,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         results = self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"]
         self.assertEqual(results[0]["filename"], "product.md")
 
-        events = self.chat({"thread_id": "", "content": "请说明北极星指标"})
+        events = self.chat({"thread_id": "", "content": "请根据知识库说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
         self.assertIn("参考资料：【product.md（片段 1）】", answer)
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")

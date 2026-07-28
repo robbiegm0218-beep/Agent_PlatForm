@@ -8,22 +8,22 @@
 
 | 面向用户的能力 | 底层保障 |
 | --- | --- |
-| 空间、任务、对话历史与 Markdown 回答渲染 | 空间可独立展开、排序，并在统一概览中查看关联任务、产物、知识库/网页来源和成员；任务可按空间归属或独立存在；空间成员支持本地邀请与移除（所有者受保护）；SQLite 持久化、PBKDF2-SHA256 密码散列、会话过期与按用户限流 |
+| 空间、任务、对话历史与 Markdown 回答渲染 | 空间可独立展开、排序，并在统一概览中查看关联任务、产物、知识库/网页来源和成员；任务可按空间归属或独立存在；空间成员支持本地邀请与移除（所有者受保护）；对话输入粘贴时只保留纯文本，避免外部标题、字号和间距撑高输入框；SQLite 持久化、PBKDF2-SHA256 密码散列、会话过期与按用户限流 |
 | DeepSeek 默认模型与 OpenAI 兼容供应商接入、快速/标准/深度任务档位 | Provider 注册表、环境变量密钥隔离、确定性模型/工具路由、有限步 Agent Loop |
-| Markdown、TXT、Word、PDF、Excel（XLSX）和图片知识库上传、检索与引用 | 仅注入命中片段；PDF 保留页码、Excel 保留工作表/单元格来源；PNG/JPG/WebP/TIFF 通过本机 Tesseract OCR 解析，不上传外部服务；资料按用户隔离，可删除 |
+| Markdown、TXT、Word、PDF、Excel（XLSX）和图片知识库上传、检索与引用 | 自动模式采用意图门控和强相关门禁，仅注入命中片段；PDF 保留页码、Excel 保留工作表/单元格来源；PNG/JPG/WebP/TIFF 通过本机 Tesseract OCR 解析，不上传外部服务；资料按用户或项目空间权限隔离，可删除 |
 | JSON、Markdown、标准 Agent Skill ZIP 技能包管理 | 版本归档、启用/停用与回滚；ZIP 资源受限保存，脚本不会执行 |
-| Markdown、静态 HTML、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；“上面/上文内容生成文件”会复用上一条 Agent 回答作为文件正文；HTML 由可信模板生成并在 sandboxed iframe 中预览；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
+| Markdown、静态 HTML、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；“上面/上文内容生成文件”会复用上一条 Agent 回答作为文件正文；HTML 由可信模板生成并在隔离的 Shadow DOM 中渲染；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
 | 运行详情、步骤、工具调用与取消 | Run 状态机、事件序号和版本、全局审计筛选；回答可评价“有帮助/没帮助”并记录原因；资料引用可逐文档评价准确性 |
 | 平台状态、工作区文件名检索、可选网页检索 | 可解释的工具意图路由；优先 Tavily MCP、失败回退 REST；应用页可按 Schema 填参执行已注册的只读工具，失败可重试且保留安全审计摘要 |
 
 ## 文件预览
 
-对话中的「预览文件」和「调用资料」均可点击打开统一的右侧预览面板；项目空间中的共享对话也遵循相同权限与体验。打开预览后，左侧保留当前对话或资源列表，右侧展示文件内容；关闭或切换到技能、应用、设置等页面时会自动恢复全宽布局。
+对话中的「预览文件」和「本地资料命中」片段按钮均可点击打开统一的右侧预览面板；知识库引用只展示一组片段按钮，不再重复显示“调用资料”卡片。点击命中片段后，预览会按本次 Run 保存的摘录定位、高亮对应段落并滚动到可视区域；无法精确定位时仍正常打开文件。项目空间中的共享对话也遵循相同权限与体验。打开预览后，左侧保留当前对话或资源列表，右侧展示文件内容；关闭或切换到技能、应用、设置等页面时会自动恢复全宽布局。
 
 | 来源 | 可预览格式 | 预览方式 |
 | --- | --- | --- |
-| Agent 产物 | Markdown、HTML、Excel（XLSX）、JSON | HTML 在受限 iframe 中直接渲染；Markdown/JSON 显示格式化内容；Excel 展示工作表与单元格文本 |
-| 知识库 | Markdown、TXT、Word（DOCX）、PDF、Excel（XLSX）、PNG/JPG/WebP/TIFF 图片 | 文档显示提取文本与来源信息；图片直接展示；Excel 展示工作表与单元格文本 |
+| Agent 产物 | Markdown、HTML、Excel（XLSX）、JSON | HTML 经安全清理后在隔离的 Shadow DOM 中直接渲染；Markdown/JSON 显示格式化内容；Excel 展示工作表与单元格文本 |
+| 知识库 | Markdown、TXT、Word（DOCX）、PDF、Excel（XLSX）、PNG/JPG/WebP/TIFF 图片 | 文档显示提取文本与来源信息；从对话引用进入时高亮本次命中片段；图片直接展示；Excel 展示工作表与单元格文本 |
 | 产物中心与知识库页面 | 与上述格式一致 | 复用同一个右侧预览面板，并保留下载入口 |
 
 所有预览读取均经过已有的用户/项目空间权限校验；项目成员只能访问其所属空间中关联对话、资料与产物。
@@ -112,6 +112,7 @@ AGENT_PLANNER_MODE="off"       # off | shadow | active
 AGENT_EVIDENCE_MODE="off"      # off | shadow | active
 AGENT_ORCHESTRATOR_MODE="off"  # off | shadow | active
 AGENT_VERIFIER_MODE="off"      # off | shadow | active
+AUTO_KNOWLEDGE_GATE_V2="false" # 高精度自动知识库门控；完成 P50 固定评测后再开启
 ```
 
 | 变量 | 作用 | 默认值 |
@@ -260,6 +261,7 @@ python3 -m server.startup_checks --create-directories
 | `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
 | `MAX_SKILL_PACKAGE_BYTES` | 单个技能 ZIP 的压缩包与解压后总大小上限 | `307200`（300 KB） |
 | `HTML_ARTIFACT_PREVIEW_ENABLED` | 启用静态 HTML 生成及 HTML/Markdown 右侧安全预览 | `false` |
+| `AUTO_KNOWLEDGE_GATE_V2` | 启用高精度自动知识库门控；普通写作/计划/代码任务不探测，隐式候选需通过强相关门禁 | `false` |
 | `MAX_KNOWLEDGE_UPLOAD_BYTES` | 单个知识文件原始字节上限 | `8388608`（8 MB） |
 | `MAX_KNOWLEDGE_ARCHIVE_FILES` / `MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES` | DOCX/XLSX 的条目数与展开后大小上限 | `256` / `33554432`（32 MB） |
 | `MAX_KNOWLEDGE_EXTRACTED_CHARS` / `MAX_KNOWLEDGE_PDF_PAGES` | 知识解析文本量与 PDF 页数上限 | `200000` / `200` |
@@ -280,7 +282,7 @@ Docker 不维护另一套代码：`docker compose up -d --build` 会将当前工
 - Docker Compose：`docker compose up -d --build`，使用命名卷 `agent-platform-data` 中的 `/data`。
 - 两种运行方式不要同时绑定同一端口。修改代码后，选择当前使用的一种方式重启即可；Docker 使用前者命令重建，直接本地运行则重启脚本启动的服务。
 
-知识库的“自动”模式会先做受限的本地命中探测，实际命中才把资料片段注入模型；项目资料在对话中按当前项目空间检索，在知识库页面可选择指定项目或“全部项目”（仅限当前账号有权限访问的项目）。
+知识库的“自动”模式在 `AUTO_KNOWLEDGE_GATE_V2=true` 时采用精度优先门控：明确要求知识库/附件时直接检索；包含产品名、文件名或项目资料指代的隐式需求，只有在候选同时满足充分性、强锚点与排序置信度时才注入；普通写作、计划、代码、翻译和闲聊不会主动探测。关闭该开关会回退原有自动探测行为。项目资料始终按当前项目空间权限检索；知识库页面可选择指定项目或“全部项目”（仅限当前账号有权限访问的项目）。
 
 ### 检索反馈与策略发布
 

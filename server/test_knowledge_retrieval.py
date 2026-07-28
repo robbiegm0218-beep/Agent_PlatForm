@@ -1,6 +1,11 @@
 import unittest
 
-from server.knowledge_retrieval import KnowledgeRetriever, RetrievalConfig, retrieval_policy_snapshot
+from server.knowledge_retrieval import (
+    KnowledgeRetriever,
+    RetrievalConfig,
+    assess_candidate_relevance,
+    retrieval_policy_snapshot,
+)
 from server.retrieval_governance import suggestions_for_feedback
 
 
@@ -48,6 +53,48 @@ class KnowledgeRetrieverTests(unittest.TestCase):
     def test_unrelated_query_returns_no_results(self):
         rows = [row("a", "d1", "材料.md", 0, "产品碳足迹与功能单位。")]
         self.assertEqual(KnowledgeRetriever().search("员工考勤制度", rows), [])
+
+    def test_v2_returns_explainable_match_and_ranking_signals(self):
+        rows = [
+            row("a", "d1", "Acme新人培训手册.md", 0, "Acme 新人培训包含账号准备和结业复盘两个阶段。"),
+            row("b", "d2", "通用培训.md", 0, "新人培训需要安排导师。"),
+        ]
+        results = KnowledgeRetriever().search(
+            "Acme 新人培训包含哪些阶段",
+            rows,
+            gate_v2=True,
+        )
+        self.assertTrue(results)
+        self.assertIn("match_signals", results[0])
+        self.assertIn("ranking_signals", results[0])
+        assessment = assess_candidate_relevance(
+            "Acme 新人培训包含哪些阶段",
+            results,
+            gate_v2=True,
+        )
+        self.assertTrue(assessment["sufficient"])
+        self.assertTrue(assessment["strong_anchor"])
+        self.assertTrue(assessment["rank_confident"])
+        self.assertEqual(assessment["unmatched_named_anchor_count"], 0)
+
+    def test_v2_rejects_candidate_when_named_anchor_is_missing(self):
+        rows = [
+            row("a", "d1", "客户培训资料.md", 0, "客户培训包含产品介绍和结业复盘两个阶段。"),
+        ]
+        results = KnowledgeRetriever().search(
+            "Beta 客户培训方案包含哪些阶段",
+            rows,
+            gate_v2=True,
+        )
+        self.assertTrue(results)
+        assessment = assess_candidate_relevance(
+            "Beta 客户培训方案包含哪些阶段",
+            results,
+            gate_v2=True,
+        )
+        self.assertTrue(assessment["sufficient"])
+        self.assertFalse(assessment["strong_anchor"])
+        self.assertEqual(assessment["unmatched_named_anchor_count"], 1)
 
     def test_policy_snapshot_records_active_retrieval_settings(self):
         snapshot = retrieval_policy_snapshot(RetrievalConfig(limit=2, neighbor_radius=0))

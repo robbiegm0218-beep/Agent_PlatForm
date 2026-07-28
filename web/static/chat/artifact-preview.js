@@ -7,6 +7,41 @@ window.AgentArtifactPreview = {
     }
   },
 
+  highlightExcerpt(root, artifact) {
+    const excerpt = String(artifact.highlight_excerpt || "").trim();
+    if (!excerpt || !root) return 0;
+    const normalize = (value) => String(value || "")
+      .replace(/^[\s#>*+\-\d.)、]+/gm, "")
+      .replace(/[*_`~[\]]/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+    const lines = excerpt
+      .split(/\n+/)
+      .map(normalize)
+      .filter((line) => line.length >= 4);
+    const whole = normalize(excerpt);
+    const elements = [...root.querySelectorAll("p, li, h1, h2, h3, h4, pre, td, th")];
+    let matches = elements.filter((element) => {
+      const text = normalize(element.textContent);
+      if (text.length < 4) return false;
+      return lines.some((line) => text.includes(line) || line.includes(text));
+    });
+    if (!matches.length && whole) {
+      matches = elements.filter((element) => {
+        const text = normalize(element.textContent);
+        const probe = text.length <= whole.length ? text : whole;
+        return probe.length >= 8 && (text.includes(probe) || whole.includes(probe));
+      });
+    }
+    matches = matches.slice(0, 8);
+    matches.forEach((element) => {
+      element.classList.add("knowledge-hit-highlight");
+      element.dataset.knowledgeHit = "true";
+    });
+    matches[0]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    return matches.length;
+  },
+
   showContext(state, els) {
     state.artifactPreviewOpen = false;
     this.clearSurface(els);
@@ -83,6 +118,10 @@ window.AgentArtifactPreview = {
         // Non-HTML files use the platform's fixed document template.
         els.artifactPreviewSurface.replaceChildren(previewFragment);
       }
+      const previewRoot = htmlDocumentMode
+        ? els.artifactPreviewSurface.shadowRoot
+        : els.artifactPreviewSurface;
+      this.highlightExcerpt(previewRoot, artifact);
       els.artifactPreviewNotice.textContent = "";
     } catch (error) {
       els.artifactPreviewNotice.textContent = error.message || "文件预览失败";

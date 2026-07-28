@@ -21,6 +21,14 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         self.assertEqual(report["no_match_accuracy"], 1.0)
         self.assertEqual(report["neighbor_accuracy"], 1.0)
 
+    def test_v2_query_filtering_keeps_the_fixed_retrieval_gate(self):
+        report = evaluate(self.cases, gate_v2=True)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["recall_at_4"], 1.0)
+        self.assertEqual(report["top1_accuracy"], 1.0)
+        self.assertEqual(report["no_match_accuracy"], 1.0)
+        self.assertEqual(report["neighbor_accuracy"], 1.0)
+
     def test_validation_rejects_duplicate_ids(self):
         cases = self.cases + [dict(self.cases[0])]
         with self.assertRaisesRegex(ValueError, "重复"):

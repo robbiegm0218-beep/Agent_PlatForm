@@ -56,7 +56,11 @@ def validate_cases(cases: object) -> list[dict]:
     return cases
 
 
-def evaluate(cases: list[dict], retriever: KnowledgeRetriever | None = None) -> dict:
+def evaluate(
+    cases: list[dict],
+    retriever: KnowledgeRetriever | None = None,
+    gate_v2: bool = False,
+) -> dict:
     retriever = retriever or KnowledgeRetriever()
     failures = []
     relevant_total = 0
@@ -71,7 +75,11 @@ def evaluate(cases: list[dict], retriever: KnowledgeRetriever | None = None) -> 
     legacy_top1 = 0
 
     for case in cases:
-        results = retriever.search(case["query"], case["documents"])
+        results = retriever.search(
+            case["query"],
+            case["documents"],
+            gate_v2=gate_v2,
+        )
         actual_ids = _unique([item["document_id"] for item in results])[:4]
         expected_ids = case["expected_document_ids"]
         legacy_ids = legacy_document_ids(case["query"], case["documents"])
@@ -124,9 +132,10 @@ def evaluate(cases: list[dict], retriever: KnowledgeRetriever | None = None) -> 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", nargs="?", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument("--gate-v2", action="store_true")
     args = parser.parse_args()
     cases = validate_cases(json.loads(args.fixture.read_text(encoding="utf-8")))
-    report = evaluate(cases)
+    report = evaluate(cases, gate_v2=args.gate_v2)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 1 if report["failures"] else 0
 

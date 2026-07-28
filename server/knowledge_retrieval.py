@@ -15,6 +15,10 @@ _QUERY_NOISE = (
     "是什么", "什么是", "如何", "怎么", "哪些", "一下",
 )
 
+_V2_QUERY_NOISE = (
+    "制定", "生成", "执行", "项目", "计划", "方案", "页面", "分析", "内容",
+)
+
 RETRIEVAL_POLICY_VERSION = "lexical-retrieval-v1"
 
 
@@ -22,9 +26,9 @@ def normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.lower())
 
 
-def query_terms(query: str) -> list[str]:
+def query_terms(query: str, gate_v2: bool = False) -> list[str]:
     cleaned = query.lower()
-    for marker in _QUERY_NOISE:
+    for marker in (*_QUERY_NOISE, *(_V2_QUERY_NOISE if gate_v2 else ())):
         cleaned = cleaned.replace(marker, " ")
     english = re.findall(r"[a-z0-9_]{2,}", cleaned)
     chinese_runs = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
@@ -34,6 +38,94 @@ def query_terms(query: str) -> list[str]:
             chinese.append(run)
         chinese.extend(run[index:index + 2] for index in range(len(run) - 1))
     return list(dict.fromkeys(english + chinese))[:32]
+
+
+def named_query_anchors(query: str) -> list[str]:
+    """Return explicit ASCII names whose absence should weaken a candidate."""
+    return list(dict.fromkeys(
+        token.lower()
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", query)
+    ))[:8]
+
+
+def assess_candidate_relevance(
+    query: str,
+    references: list[dict],
+    gate_v2: bool = False,
+) -> dict:
+    """Return content-free, explainable relevance gates for the top candidate."""
+    terms = query_terms(query, gate_v2=gate_v2)
+    expected_matches = 1 if len(terms) <= 1 else 2
+    top = references[0] if references else None
+    if not top:
+        return {
+            "sufficient": False,
+            "strong_anchor": False,
+            "rank_confident": False,
+            "top1_score": None,
+            "top1_top2_gap": None,
+            "coverage_ratio": 0.0,
+            "filename_match_count": 0,
+            "rare_match_count": 0,
+            "unmatched_named_anchor_count": 0,
+        }
+
+    signals = top.get("match_signals") or {}
+    matched_terms = list(top.get("matched_terms") or [])
+    filename_terms = list(signals.get("filename_terms") or [])
+    rare_terms = list(signals.get("rare_terms") or [])
+    coverage_ratio = float(signals.get("coverage_ratio") or 0.0)
+    score = float(top.get("score") or 0.0)
+    second_document = next(
+        (
+            item for item in references[1:]
+            if item.get("document_id") != top.get("document_id")
+        ),
+        None,
+    )
+    gap = (
+        score - float(second_document.get("score") or 0.0)
+        if second_document is not None
+        else None
+    )
+    named_anchors = named_query_anchors(query)
+    normalized_candidate = normalize_text(
+        f"{top.get('filename', '')} {top.get('excerpt', '')}"
+    )
+    unmatched_named_anchors = [
+        anchor for anchor in named_anchors if anchor not in normalized_candidate
+    ]
+    informative_rare_terms = [
+        term for term in rare_terms
+        if len(term) >= 3
+    ]
+    exact_phrase = bool(signals.get("exact_phrase"))
+    filename_anchor = len(filename_terms) >= 2 and coverage_ratio >= 0.4
+    rare_anchor = bool(informative_rare_terms) and coverage_ratio >= 0.5
+    strong_anchor = not unmatched_named_anchors and (
+        exact_phrase or filename_anchor or rare_anchor
+    )
+    rank_confident = (
+        gap is None
+        or float(gap) >= 0.75
+        or exact_phrase
+        or len(filename_terms) >= 2
+    )
+    sufficient = (
+        len(matched_terms) >= expected_matches
+        and score >= 2.0
+    )
+    return {
+        "sufficient": sufficient,
+        "strong_anchor": strong_anchor,
+        "rank_confident": rank_confident,
+        "top1_score": round(score, 6),
+        "top1_top2_gap": round(float(gap), 6) if gap is not None else None,
+        "coverage_ratio": round(coverage_ratio, 6),
+        "filename_match_count": len(filename_terms),
+        "rare_match_count": len(rare_terms),
+        "unmatched_named_anchor_count": len(unmatched_named_anchors),
+    }
 
 
 @dataclass(frozen=True)
@@ -62,11 +154,12 @@ class KnowledgeRetriever:
     def __init__(self, config: RetrievalConfig | None = None) -> None:
         self.config = config or RetrievalConfig()
 
-    def search(self, query: str, rows: Iterable[Mapping]) -> list[dict]:
+    def search(self, query: str, rows: Iterable[Mapping], gate_v2: bool = False) -> list[dict]:
         records = [dict(row) for row in rows]
-        terms = query_terms(query)
+        terms = query_terms(query, gate_v2=gate_v2)
         if not records or not terms:
             return []
+        named_anchors = named_query_anchors(query)
 
         document_frequency = {
             term: sum(1 for row in records if term in normalize_text(str(row.get("content", ""))))
@@ -79,6 +172,15 @@ class KnowledgeRetriever:
             normalized_content = normalize_text(content)
             normalized_filename = normalize_text(str(row.get("filename", "")))
             matched = [term for term in terms if term in normalized_content or term in normalized_filename]
+            filename_matches = [term for term in matched if term in normalized_filename]
+            rare_matches = [
+                term for term in matched
+                if document_frequency[term] <= max(1, math.ceil(len(records) * 0.25))
+            ]
+            matched_named_anchors = [
+                anchor for anchor in named_anchors
+                if anchor in normalized_content or anchor in normalized_filename
+            ]
             minimum_matches = 1 if len(terms) == 1 else 2
             if len(matched) < minimum_matches:
                 continue
@@ -96,7 +198,10 @@ class KnowledgeRetriever:
             phrase = 8.0 if len(normalized_query) >= 4 and normalized_query in normalized_content else 0.0
             length_normalization = 1 / math.sqrt(max(len(normalized_content), 120) / 120)
             score = (lexical * length_normalization) + title + coverage + phrase
-            ranked.append((score, phrase, title, lexical, coverage, matched, row))
+            ranked.append((
+                score, phrase, title, lexical, coverage, matched, row,
+                filename_matches, rare_matches, matched_named_anchors,
+            ))
 
         ranked.sort(key=lambda item: (-item[0], int(item[6].get("position", 0)), str(item[6].get("id", ""))))
         by_document_position = {
@@ -105,7 +210,10 @@ class KnowledgeRetriever:
         results = []
         seen_hashes: set[str] = set()
         remaining_budget = self.config.max_total_chars
-        for score, phrase, title, lexical, coverage, matched, row in ranked:
+        for (
+            score, phrase, title, lexical, coverage, matched, row,
+            filename_matches, rare_matches, matched_named_anchors,
+        ) in ranked:
             if len(results) >= self.config.limit or remaining_budget <= 0:
                 break
             primary_content = str(row.get("content", "")).strip()
@@ -145,5 +253,32 @@ class KnowledgeRetriever:
                     "lexical": round(lexical, 6),
                     "coverage": round(coverage, 6),
                 },
+                "match_signals": {
+                    "exact_phrase": bool(phrase),
+                    "filename_terms": filename_matches,
+                    "rare_terms": rare_matches,
+                    "coverage_ratio": round(len(matched) / len(terms), 6),
+                    "named_anchors": named_anchors,
+                    "matched_named_anchors": matched_named_anchors,
+                    "unmatched_named_anchors": [
+                        anchor for anchor in named_anchors
+                        if anchor not in matched_named_anchors
+                    ],
+                },
             })
+        if results:
+            top_document_id = results[0]["document_id"]
+            second_document = next(
+                (item for item in results[1:] if item["document_id"] != top_document_id),
+                None,
+            )
+            top_score = float(results[0]["score"])
+            second_score = float(second_document["score"]) if second_document else None
+            results[0]["ranking_signals"] = {
+                "top1_score": round(top_score, 6),
+                "top2_document_score": round(second_score, 6) if second_score is not None else None,
+                "top1_top2_document_gap": (
+                    round(top_score - second_score, 6) if second_score is not None else None
+                ),
+            }
         return results

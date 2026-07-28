@@ -1,0 +1,132 @@
+{
+  "documents": [
+    {
+      "id": "row-project-0",
+      "document_id": "doc-project",
+      "filename": "Nova项目执行手册.md",
+      "position": 0,
+      "content": "Nova 项目计划包含方案设计、执行步骤、页面交付、内容分析与风险复盘。项目负责人按周更新执行计划。"
+    },
+    {
+      "id": "row-training-0",
+      "document_id": "doc-training",
+      "filename": "Acme新人培训手册.md",
+      "position": 0,
+      "content": "Acme 新人培训分为账号准备、产品学习、导师演练和结业复盘四个阶段。"
+    },
+    {
+      "id": "row-metrics-0",
+      "document_id": "doc-metrics",
+      "filename": "Orion产品指标.md",
+      "position": 0,
+      "content": "Orion 产品的月度留存指标目标为百分之六十五，指标按自然月统计。"
+    },
+    {
+      "id": "row-engineering-0",
+      "document_id": "doc-engineering",
+      "filename": "工程术语.md",
+      "position": 0,
+      "content": "幂等性表示相同操作执行一次或多次产生相同结果，接口设计需要记录幂等键。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "explicit-uploaded-training",
+      "category": "explicit",
+      "query": "请根据上传资料总结 Acme 新人培训流程",
+      "knowledge_mode": "auto",
+      "expected_selected": true
+    },
+    {
+      "id": "explicit-local-metrics",
+      "category": "explicit",
+      "query": "请引用本地资料中的 Orion 产品指标",
+      "knowledge_mode": "auto",
+      "expected_selected": true
+    },
+    {
+      "id": "explicit-document-project",
+      "category": "explicit",
+      "query": "根据文档中的材料说明 Nova 项目执行步骤",
+      "knowledge_mode": "auto",
+      "expected_selected": true
+    },
+    {
+      "id": "implicit-training-name",
+      "category": "implicit_anchor",
+      "query": "Acme 新人培训包含哪些阶段",
+      "knowledge_mode": "auto",
+      "expected_selected": true
+    },
+    {
+      "id": "implicit-product-metric",
+      "category": "implicit_anchor",
+      "query": "Orion 月度留存指标是多少",
+      "knowledge_mode": "auto",
+      "expected_selected": true
+    },
+    {
+      "id": "negative-generic-project-plan",
+      "category": "negative",
+      "query": "请制定一个减重十斤的可执行项目计划",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-generate-html",
+      "category": "negative",
+      "query": "把上面的执行计划生成 HTML 页面",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-generic-concept",
+      "category": "negative",
+      "query": "解释幂等性是什么",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-code-change",
+      "category": "negative",
+      "query": "修改代码修复接口超时问题",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-translation",
+      "category": "negative",
+      "query": "把这句话翻译成英文",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-small-talk",
+      "category": "negative",
+      "query": "你好，今天感觉怎么样",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "negative-writing-report",
+      "category": "negative",
+      "query": "写一份项目风险分析报告",
+      "knowledge_mode": "auto",
+      "expected_selected": false
+    },
+    {
+      "id": "control-off-explicit",
+      "category": "mode_control",
+      "query": "请根据上传资料总结 Acme 新人培训流程",
+      "knowledge_mode": "off",
+      "expected_selected": false
+    },
+    {
+      "id": "control-required-training",
+      "category": "mode_control",
+      "query": "Acme 新人培训包含哪些阶段",
+      "knowledge_mode": "required",
+      "expected_selected": true
+    }
+  ]
+}

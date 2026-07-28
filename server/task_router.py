@@ -15,29 +15,55 @@ from typing import Callable
 TASK_TIERS = {"quick", "standard", "deep"}
 
 
-def classify_knowledge_intent(content: str) -> dict:
+def classify_knowledge_intent(content: str, gate_v2: bool = False) -> dict:
     """Return whether local evidence should be retrieved for this request."""
     normalized = re.sub(r"\s+", "", content.lower())
     local_source_markers = ("知识库", "本地资料", "上传资料", "参考资料", "附件", "文档中", "材料中")
     if any(marker in normalized for marker in local_source_markers):
-        return {"needed": True, "reason": "explicit_local_source"}
+        return {"needed": True, "route": "explicit", "reason": "explicit_local_source"}
     if re.search(r"(?:根据|基于|查阅|引用|检索).{0,10}(?:资料|文档|材料|来源)", normalized):
-        return {"needed": True, "reason": "explicit_local_source"}
+        return {"needed": True, "route": "explicit", "reason": "explicit_local_source"}
 
-    operational_markers = ("平台", "技能", "模型", "版本", "接口", "服务", "对话", "文件夹", "改动范围", "今天", "星期", "代码")
-    # Broad suffixes such as “是什么” and “说明” often describe a general
-    # explanation, not a request for private knowledge.  Keep local retrieval
-    # for explicit definitions and factual comparisons, where evidence is more
-    # likely to improve the answer.
-    factual_markers = ("什么是", "定义", "含义", "介绍", "多少", "数据", "指标", "事实")
-    factual_comparison = "说明" in normalized and "比较" in normalized
-    if (
-        len(normalized) >= 5
-        and (any(marker in normalized for marker in factual_markers) or factual_comparison)
-        and not any(marker in normalized for marker in operational_markers)
-    ):
-        return {"needed": True, "reason": "factual_query"}
-    return {"needed": False, "reason": "not_recognized"}
+    if not gate_v2:
+        operational_markers = ("平台", "技能", "模型", "版本", "接口", "服务", "对话", "文件夹", "改动范围", "今天", "星期", "代码")
+        factual_markers = ("什么是", "定义", "含义", "介绍", "多少", "数据", "指标", "事实")
+        factual_comparison = "说明" in normalized and "比较" in normalized
+        if (
+            len(normalized) >= 5
+            and (any(marker in normalized for marker in factual_markers) or factual_comparison)
+            and not any(marker in normalized for marker in operational_markers)
+        ):
+            return {"needed": True, "route": "explicit", "reason": "factual_query"}
+        return {"needed": False, "route": "none", "reason": "not_recognized"}
+
+    general_task_markers = (
+        "制定", "生成", "创建", "写一", "撰写", "改写", "润色", "翻译",
+        "修改代码", "修复代码", "实现功能", "开发功能", "设计页面",
+        "你好", "谢谢", "感觉怎么样",
+    )
+    if any(marker in normalized for marker in general_task_markers):
+        return {"needed": False, "route": "none", "reason": "general_task"}
+
+    implicit_local_markers = (
+        "这份", "这套", "该项目", "当前项目", "当前空间", "空间里",
+        "已有资料", "内部资料", "公司制度", "公司流程", "项目里",
+        "已有材料", "已有文档", "之前的", "上述", "刚才的文档",
+    )
+    question_markers = ("哪些", "什么", "如何", "怎么", "多少", "说明", "总结", "分析", "是否", "包含")
+    asks_for_answer = any(marker in normalized for marker in question_markers)
+    if asks_for_answer and any(marker in normalized for marker in implicit_local_markers):
+        return {"needed": False, "route": "implicit_candidate", "reason": "implicit_local_reference"}
+
+    # Preserve a conservative path for named products/files without treating a
+    # generic definition or factual question as a private-knowledge request.
+    named_ascii_anchor = bool(re.search(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", content))
+    named_document_subject = bool(re.search(
+        r"[\u4e00-\u9fffA-Za-z0-9_-]{2,}(?:手册|制度|规范|方案|报告|指标|流程|记录|文档)",
+        content,
+    ))
+    if asks_for_answer and (named_ascii_anchor or named_document_subject):
+        return {"needed": False, "route": "implicit_candidate", "reason": "named_knowledge_candidate"}
+    return {"needed": False, "route": "none", "reason": "not_recognized"}
 
 
 @dataclass(frozen=True)

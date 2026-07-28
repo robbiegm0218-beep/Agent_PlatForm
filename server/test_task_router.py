@@ -64,6 +64,30 @@ class TaskRouterTests(unittest.TestCase):
         self.assertFalse(classify_knowledge_intent("解释幂等性是什么")['needed'])
         self.assertTrue(classify_knowledge_intent("比较 AP 与 CP 并说明关键取舍")['needed'])
 
+    def test_v2_knowledge_classifier_exposes_three_conservative_routes(self):
+        explicit = classify_knowledge_intent("请根据上传资料总结结论", gate_v2=True)
+        self.assertTrue(explicit["needed"])
+        self.assertEqual(explicit["route"], "explicit")
+
+        implicit = classify_knowledge_intent("Acme 新人培训包含哪些阶段", gate_v2=True)
+        self.assertFalse(implicit["needed"])
+        self.assertEqual(implicit["route"], "implicit_candidate")
+        chinese_implicit = classify_knowledge_intent("产品新人培训方案讲的是什么", gate_v2=True)
+        self.assertEqual(chinese_implicit["route"], "implicit_candidate")
+
+        for content in (
+            "请制定一个减重十斤的可执行项目计划",
+            "把上面的执行计划生成 HTML 页面",
+            "解释幂等性是什么",
+            "修改代码修复接口超时问题",
+            "把这句话翻译成英文",
+            "你好，今天感觉怎么样",
+        ):
+            with self.subTest(content=content):
+                classified = classify_knowledge_intent(content, gate_v2=True)
+                self.assertFalse(classified["needed"])
+                self.assertEqual(classified["route"], "none")
+
 
 if __name__ == "__main__":
     unittest.main()
