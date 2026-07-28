@@ -244,7 +244,9 @@ SKILLS_DIR = ROOT_DIR / "server" / "skills"
 BUILTIN_SKILL_RESOURCE_DIR = ROOT_DIR / "server" / "skill_resources"
 SKILL_HISTORY_DIR = DATA_DIR / "skill_history"
 SKILL_PACKAGE_DIR = DATA_DIR / "skill_packages"
-MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(256 * 1024)))
+# ZIP skills are intentionally small because they are stored and inspected in
+# memory. Keep the compressed and extracted package budget aligned at 300 KiB.
+MAX_SKILL_PACKAGE_BYTES = int(os.environ.get("MAX_SKILL_PACKAGE_BYTES", str(300 * 1024)))
 MAX_SKILL_RESOURCE_CHARS = int(os.environ.get("MAX_SKILL_RESOURCE_CHARS", "12000"))
 EXECUTION_MODE_VALUES = {"off", "auto", "required"}
 SOURCE_MODE_VALUES = {"general", "local_only", "web_only", "mixed"}
@@ -3716,7 +3718,10 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def create_skill(self, user: dict) -> None:
         try:
-            payload = self.read_json()
+            # ZIP bytes arrive Base64 encoded, so the JSON request is about
+            # 4/3 the package size. Do not let the generic 64 KiB API limit
+            # reject an otherwise valid 300 KiB skill package.
+            payload = self.read_json(MAX_SKILL_PACKAGE_BYTES * 2)
             resources: list[tuple[str, bytes]] = []
             if payload.get("bundle_base64"):
                 source_skill, resources = parse_skill_bundle(payload["bundle_base64"])
@@ -4315,9 +4320,22 @@ def build_system_prompt(execution_context: dict) -> str:
 
 
 def append_knowledge_sources(answer: str, references: list[dict], knowledge_route: str) -> str:
-    # A citation is a document-level affordance in the chat UI.  Several matching
-    # chunks from one document should not turn into noisy, repeated source chips.
-    labels = list(dict.fromkeys(str(item.get("filename", "未命名资料")) for item in references))
+    # Keep citations at document level, but retain the first actual chunk that
+    # matched.  This gives a useful source location without repeating one file
+    # several times when multiple chunks are retrieved from it.
+    seen_documents: set[str] = set()
+    labels: list[str] = []
+    for item in references:
+        filename = str(item.get("filename") or "未命名资料").strip()
+        document_key = str(item.get("document_id") or filename)
+        if document_key in seen_documents:
+            continue
+        seen_documents.add(document_key)
+        position = item.get("position")
+        if isinstance(position, int) and position >= 0:
+            labels.append(f"【{filename}（片段 {position + 1}）】")
+        else:
+            labels.append(f"【{filename}】")
     if labels:
         return answer.rstrip() + "\n\n参考资料：" + "、".join(labels)
     if knowledge_route == "required_no_match":

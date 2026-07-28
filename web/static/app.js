@@ -1112,7 +1112,10 @@ function renderMessageContent(element, content, role = "assistant") {
     const source = document.createElement("button");
     source.type = "button";
     source.className = "knowledge-source-link";
-    const filename = sourceLabel.replace(/（片段\s*\d+(?:\s*·\s*摘录：[\s\S]*)?）$/, "");
+    const filename = sourceLabel
+      .trim()
+      .replace(/^【|】$/g, "")
+      .replace(/（片段\s*\d+(?:\s*·\s*摘录：[\s\S]*)?）$/, "");
     source.textContent = sourceLabel;
     source.title = `查看本地资料：${filename}`;
     source.addEventListener("click", async () => {

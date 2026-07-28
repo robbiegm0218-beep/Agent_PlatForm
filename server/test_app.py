@@ -514,6 +514,29 @@ class AgentPlatformApiTests(unittest.TestCase):
             app.SKILL_PACKAGE_DIR = original_package_dir
             app.SKILLS = original_skills
 
+    def test_skill_zip_upload_accepts_a_300kb_budget_payload(self):
+        original_skills_dir = app.SKILLS_DIR
+        original_package_dir = app.SKILL_PACKAGE_DIR
+        original_skills = app.SKILLS
+        app.SKILLS_DIR = Path(self.temp_dir.name) / "skills"
+        app.SKILL_PACKAGE_DIR = Path(self.temp_dir.name) / "packages"
+        try:
+            bundle = io.BytesIO()
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("skill.json", json.dumps({
+                    "id": "large_bundle_skill", "name": "Large bundle", "description": "测试 300KB 上限",
+                    "version": "1.0.0", "prompt": "只输出测试", "input_limit": 1200,
+                    "default_enabled": False, "status": "enabled",
+                }))
+                archive.writestr("assets/fixture.bin", os.urandom(270 * 1024))
+            self.assertLessEqual(len(bundle.getvalue()), app.MAX_SKILL_PACKAGE_BYTES)
+            result = self.request_json("/api/skills", {"bundle_base64": base64.b64encode(bundle.getvalue()).decode()}, self.token)
+            self.assertEqual(result["skill"]["id"], "large_bundle_skill")
+        finally:
+            app.SKILLS_DIR = original_skills_dir
+            app.SKILL_PACKAGE_DIR = original_package_dir
+            app.SKILLS = original_skills
+
     def test_standard_skill_package_accepts_wrapped_resources_without_executing_scripts(self):
         original_skills_dir = app.SKILLS_DIR
         original_package_dir = app.SKILL_PACKAGE_DIR
@@ -1265,8 +1288,7 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         events = self.chat({"thread_id": "", "content": "请说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
-        self.assertIn("参考资料：product.md", answer)
-        self.assertNotIn("片段", answer)
+        self.assertIn("参考资料：【product.md（片段 1）】", answer)
         thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         context = json.loads(run["execution_context"])
@@ -1340,7 +1362,7 @@ class AgentPlatformApiTests(unittest.TestCase):
             {"filename": "项目资料.md", "position": 0, "excerpt": "第三段"},
         ], "retrieved")
 
-        self.assertEqual(answer, "回答\n\n参考资料：通用资料.md、项目资料.md")
+        self.assertEqual(answer, "回答\n\n参考资料：【通用资料.md（片段 1）】、【项目资料.md（片段 1）】")
 
     def test_retrieval_policy_candidate_evaluation_publish_and_rollback(self):
         with app.db() as conn:
