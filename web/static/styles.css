@@ -1,7 +1,7 @@
-@import url("/static/styles/tokens-base.css");
-@import url("/static/styles/layout.css");
-@import url("/static/styles/space.css");
-@import url("/static/styles/chat.css");
-@import url("/static/styles/knowledge.css");
-@import url("/static/styles/components.css");
-@import url("/static/styles/responsive.css");
+@import url("/static/styles/tokens-base.css?v=p48-3-1");
+@import url("/static/styles/layout.css?v=p48-4-4");
+@import url("/static/styles/space.css?v=p48-3-1");
+@import url("/static/styles/chat.css?v=p48-3-1");
+@import url("/static/styles/knowledge.css?v=p48-4-1");
+@import url("/static/styles/components.css?v=p48-3-1");
+@import url("/static/styles/responsive.css?v=p48-3-1");

@@ -59,6 +59,15 @@ from server.auth_service import AuthService, validate_new_password
 from server.knowledge_service import KnowledgeService
 from server.space_service import SpaceService
 from server.chat_service import ChatService
+from server.artifact_service import (
+    ARTIFACT_MIME_TYPES,
+    preview_content,
+    public_artifact as artifact_public_view,
+    render_image_preview,
+    render_static_html,
+    resolve_artifact_path,
+    write_artifact_file,
+)
 from server.http_routes import API_ROUTES
 from server.schema_migrations import apply_migrations, migration_status
 from server.upgrade import prepare_automatic_upgrade, record_automatic_upgrade
@@ -124,6 +133,7 @@ DB_PATH = Path(os.environ.get("AGENT_DATABASE_PATH", ROOT_DIR / "agent_platform.
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 ARTIFACT_DIR = DATA_DIR / "artifacts"
 ARTIFACT_NODE = resolve_artifact_node()
+HTML_ARTIFACT_PREVIEW_ENABLED = os.environ.get("HTML_ARTIFACT_PREVIEW_ENABLED", "false").lower() in {"1", "true", "yes"}
 TESSERACT_BINARY = next((candidate for candidate in (os.environ.get("TESSERACT_BINARY", "").strip(), shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -599,7 +609,7 @@ APPS = [
     {
         "id": "local_artifacts",
         "name": "本地文件产物",
-        "description": "可生成 Markdown 和 Excel 文件；创建文件前必须由用户确认。",
+        "description": "可生成 Markdown、静态 HTML 和 Excel 文件；创建文件前必须由用户确认。",
         "status": "enabled",
         "category": "app",
     },
@@ -1014,7 +1024,13 @@ def init_db() -> None:
                 kind TEXT NOT NULL,
                 storage_path TEXT NOT NULL,
                 summary TEXT DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                mime_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ready',
+                revision INTEGER NOT NULL DEFAULT 1,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                content_sha256 TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS run_confirmations (
                 run_id TEXT PRIMARY KEY,
@@ -1165,9 +1181,104 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 
 
 def public_artifact(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
-    item.pop("storage_path", None)
+    item = artifact_public_view(row)
+    item["previewable"] = bool(item["previewable"] and HTML_ARTIFACT_PREVIEW_ENABLED)
     return item
+
+
+def visible_artifact(artifact_id: str, user_id: str) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute(
+            """SELECT artifacts.* FROM artifacts
+               LEFT JOIN runs ON runs.id = artifacts.run_id
+               LEFT JOIN threads ON threads.id = runs.thread_id
+               WHERE artifacts.id = ? AND (
+                 artifacts.user_id = ? OR (
+                   threads.folder_id != '' AND EXISTS (
+                     SELECT 1 FROM space_members
+                     WHERE space_members.space_id = threads.folder_id
+                       AND space_members.user_id = ?
+                   )
+                 )
+               )""",
+            (artifact_id, user_id, user_id),
+        ).fetchone()
+
+
+def knowledge_kind(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    return {
+        ".md": "markdown",
+        ".txt": "text",
+        ".docx": "docx",
+        ".pdf": "pdf",
+        ".xlsx": "xlsx",
+        ".png": "image",
+        ".jpg": "image",
+        ".jpeg": "image",
+        ".webp": "image",
+        ".tif": "image",
+        ".tiff": "image",
+    }.get(suffix, "file")
+
+
+def public_knowledge_document(row: sqlite3.Row | dict) -> dict:
+    item = row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+    item.pop("storage_path", None)
+    item.pop("content_hash", None)
+    item["kind"] = knowledge_kind(str(item.get("filename", "")))
+    item["previewable"] = bool(HTML_ARTIFACT_PREVIEW_ENABLED)
+    return item
+
+
+def resolve_knowledge_path(document: sqlite3.Row) -> Path:
+    path = Path(str(document["storage_path"]))
+    allowed_root = KNOWLEDGE_DIR.resolve()
+    if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
+        raise FileNotFoundError("知识库文件不可用")
+    content = path.read_bytes()
+    expected_hash = str(document["content_hash"] or "")
+    if expected_hash and hashlib.sha256(content).hexdigest() != expected_hash:
+        raise ValueError("知识库文件完整性校验失败")
+    return path
+
+
+def preview_knowledge_content(document: sqlite3.Row) -> tuple[bytes, str]:
+    path = resolve_knowledge_path(document)
+    content = path.read_bytes()
+    filename = str(document["filename"])
+    suffix = Path(filename).suffix.lower()
+    mime_type = str(document["mime_type"])
+    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        return render_image_preview(filename, mime_type, content).encode("utf-8"), ARTIFACT_MIME_TYPES["html"]
+    extracted = extract_knowledge_text(filename, content)
+    markdown = extracted if suffix == ".md" else f"```\n{extracted}\n```"
+    return render_static_html(filename, markdown).encode("utf-8"), ARTIFACT_MIME_TYPES["html"]
+
+
+def visible_knowledge_references(references: object, user_id: str) -> list[dict]:
+    if not isinstance(references, list):
+        return []
+    result: list[dict] = []
+    seen: set[str] = set()
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        document_id = str(reference.get("document_id", ""))
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        document = KNOWLEDGE_SERVICE.get_visible(document_id, user_id)
+        if not document:
+            continue
+        item = public_knowledge_document(document)
+        item.update({
+            "document_id": document_id,
+            "position": int(reference.get("position", 0) or 0),
+            "excerpt": str(reference.get("excerpt", ""))[:700],
+        })
+        result.append(item)
+    return result
 
 
 def safe_json_object(value: object) -> dict:
@@ -1553,7 +1664,8 @@ def extract_xlsx_knowledge_text(raw: bytes) -> str:
             for sheet in workbook.findall(f"{namespace}sheets/{namespace}sheet"):
                 rel_id = sheet.attrib.get(f"{rel_namespace}id")
                 target = targets.get(rel_id, "")
-                path = "xl/" + target.lstrip("/")
+                normalized_target = target.lstrip("/")
+                path = normalized_target if normalized_target.startswith("xl/") else "xl/" + normalized_target
                 if path not in archive.namelist():
                     continue
                 sheet_root = ET.fromstring(archive.read(path))
@@ -1900,7 +2012,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         return
 
     def end_headers(self) -> None:
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; media-src 'none'; worker-src 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self' about:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; media-src 'none'; worker-src 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -1908,6 +2020,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         if self.path.startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
+        elif self.path == "/" or Path(urlparse(self.path).path).suffix.lower() in {".html", ".js", ".css"}:
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
         super().end_headers()
 
     def request_id(self) -> str:
@@ -2099,11 +2213,20 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/knowledge":
             self.list_knowledge(user)
             return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/download"):
+            self.download_knowledge(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/preview"):
+            self.preview_knowledge(user)
+            return
         if self.path == "/api/artifacts":
             self.list_artifacts(user)
             return
         if self.path.startswith("/api/artifacts/") and self.path.endswith("/download"):
             self.download_artifact(user)
+            return
+        if self.path.startswith("/api/artifacts/") and self.path.endswith("/preview"):
+            self.preview_artifact(user)
             return
         if self.path.startswith("/api/knowledge/search"):
             self.search_knowledge_api(user)
@@ -2453,7 +2576,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not detail:
             self.send_error_json("空间不存在", HTTPStatus.NOT_FOUND)
             return
-        self.send_json({"space": row_to_dict(detail["space"]), "tasks": [row_to_dict(item) for item in detail["tasks"]], "artifacts": [row_to_dict(item) for item in detail["artifacts"]], "sources": detail["sources"], "knowledge_documents": [row_to_dict(item) for item in detail["knowledge_documents"]], "members": [row_to_dict(item) for item in detail["members"]], "invitations": [row_to_dict(item) for item in detail["invitations"]], "can_manage_members": SPACE_SERVICE.can_manage_members(detail["space"], user["id"])})
+        self.send_json({"space": row_to_dict(detail["space"]), "tasks": [row_to_dict(item) for item in detail["tasks"]], "artifacts": [public_artifact(item) for item in detail["artifacts"]], "sources": detail["sources"], "knowledge_documents": [row_to_dict(item) for item in detail["knowledge_documents"]], "members": [row_to_dict(item) for item in detail["members"]], "invitations": [row_to_dict(item) for item in detail["invitations"]], "can_manage_members": SPACE_SERVICE.can_manage_members(detail["space"], user["id"])})
 
     def invite_space_member(self, user: dict) -> None:
         space_id = self.path.split("/")[-2]
@@ -2517,7 +2640,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             ).fetchall()
             artifacts = conn.execute(
                 """
-                SELECT artifacts.id, artifacts.run_id, artifacts.filename, artifacts.kind, artifacts.summary, artifacts.created_at
+                SELECT artifacts.id, artifacts.run_id, artifacts.filename, artifacts.kind, artifacts.summary,
+                       artifacts.created_at, artifacts.mime_type, artifacts.status, artifacts.revision,
+                       artifacts.size_bytes, artifacts.updated_at, artifacts.content_sha256
                 FROM artifacts JOIN runs ON runs.id = artifacts.run_id
                 WHERE runs.thread_id = ?
                 ORDER BY artifacts.created_at DESC, artifacts.id DESC
@@ -2533,7 +2658,8 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 """,
                 (thread_id,),
             ).fetchall()
-            visible_document_ids = {row["id"] for row in conn.execute("""SELECT id FROM knowledge_documents
+            visible_documents = {row["id"]: row for row in conn.execute("""SELECT id, filename, mime_type, size_bytes, chunk_count,
+                    created_at, scope, project_space_id, upload_origin, created_by_user_id FROM knowledge_documents
                 WHERE (scope = 'general' AND user_id = ?) OR
                 (scope = 'project' AND EXISTS (SELECT 1 FROM space_members
                     WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))""",
@@ -2552,7 +2678,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 if not document_id or not isinstance(position, int) or document_id in seen_knowledge_documents:
                     continue
                 seen_knowledge_documents.add(document_id)
-                if document_id not in visible_document_ids:
+                if document_id not in visible_documents:
                     sources.append({
                         "kind": "knowledge",
                         "title": "资料引用已隐藏",
@@ -2561,10 +2687,14 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                         "used_at": run["started_at"],
                     })
                     continue
+                document = public_knowledge_document(visible_documents[document_id])
                 sources.append({
                     "kind": "knowledge",
                     "document_id": document_id,
-                    "filename": str(reference.get("filename", "未命名资料"))[:255],
+                    "filename": document["filename"],
+                    "mime_type": document["mime_type"],
+                    "file_kind": document["kind"],
+                    "previewable": document["previewable"],
                     "position": position,
                     "excerpt": str(reference.get("excerpt", ""))[:700],
                     "score": reference.get("score", 0),
@@ -2591,7 +2721,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
         self.send_json({
             "sources": sources,
-            "outputs": [row_to_dict(row) for row in artifacts],
+            "outputs": [public_artifact(row) for row in artifacts],
             "structured_context": structured_context,
         })
 
@@ -2924,7 +3054,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             citation_feedback_items = conn.execute("""SELECT document_id, position, citation_correct, reason_code, note,
                 retrieval_policy_version, created_at, updated_at FROM citation_feedback_items
                 WHERE run_id = ? AND user_id = ? ORDER BY created_at ASC, id ASC""", (run_id, user["id"])).fetchall()
-        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "confirmations": [row_to_dict(item) for item in approvals], "artifact": row_to_dict(artifact) if artifact else None, "feedback": row_to_dict(feedback) if feedback else None, "citation_feedback_items": [row_to_dict(item) for item in citation_feedback_items]})
+        run_context = safe_json_object(run["execution_context"])
+        knowledge_sources = visible_knowledge_references(run_context.get("knowledge_refs"), user["id"])
+        self.send_json({"run": row_to_dict(run), "events": [row_to_dict(row) for row in events], "steps": [row_to_dict(row) for row in steps], "confirmation": row_to_dict(confirmation) if confirmation else None, "confirmations": [row_to_dict(item) for item in approvals], "artifact": public_artifact(artifact) if artifact else None, "knowledge_sources": knowledge_sources, "feedback": row_to_dict(feedback) if feedback else None, "citation_feedback_items": [row_to_dict(item) for item in citation_feedback_items]})
 
     def resolve_confirmation(self, user: dict) -> None:
         run_id = self.path.split("/")[-2]
@@ -3476,7 +3608,49 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def list_knowledge(self, user: dict) -> None:
         rows = KNOWLEDGE_SERVICE.list_visible(user["id"])
-        self.send_json({"documents": [row_to_dict(row) for row in rows], "pdf_supported": bool(PdfReader), "image_ocr_supported": bool(TESSERACT_BINARY)})
+        self.send_json({"documents": [public_knowledge_document(row) for row in rows], "pdf_supported": bool(PdfReader), "image_ocr_supported": bool(TESSERACT_BINARY)})
+
+    def download_knowledge(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        document = KNOWLEDGE_SERVICE.get_visible(document_id, user["id"])
+        if not document:
+            self.send_error_json("知识库文件不存在", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            path = resolve_knowledge_path(document)
+        except (FileNotFoundError, ValueError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", str(document["mime_type"]) or "application/octet-stream")
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", Path(str(document["filename"])).name) or "download"
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
+        self.wfile.write(path.read_bytes())
+
+    def preview_knowledge(self, user: dict) -> None:
+        if not HTML_ARTIFACT_PREVIEW_ENABLED:
+            self.send_error_json("文件预览尚未启用", HTTPStatus.NOT_FOUND)
+            return
+        document_id = self.path.split("/")[-2]
+        document = KNOWLEDGE_SERVICE.get_visible(document_id, user["id"])
+        if not document:
+            self.send_error_json("知识库文件不存在", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            content, content_type = preview_knowledge_content(document)
+        except (FileNotFoundError, ValueError, UnicodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'; frame-src 'none'")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def list_artifacts(self, user: dict) -> None:
         with db() as conn:
@@ -3485,24 +3659,16 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def download_artifact(self, user: dict) -> None:
         artifact_id = self.path.split("/")[-2]
-        with db() as conn:
-            artifact = conn.execute(
-                "SELECT * FROM artifacts WHERE id = ? AND user_id = ?", (artifact_id, user["id"])
-            ).fetchone()
+        artifact = visible_artifact(artifact_id, user["id"])
         if not artifact:
             self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
             return
-        path = Path(artifact["storage_path"])
-        allowed_root = ARTIFACT_DIR.resolve()
-        if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
+        try:
+            path = resolve_artifact_path(artifact["storage_path"], ARTIFACT_DIR)
+        except FileNotFoundError:
             self.send_error_json("文件产物不可用", HTTPStatus.NOT_FOUND)
             return
-        content_types = {
-            "markdown": "text/markdown; charset=utf-8",
-            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "json": "application/json; charset=utf-8",
-        }
-        content_type = content_types.get(artifact["kind"], "application/octet-stream")
+        content_type = artifact["mime_type"] or ARTIFACT_MIME_TYPES.get(artifact["kind"], "application/octet-stream")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", Path(str(artifact["filename"])).name) or "download"
@@ -3510,6 +3676,33 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(path.stat().st_size))
         self.end_headers()
         self.wfile.write(path.read_bytes())
+
+    def preview_artifact(self, user: dict) -> None:
+        if not HTML_ARTIFACT_PREVIEW_ENABLED:
+            self.send_error_json("HTML 文件预览尚未启用", HTTPStatus.NOT_FOUND)
+            return
+        artifact_id = self.path.split("/")[-2]
+        artifact = visible_artifact(artifact_id, user["id"])
+        if not artifact:
+            self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            content, content_type = preview_content(
+                artifact,
+                ARTIFACT_DIR,
+                xlsx_text_extractor=extract_xlsx_knowledge_text,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'; frame-src 'none'")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def delete_artifact(self, user: dict) -> None:
         artifact_id = self.path.split("/")[-1]
@@ -3521,9 +3714,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if not artifact:
             self.send_error_json("文件产物不存在", HTTPStatus.NOT_FOUND)
             return
-        path = Path(artifact["storage_path"])
-        allowed_root = ARTIFACT_DIR.resolve()
-        if not path.is_file() or not path.resolve().is_relative_to(allowed_root):
+        try:
+            path = resolve_artifact_path(artifact["storage_path"], ARTIFACT_DIR)
+        except FileNotFoundError:
             self.send_error_json("文件产物不可用", HTTPStatus.NOT_FOUND)
             return
         path.unlink()
@@ -3948,6 +4141,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             if artifact_kind and not artifact_enabled:
                 self.send_error_json("本地文件产物技能未启用，请先在“技能和应用”中启用后再生成文件。", HTTPStatus.BAD_REQUEST)
                 return
+            if artifact_kind == "html" and not HTML_ARTIFACT_PREVIEW_ENABLED:
+                self.send_error_json("HTML 文件生成与预览尚未启用。", HTTPStatus.BAD_REQUEST)
+                return
             if artifact_kind:
                 execution_context["artifact_request"] = {"kind": artifact_kind, "target": "本地受控产物目录"}
             actual_model = execution_context["model"]
@@ -4161,7 +4357,7 @@ def load_space_context(conn: sqlite3.Connection, user_id: str, thread_id: str) -
     tasks = conn.execute("SELECT id, title, updated_at FROM threads WHERE user_id = ? AND folder_id = ? ORDER BY updated_at DESC LIMIT 6", (user_id, space_id)).fetchall()
     artifacts = conn.execute("""SELECT artifacts.filename, artifacts.kind FROM artifacts JOIN runs ON runs.id = artifacts.run_id JOIN threads ON threads.id = runs.thread_id
         WHERE threads.user_id = ? AND threads.folder_id = ? ORDER BY artifacts.created_at DESC LIMIT 4""", (user_id, space_id)).fetchall()
-    return {"id": space_id, "name": space["name"], "tasks": [row_to_dict(row) for row in tasks], "artifacts": [row_to_dict(row) for row in artifacts]}
+    return {"id": space_id, "name": space["name"], "tasks": [row_to_dict(row) for row in tasks], "artifacts": [public_artifact(row) for row in artifacts]}
 
 
 def refresh_structured_context(conn: sqlite3.Connection, thread_id: str) -> dict:
@@ -4289,11 +4485,16 @@ def build_system_prompt(execution_context: dict) -> str:
     if execution_context.get("required_tool_errors"):
         system_prompt += "\n\n[必需能力不可用]\n" + "\n".join(f"- {item}" for item in execution_context["required_tool_errors"])
     if any(skill["id"] == "file_artifact" for skill in active_skills):
+        artifact_formats = "Markdown（.md）、Excel（.xlsx）"
+        if HTML_ARTIFACT_PREVIEW_ENABLED:
+            artifact_formats += "和静态 HTML（.html）"
         system_prompt += (
-            "\n\n[本地文件产物]\n平台已启用本地 Markdown（.md）和 Excel（.xlsx）生成能力。"
+            f"\n\n[本地文件产物]\n平台已启用本地 {artifact_formats} 生成能力。"
             "当用户询问是否支持时，应明确回答支持；当用户明确要求生成时，平台会先展示确认操作，"
             "用户确认后才会写入 data/artifacts/ 并返回下载入口。不要对能力询问、模糊回复或“确定”声称已经弹出确认卡；"
             "只有平台实际返回确认卡后才能说明等待确认。不得声称已经生成，除非收到实际产物结果。"
+            "生成静态 HTML 产物时只返回适合阅读的 Markdown 正文，不要输出 HTML 源码或 HTML 代码围栏；"
+            "平台会用可信模板把正文渲染为 HTML。"
         )
     references = execution_context.get("knowledge_refs", [])
     if references:
@@ -4359,6 +4560,8 @@ def artifact_kind_from_text(content: str) -> str:
     normalized = re.sub(r"\s+", "", content.lower())
     if re.search(r"(?:\.xlsx\b|xlsx|excel|表格)", normalized):
         return "xlsx"
+    if re.search(r"(?:\.html?\b|html|网页报告|网页文档)", normalized):
+        return "html"
     if re.search(r"(?:\.md\b|markdown|md文件|md文档)", normalized):
         return "markdown"
     return ""
@@ -4385,7 +4588,12 @@ def requested_artifact_kind(content: str, thread_id: str = "") -> str:
 
 
 def artifact_confirmation_text(kind: str) -> str:
-    label = "Excel（.xlsx）" if kind == "xlsx" else "Markdown（.md）"
+    labels = {
+        "xlsx": "Excel（.xlsx）",
+        "html": "静态 HTML（.html）",
+        "markdown": "Markdown（.md）",
+    }
+    label = labels.get(kind, kind)
     return f"将根据本次任务生成 {label} 文件，并写入本机 data/artifacts/ 目录。确认后才会创建文件。"
 
 
@@ -4500,62 +4708,75 @@ def create_personal_data_export(user_id: str) -> dict:
         raise ValueError("个人数据导出路径无效")
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     filename = f"agent-platform-data-export-{exported_at}.json"
+    content = path.read_bytes()
     with db() as conn:
         conn.execute(
-            "INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, '', ?, 'json', ?, ?, ?)",
-            (artifact_id, user_id, filename, str(path), "个人数据导出（不含凭据、本地路径与知识原文件）", exported_at),
+            """INSERT INTO artifacts
+               (id, user_id, run_id, filename, kind, storage_path, summary, created_at,
+                mime_type, status, revision, size_bytes, updated_at, content_sha256)
+               VALUES (?, ?, '', ?, 'json', ?, ?, ?, ?, 'ready', 1, ?, ?, ?)""",
+            (
+                artifact_id, user_id, filename, str(path),
+                "个人数据导出（不含凭据、本地路径与知识原文件）", exported_at,
+                ARTIFACT_MIME_TYPES["json"], len(content), exported_at, hashlib.sha256(content).hexdigest(),
+            ),
         )
-    return {"id": artifact_id, "filename": filename, "kind": "json", "summary": "个人数据导出已生成"}
+        stored = conn.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+    return public_artifact(stored)
 
 
 def create_artifact(user_id: str, run_id: str, kind: str, source_content: str, answer: str, *, title_content: str = "") -> dict:
-    if kind not in {"markdown", "xlsx"}:
+    if kind not in {"markdown", "html", "xlsx"}:
         raise ValueError("不支持的文件类型")
+    if kind == "html" and not HTML_ARTIFACT_PREVIEW_ENABLED:
+        raise ValueError("HTML 文件预览尚未启用")
     with db() as conn:
         existing = conn.execute(
-            "SELECT id, filename, kind, summary, storage_path FROM artifacts WHERE run_id = ? AND user_id = ?",
+            "SELECT * FROM artifacts WHERE run_id = ? AND user_id = ?",
             (run_id, user_id),
         ).fetchone()
     if existing:
-        if not Path(existing["storage_path"]).is_file():
+        try:
+            resolve_artifact_path(existing["storage_path"], ARTIFACT_DIR)
+        except FileNotFoundError:
             raise RuntimeError("幂等产物记录存在，但本地文件缺失")
-        return {
-            "id": existing["id"], "filename": existing["filename"],
-            "kind": existing["kind"], "summary": existing["summary"],
-        }
+        return public_artifact(existing)
     artifact_id = new_id("artifact")
-    extension = ".xlsx" if kind == "xlsx" else ".md"
-    filename = f"{artifact_id}{extension}"
-    storage_dir = ARTIFACT_DIR / user_id
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    path = (storage_dir / filename).resolve()
-    if storage_dir.resolve() not in path.parents or path.exists():
-        raise ValueError("文件产物路径无效")
     title = (title_content or source_content).strip().splitlines()[0][:80] or "Agent_Platform 输出"
-    try:
-        if kind == "markdown":
-            path.write_text(f"# {title}\n\n{answer.strip()}\n", encoding="utf-8")
-        else:
-            result = subprocess.run(
-                [ARTIFACT_NODE, str(ARTIFACT_SCRIPT), str(path), title, answer],
-                cwd=str(ROOT_DIR), text=True, capture_output=True, timeout=30,
-            )
-            if result.returncode != 0 or not path.exists():
-                raise RuntimeError((result.stderr or result.stdout or "Excel 生成器未返回文件").strip()[:500])
-    except Exception:
-        raise
-    summary = f"由运行 {run_id} 生成的{'Excel' if kind == 'xlsx' else 'Markdown'}文件"
+    file_result = write_artifact_file(
+        artifact_root=ARTIFACT_DIR,
+        user_id=user_id,
+        artifact_id=artifact_id,
+        kind=kind,
+        title=title,
+        answer=answer,
+        node_binary=ARTIFACT_NODE,
+        xlsx_script=ARTIFACT_SCRIPT,
+        root_dir=ROOT_DIR,
+    )
+    labels = {"xlsx": "Excel", "html": "HTML", "markdown": "Markdown"}
+    summary = f"由运行 {run_id} 生成的{labels[kind]}文件"
+    created_at = now()
     with db() as conn:
         conn.execute(
-            "INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (artifact_id, user_id, run_id, filename, kind, str(path), summary, now()),
+            """INSERT INTO artifacts
+               (id, user_id, run_id, filename, kind, storage_path, summary, created_at,
+                mime_type, status, revision, size_bytes, updated_at, content_sha256)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', 1, ?, ?, ?)""",
+            (
+                artifact_id, user_id, run_id, file_result["filename"], kind, str(file_result["path"]),
+                summary, created_at, file_result["mime_type"], file_result["size_bytes"], created_at,
+                file_result["content_sha256"],
+            ),
         )
         append_run_event(conn, run_id, "artifact_created", {
             "artifact_id": artifact_id,
-            "filename": filename,
+            "filename": file_result["filename"],
             "kind": kind,
+            "revision": 1,
         })
-    return {"id": artifact_id, "filename": filename, "kind": kind, "summary": summary}
+        stored = conn.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+    return public_artifact(stored)
 
 
 def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
@@ -4573,7 +4794,7 @@ def complete_confirmed_artifact_run(run_id: str, user_id: str) -> dict:
         context = json.loads(run["execution_context"] or "{}")
         request = context.get("artifact_request") or {}
         kind = request.get("kind")
-        if kind not in {"markdown", "xlsx"}:
+        if kind not in {"markdown", "html", "xlsx"}:
             raise ValueError("该运行没有可执行的文件产物请求")
         RUNTIME_STORE.transition_run(conn, run_id, "running")
         RUNTIME_STORE.transition_phase(conn, run_id, "generating", detail={"source": "confirmation_approved"})
@@ -4752,7 +4973,10 @@ def stream_answer(thread_id: str, user_content: str, execution_context: dict, on
 
     if is_skill_inventory_question(user_content):
         names = "、".join(skill["name"] for skill in execution_context["skills"]) or "当前没有启用技能"
-        artifact_note = "已启用本地 Markdown 和 Excel 文件生成，创建前需要确认。" if any(
+        artifact_formats = "Markdown、Excel"
+        if HTML_ARTIFACT_PREVIEW_ENABLED:
+            artifact_formats += "、静态 HTML"
+        artifact_note = f"已启用本地 {artifact_formats} 文件生成，创建前需要确认。" if any(
             skill["id"] == "file_artifact" for skill in execution_context["skills"]
         ) else ""
         answer = f"当前可调用的技能：{names}。{artifact_note}"

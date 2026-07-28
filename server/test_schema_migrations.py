@@ -8,6 +8,11 @@ class SchemaMigrationTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.execute("CREATE TABLE users (id TEXT PRIMARY KEY)")
+        self.conn.execute("""CREATE TABLE artifacts (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
 
     def tearDown(self):
         self.conn.close()
@@ -22,6 +27,21 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'security_events'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'account_deletion_requests'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'login_throttles'").fetchone())
+        artifact_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(artifacts)")}
+        self.assertTrue({
+            "mime_type", "status", "revision", "size_bytes", "updated_at", "content_sha256",
+        }.issubset(artifact_columns))
+
+    def test_artifact_contract_backfills_existing_rows(self):
+        self.conn.execute(
+            "INSERT INTO artifacts (id, kind, created_at) VALUES ('old_markdown', 'markdown', 42)"
+        )
+        apply_migrations(self.conn, lambda: 123)
+        row = self.conn.execute(
+            "SELECT mime_type, status, revision, size_bytes, updated_at, content_sha256 "
+            "FROM artifacts WHERE id = 'old_markdown'"
+        ).fetchone()
+        self.assertEqual(row, ("text/markdown; charset=utf-8", "ready", 1, 0, 42, ""))
 
     def test_failed_migration_rolls_back_its_changes(self):
         def fail(conn):

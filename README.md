@@ -12,9 +12,21 @@
 | DeepSeek 默认模型与 OpenAI 兼容供应商接入、快速/标准/深度任务档位 | Provider 注册表、环境变量密钥隔离、确定性模型/工具路由、有限步 Agent Loop |
 | Markdown、TXT、Word、PDF、Excel（XLSX）和图片知识库上传、检索与引用 | 仅注入命中片段；PDF 保留页码、Excel 保留工作表/单元格来源；PNG/JPG/WebP/TIFF 通过本机 Tesseract OCR 解析，不上传外部服务；资料按用户隔离，可删除 |
 | JSON、Markdown、标准 Agent Skill ZIP 技能包管理 | 版本归档、启用/停用与回滚；ZIP 资源受限保存，脚本不会执行 |
-| Markdown、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；“上面/上文内容生成文件”会复用上一条 Agent 回答作为文件正文；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
+| Markdown、静态 HTML、Excel 文件产物 | 仅写入 `data/artifacts/` 受控目录；创建前必须确认；路径、类型与审计受限；“上面/上文内容生成文件”会复用上一条 Agent 回答作为文件正文；HTML 由可信模板生成并在 sandboxed iframe 中预览；自动发现本机 Node 运行时以生成 Excel；可在所属空间聚合查看并追溯关联任务 |
 | 运行详情、步骤、工具调用与取消 | Run 状态机、事件序号和版本、全局审计筛选；回答可评价“有帮助/没帮助”并记录原因；资料引用可逐文档评价准确性 |
 | 平台状态、工作区文件名检索、可选网页检索 | 可解释的工具意图路由；优先 Tavily MCP、失败回退 REST；应用页可按 Schema 填参执行已注册的只读工具，失败可重试且保留安全审计摘要 |
+
+## 文件预览
+
+对话中的「预览文件」和「调用资料」均可点击打开统一的右侧预览面板；项目空间中的共享对话也遵循相同权限与体验。打开预览后，左侧保留当前对话或资源列表，右侧展示文件内容；关闭或切换到技能、应用、设置等页面时会自动恢复全宽布局。
+
+| 来源 | 可预览格式 | 预览方式 |
+| --- | --- | --- |
+| Agent 产物 | Markdown、HTML、Excel（XLSX）、JSON | HTML 在受限 iframe 中直接渲染；Markdown/JSON 显示格式化内容；Excel 展示工作表与单元格文本 |
+| 知识库 | Markdown、TXT、Word（DOCX）、PDF、Excel（XLSX）、PNG/JPG/WebP/TIFF 图片 | 文档显示提取文本与来源信息；图片直接展示；Excel 展示工作表与单元格文本 |
+| 产物中心与知识库页面 | 与上述格式一致 | 复用同一个右侧预览面板，并保留下载入口 |
+
+所有预览读取均经过已有的用户/项目空间权限校验；项目成员只能访问其所属空间中关联对话、资料与产物。
 
 ## 架构与执行边界
 
@@ -247,6 +259,7 @@ python3 -m server.startup_checks --create-directories
 | `AGENT_DATABASE_PATH` | SQLite 数据库文件 | `agent_platform.db` |
 | `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
 | `MAX_SKILL_PACKAGE_BYTES` | 单个技能 ZIP 的压缩包与解压后总大小上限 | `307200`（300 KB） |
+| `HTML_ARTIFACT_PREVIEW_ENABLED` | 启用静态 HTML 生成及 HTML/Markdown 右侧安全预览 | `false` |
 | `MAX_KNOWLEDGE_UPLOAD_BYTES` | 单个知识文件原始字节上限 | `8388608`（8 MB） |
 | `MAX_KNOWLEDGE_ARCHIVE_FILES` / `MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES` | DOCX/XLSX 的条目数与展开后大小上限 | `256` / `33554432`（32 MB） |
 | `MAX_KNOWLEDGE_EXTRACTED_CHARS` / `MAX_KNOWLEDGE_PDF_PAGES` | 知识解析文本量与 PDF 页数上限 | `200000` / `200` |

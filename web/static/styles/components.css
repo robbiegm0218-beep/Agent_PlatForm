@@ -145,6 +145,11 @@
   color: #5b4b8a;
 }
 
+.artifact-type-icon.html {
+  background: #fff0e7;
+  color: #a24b13;
+}
+
 .artifact-heading { min-width: 0; }
 .artifact-card h3 {
   overflow: hidden;

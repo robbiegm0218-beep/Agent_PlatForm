@@ -17,6 +17,18 @@ class KnowledgeService:
                 (knowledge_documents.scope = 'project' AND EXISTS (SELECT 1 FROM space_members WHERE space_members.space_id = knowledge_documents.project_space_id AND space_members.user_id = ?))
                 ORDER BY knowledge_documents.created_at DESC""", (user_id, user_id)).fetchall()
 
+    def get_visible(self, document_id: str, user_id: str):
+        with self.db_factory() as conn:
+            return conn.execute("""SELECT knowledge_documents.* FROM knowledge_documents
+                WHERE knowledge_documents.id = ? AND (
+                  (knowledge_documents.scope = 'general' AND knowledge_documents.user_id = ?) OR
+                  (knowledge_documents.scope = 'project' AND EXISTS (
+                    SELECT 1 FROM space_members
+                    WHERE space_members.space_id = knowledge_documents.project_space_id
+                      AND space_members.user_id = ?
+                  ))
+                )""", (document_id, user_id, user_id)).fetchone()
+
     def list_for_space(self, space_id: str):
         with self.db_factory() as conn:
             return conn.execute("""SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,

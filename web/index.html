@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent_Platform</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=p48-4-4" />
   </head>
   <body class="booting">
     <main id="app">
@@ -144,23 +144,43 @@
         </section>
 
         <aside id="threadContextPanel" class="thread-context-panel" aria-label="对话来源与输出">
-          <div class="thread-context-heading">
-            <h2>对话上下文</h2>
-            <span id="threadContextCount" class="thread-context-count">—</span>
+          <div class="thread-context-tabs" role="tablist" aria-label="右侧面板">
+            <button id="threadContextTab" class="thread-context-tab active" type="button" role="tab" aria-selected="true">上下文</button>
+            <button id="artifactPreviewTab" class="thread-context-tab" type="button" role="tab" aria-selected="false" disabled>预览</button>
           </div>
-          <section class="context-section" aria-labelledby="outputsHeading">
-            <div class="context-section-heading">
-              <h3 id="outputsHeading">输出</h3>
-              <button id="viewArtifactsButton" class="context-all-button" type="button">查看全部</button>
+          <div id="threadContextContent">
+            <div class="thread-context-heading">
+              <h2>对话上下文</h2>
+              <span id="threadContextCount" class="thread-context-count">—</span>
             </div>
-            <div id="threadOutputs" class="context-list"></div>
-          </section>
-          <section class="context-section" aria-labelledby="sourcesHeading">
-            <div class="context-section-heading">
-              <h3 id="sourcesHeading">来源</h3>
-              <button id="viewKnowledgeButton" class="context-all-button" type="button">查看全部</button>
+            <section class="context-section" aria-labelledby="outputsHeading">
+              <div class="context-section-heading">
+                <h3 id="outputsHeading">输出</h3>
+                <button id="viewArtifactsButton" class="context-all-button" type="button">查看全部</button>
+              </div>
+              <div id="threadOutputs" class="context-list"></div>
+            </section>
+            <section class="context-section" aria-labelledby="sourcesHeading">
+              <div class="context-section-heading">
+                <h3 id="sourcesHeading">来源</h3>
+                <button id="viewKnowledgeButton" class="context-all-button" type="button">查看全部</button>
+              </div>
+              <div id="threadSources" class="context-list"></div>
+            </section>
+          </div>
+          <section id="artifactPreviewContent" class="artifact-preview-content hidden" role="tabpanel" aria-label="文件预览">
+            <div class="artifact-preview-header">
+              <div>
+                <h2 id="artifactPreviewTitle">文件预览</h2>
+                <span id="artifactPreviewMeta"></span>
+              </div>
+              <div class="artifact-preview-actions">
+                <button id="artifactPreviewDownload" type="button">下载</button>
+                <button id="artifactPreviewClose" type="button" aria-label="关闭预览">关闭</button>
+              </div>
             </div>
-            <div id="threadSources" class="context-list"></div>
+            <div id="artifactPreviewNotice" class="artifact-preview-notice" aria-live="polite"></div>
+            <div id="artifactPreviewSurface" class="artifact-preview-surface" role="document" aria-label="文件预览"></div>
           </section>
         </aside>
 
@@ -300,7 +320,7 @@
             </div>
           </header>
           <div class="artifacts-info">
-            <p>支持生成 <strong>Markdown（.md）</strong> 和 <strong>Excel（.xlsx）</strong> 文件。所有文件在创建前需要确认，生成后保存到本地 data/artifacts/ 目录。确认后的文件可在此页下载或删除。</p>
+            <p>支持生成 <strong>Markdown（.md）</strong>、<strong>静态 HTML（.html）</strong>、<strong>Excel（.xlsx）</strong> 和 <strong>JSON（.json）</strong> 文件。所有文件在创建前需要确认，生成后保存到本地 data/artifacts/ 目录；均可安全预览、下载或删除。</p>
           </div>
           <div id="artifactsGrid" class="card-grid"></div>
         </section>
@@ -328,22 +348,23 @@
         </section>
       </section>
     </main>
-    <script src="/static/core/storage.js"></script>
-    <script src="/static/core/state.js"></script>
-    <script src="/static/core/dom.js"></script>
-    <script src="/static/core/api.js"></script>
-    <script src="/static/knowledge/library.js"></script>
-    <script src="/static/space/workspace.js"></script>
-    <script src="/static/views/resources.js"></script>
-    <script src="/static/views/capabilities.js"></script>
-    <script src="/static/views/settings.js"></script>
-    <script src="/static/views/audit.js"></script>
-    <script src="/static/chat/composer.js"></script>
-    <script src="/static/chat/stream.js"></script>
-    <script src="/static/chat/execution-mode.js"></script>
-    <script src="/static/chat/markdown.js"></script>
-    <script src="/static/chat/interactions.js"></script>
-    <script src="/static/chat/run-trace.js"></script>
-    <script src="/static/app.js"></script>
+    <script src="/static/core/storage.js?v=p48-4-3"></script>
+    <script src="/static/core/state.js?v=p48-4-3"></script>
+    <script src="/static/core/dom.js?v=p48-4-3"></script>
+    <script src="/static/core/api.js?v=p48-4-3"></script>
+    <script src="/static/knowledge/library.js?v=p48-4-3"></script>
+    <script src="/static/space/workspace.js?v=p48-4-3"></script>
+    <script src="/static/views/resources.js?v=p48-4-3"></script>
+    <script src="/static/views/capabilities.js?v=p48-4-3"></script>
+    <script src="/static/views/settings.js?v=p48-4-3"></script>
+    <script src="/static/views/audit.js?v=p48-4-3"></script>
+    <script src="/static/chat/composer.js?v=p48-4-3"></script>
+    <script src="/static/chat/stream.js?v=p48-4-3"></script>
+    <script src="/static/chat/execution-mode.js?v=p48-4-3"></script>
+    <script src="/static/chat/markdown.js?v=p48-4-3"></script>
+    <script src="/static/chat/interactions.js?v=p48-4-3"></script>
+    <script src="/static/chat/run-trace.js?v=p48-4-3"></script>
+    <script src="/static/chat/artifact-preview.js?v=p48-4-3"></script>
+    <script src="/static/app.js?v=p48-4-3"></script>
   </body>
 </html>

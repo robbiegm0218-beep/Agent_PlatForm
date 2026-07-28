@@ -18,17 +18,21 @@ window.AgentResourceViews = {
       els.memoryList.appendChild(card);
     });
   },
-  renderArtifacts(state, els, escape, { onDownload, onDelete }) {
+  renderArtifacts(state, els, escape, { onPreview, onDownload, onDelete }) {
     els.artifactsGrid.innerHTML = "";
     els.artifactsGrid.classList.add("artifacts-grid");
     if (!state.artifacts.length) { els.artifactsGrid.innerHTML = '<div class="empty-state"><h2>暂无产物</h2><p>在对话中启用文件生成技能后，确认生成的文件会出现在这里。</p></div>'; return; }
     state.artifacts.forEach((artifact) => {
       const isExcel = artifact.kind === "xlsx";
+      const isHtml = artifact.kind === "html";
       const date = new Date(artifact.created_at / 1e6).toLocaleString("zh-CN");
-      const title = artifact.filename.startsWith("artifact_") ? `${isExcel ? "Excel 文件" : "Markdown 文件"} · ${date}` : artifact.filename;
+      const kindLabel = isExcel ? "Excel 文件" : isHtml ? "HTML 文件" : artifact.kind === "json" ? "JSON 文件" : "Markdown 文件";
+      const shortKind = isExcel ? "XLSX" : isHtml ? "HTML" : artifact.kind === "json" ? "JSON" : "MD";
+      const title = artifact.filename.startsWith("artifact_") ? `${kindLabel} · ${date}` : artifact.filename;
       const card = document.createElement("article");
       card.className = "capability-card artifact-card";
-      card.innerHTML = `<div class="artifact-card-header"><span class="artifact-type-icon ${isExcel ? "excel" : "markdown"}">${isExcel ? "▦" : "≡"}</span><div class="artifact-heading"><h3 title="${escape(artifact.filename)}">${escape(title)}</h3><p class="artifact-file-name">${escape(artifact.filename)}</p></div></div><p class="artifact-summary">${escape(artifact.summary || "由对话确认后生成，可随时下载或删除。")}</p><div class="artifact-meta"><span>创建于 ${date}</span><span>已确认生成</span></div><div class="card-footer artifact-footer"><span class="artifact-kind-tag">${isExcel ? "XLSX" : "MD"}</span><div class="artifact-actions"><button class="skill-action artifact-download" type="button">下载</button><button class="skill-action danger artifact-delete" type="button">删除</button></div></div>`;
+      card.innerHTML = `<div class="artifact-card-header"><span class="artifact-type-icon ${isExcel ? "excel" : isHtml ? "html" : "markdown"}">${isExcel ? "▦" : isHtml ? "&lt;/&gt;" : "≡"}</span><div class="artifact-heading"><h3 title="${escape(artifact.filename)}">${escape(title)}</h3><p class="artifact-file-name">${escape(artifact.filename)}</p></div></div><p class="artifact-summary">${escape(artifact.summary || "由对话确认后生成，可随时预览、下载或删除。")}</p><div class="artifact-meta"><span>创建于 ${date}</span><span>${escape(artifact.status || "ready")} · 版本 ${Number(artifact.revision || 1)}</span></div><div class="card-footer artifact-footer"><span class="artifact-kind-tag">${shortKind}</span><div class="artifact-actions">${artifact.previewable ? '<button class="skill-action artifact-preview" type="button">预览</button>' : ""}<button class="skill-action artifact-download" type="button">下载</button><button class="skill-action danger artifact-delete" type="button">删除</button></div></div>`;
+      card.querySelector(".artifact-preview")?.addEventListener("click", () => onPreview(artifact));
       card.querySelector(".artifact-download").addEventListener("click", () => onDownload(artifact));
       card.querySelector(".artifact-delete").addEventListener("click", () => onDelete(artifact));
       els.artifactsGrid.appendChild(card);

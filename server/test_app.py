@@ -123,6 +123,14 @@ class AgentPlatformApiTests(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.read(), response.headers.get_content_type()
 
+    def preview_artifact(self, artifact_id, token=None):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/artifacts/{artifact_id}/preview",
+            headers={"Authorization": f"Bearer {token or self.token}"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.read(), response.headers
+
     @staticmethod
     def parse_event(raw):
         lines = raw.splitlines()
@@ -151,6 +159,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         request = urllib.request.Request(f"{self.base_url}/api/health")
         with urllib.request.urlopen(request, timeout=3) as response:
             self.assertIn("form-action 'self'", response.headers["Content-Security-Policy"])
+            self.assertIn("frame-src 'self' about:", response.headers["Content-Security-Policy"])
             self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(response.headers["Cross-Origin-Resource-Policy"], "same-origin")
@@ -164,6 +173,12 @@ class AgentPlatformApiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(cross_origin, timeout=3)
         self.assertEqual(denied.exception.code, 403)
+
+    def test_frontend_assets_revalidate_after_local_source_restart(self):
+        request = urllib.request.Request(f"{self.base_url}/static/app.js")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            self.assertEqual(response.headers["Cache-Control"], "no-cache, must-revalidate")
+            self.assertIn("artifactPreview.bind", response.read().decode("utf-8"))
 
     def test_sensitive_values_are_redacted_before_logging(self):
         message = app.redact_sensitive_text("Authorization: Bearer abc123 password=hunter2 api_key: value")
@@ -807,6 +822,118 @@ class AgentPlatformApiTests(unittest.TestCase):
         finally:
             app.ARTIFACT_DIR = original_artifact_dir
 
+    def test_html_artifact_is_confirmed_previewed_and_idempotent(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = True
+        try:
+            thread = self.request_json("/api/threads", {"title": "HTML 安全预览"}, self.token)["thread"]
+            unsafe_answer = (
+                '# 安全报告\n\n<script>alert("body")</script>\n\n'
+                '<form action="https://evil.example"><input onfocus="alert(1)"></form>'
+            )
+            with app.db() as conn:
+                conn.execute(
+                    "INSERT INTO messages (id, thread_id, role, content, created_at) "
+                    "VALUES (?, ?, 'assistant', ?, ?)",
+                    ("unsafe_previous_answer", thread["id"], unsafe_answer, app.now()),
+                )
+            events = self.chat({"thread_id": thread["id"], "content": "把上面内容生成 HTML 报告"})
+            self.assertEqual(events[-1]["event"], "confirmation")
+            self.assertEqual(events[-1]["data"]["kind"], "html")
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            result = self.request_json(
+                f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token, timeout=30
+            )
+            artifact = result["artifact"]
+            self.assertEqual(artifact["kind"], "html")
+            self.assertTrue(artifact["previewable"])
+            self.assertEqual(artifact["mime_type"], "text/html; charset=utf-8")
+            self.assertEqual(artifact["status"], "ready")
+            self.assertEqual(artifact["revision"], 1)
+            self.assertGreater(artifact["size_bytes"], 0)
+            self.assertNotIn("storage_path", artifact)
+            preview, headers = self.preview_artifact(artifact["id"])
+            rendered = preview.decode("utf-8")
+            self.assertEqual(headers.get_content_type(), "text/html")
+            self.assertEqual(headers["Content-Disposition"], "inline")
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+            self.assertIn("&lt;script&gt;", rendered)
+            self.assertNotIn('<script>alert("body")</script>', rendered)
+            self.assertNotIn("<form action=", rendered)
+            repeated = app.create_artifact(
+                artifact["user_id"], run_id, "html", "ignored", "ignored"
+            )
+            self.assertEqual(repeated["id"], artifact["id"])
+            with app.db() as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM artifacts WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            self.assertEqual(count, 1)
+        finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
+            app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_html_artifact_renders_a_sanitized_page_and_recovers_legacy_wrappers(self):
+        artifact_root = Path(self.temp_dir.name) / "html-artifacts"
+        raw_html = """<!doctype html>
+        <html><head><title>项目页面</title><style>
+        body { background: #f7f9fc; } .card { color: #14532d; }
+        .remote { background-image: url(https://evil.example/a.png); }
+        </style></head><body>
+        <main class="card" onclick="alert(1)"><h1>真实页面</h1>
+        <table><tr><td>阶段一</td></tr></table>
+        <script>window.stolen = true</script>
+        <img src="https://evil.example/tracker.png" alt="远程图片">
+        </main></body></html>"""
+        result = app.write_artifact_file(
+            artifact_root=artifact_root,
+            user_id="user",
+            artifact_id="artifact_page",
+            kind="html",
+            title="项目页面",
+            answer=raw_html,
+            node_binary="node",
+            xlsx_script=app.ARTIFACT_SCRIPT,
+            root_dir=app.ROOT_DIR,
+        )
+        stored = result["path"].read_text(encoding="utf-8")
+        self.assertIn('name="agent-preview-mode"', stored)
+        self.assertIn("<table>", stored)
+        self.assertIn("真实页面", stored)
+        self.assertNotIn("onclick", stored)
+        self.assertNotIn("<script", stored)
+        self.assertNotIn("evil.example", stored)
+        self.assertIn(".preview-document", stored)
+
+        legacy = app.render_static_html("旧产物", raw_html)
+        legacy_path = artifact_root / "legacy.html"
+        legacy_path.write_text(legacy, encoding="utf-8")
+        rendered, _ = app.preview_content({
+            "kind": "html",
+            "filename": "legacy.html",
+            "storage_path": str(legacy_path),
+            "content_sha256": app.hashlib.sha256(legacy.encode("utf-8")).hexdigest(),
+        }, artifact_root)
+        preview = rendered.decode("utf-8")
+        self.assertIn('name="agent-preview-mode"', preview)
+        self.assertIn("<table>", preview)
+        self.assertIn("阶段一", preview)
+        self.assertNotIn("&lt;table&gt;", preview)
+        self.assertNotIn("<script", preview)
+
+    def test_html_artifact_feature_flag_defaults_to_denied(self):
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = False
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                self.chat({"thread_id": "", "content": "生成 HTML 报告"})
+            self.assertEqual(denied.exception.code, 400)
+        finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
+
     def test_artifact_command_can_use_the_previous_answer_as_file_content(self):
         original_artifact_dir = app.ARTIFACT_DIR
         app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
@@ -876,7 +1003,9 @@ class AgentPlatformApiTests(unittest.TestCase):
 
     def test_xlsx_artifact_uses_a_fixed_workbook(self):
         original_artifact_dir = app.ARTIFACT_DIR
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
         app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = True
         try:
             events = self.chat({"thread_id": "", "content": "请生成 xlsx 文件，输出项目计划"})
             run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
@@ -893,10 +1022,32 @@ class AgentPlatformApiTests(unittest.TestCase):
             downloaded, content_type = self.download_artifact(artifact["id"])
             self.assertEqual(content_type, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             self.assertTrue(downloaded.startswith(b"PK"))
+            preview, headers = self.preview_artifact(artifact["id"])
+            self.assertEqual(headers.get_content_type(), "text/html")
+            self.assertIn("项目计划", preview.decode("utf-8"))
             with zipfile.ZipFile(path) as workbook:
                 self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
         finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
             app.ARTIFACT_DIR = original_artifact_dir
+
+    def test_json_artifact_preview_is_pretty_printed_and_escaped(self):
+        artifact_root = Path(self.temp_dir.name) / "artifacts"
+        artifact_root.mkdir()
+        path = artifact_root / "report.json"
+        content = b'{"title":"<script>alert(1)</script>","count":2}'
+        path.write_bytes(content)
+        row = {
+            "kind": "json",
+            "filename": "report.json",
+            "storage_path": str(path),
+            "content_sha256": app.hashlib.sha256(content).hexdigest(),
+        }
+        rendered, content_type = app.preview_content(row, artifact_root)
+        self.assertEqual(content_type, "text/html; charset=utf-8")
+        text = rendered.decode("utf-8")
+        self.assertIn("&lt;script&gt;", text)
+        self.assertNotIn("<script>alert(1)</script>", text)
 
     def test_local_tool_execution_is_bounded_and_audited(self):
         events = self.chat({"thread_id": "", "content": "请分析当前平台状态，并给出优化方案"})
@@ -993,6 +1144,37 @@ class AgentPlatformApiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as failure:
             self.request_json(f"/api/threads/{member_thread['id']}", {"title": "越权编辑"}, self.token, method="PATCH")
         self.assertEqual(failure.exception.code, 404)
+
+    def test_project_space_members_can_preview_and_download_shared_artifacts(self):
+        original_artifact_dir = app.ARTIFACT_DIR
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
+        app.ARTIFACT_DIR = Path(self.temp_dir.name) / "shared-artifacts"
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = True
+        try:
+            with app.db() as conn:
+                conn.execute("INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)", (
+                    "artifact_member", "artifact-member@example.com", app.hash_password("member123"), "产物成员", app.now(),
+                ))
+            member_token = self.request_json("/api/login", {"email": "artifact-member@example.com", "password": "member123"})["token"]
+            space = self.request_json("/api/folders", {"name": "产物共享项目", "section": "project"}, self.token)["folder"]
+            self.request_json(f"/api/folders/{space['id']}/invitations", {"email": "artifact-member@example.com"}, self.token)
+            thread = self.request_json("/api/threads", {"title": "共享文件", "folder_id": space["id"]}, self.token)["thread"]
+            events = self.chat({"thread_id": thread["id"], "content": "请生成 Markdown 文件，内容为项目共享产物"})
+            run_id = next(event["data"]["run_id"] for event in events if event["event"] == "meta")
+            artifact = self.request_json(f"/api/runs/{run_id}/confirmation", {"approved": True}, self.token)["artifact"]
+
+            preview, headers = self.preview_artifact(artifact["id"], token=member_token)
+            self.assertEqual(headers.get_content_type(), "text/html")
+            self.assertIn("项目共享产物", preview.decode("utf-8"))
+            download_request = urllib.request.Request(
+                f"{self.base_url}/api/artifacts/{artifact['id']}/download",
+                headers={"Authorization": f"Bearer {member_token}"},
+            )
+            with urllib.request.urlopen(download_request, timeout=3) as response:
+                self.assertIn("项目共享产物", response.read().decode("utf-8"))
+        finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
+            app.ARTIFACT_DIR = original_artifact_dir
 
     def test_space_invitation_auto_join_and_member_management_permissions(self):
         owner_id = self.request_json("/api/me", token=self.token)["user"]["id"]
@@ -1328,6 +1510,8 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(len(run_detail["citation_feedback_items"]), 1)
         self.assertEqual(run_detail["citation_feedback_items"][0]["document_id"], citation_item["document_id"])
         self.assertEqual(run_detail["citation_feedback_items"][0]["position"], citation_item["position"])
+        self.assertEqual(run_detail["knowledge_sources"][0]["document_id"], document_id)
+        self.assertEqual(run_detail["knowledge_sources"][0]["kind"], "markdown")
         metrics = self.request_json("/api/metrics", token=self.token)
         self.assertEqual(metrics["feedback"]["document_citation_accuracy"], 0.0)
         self.assertFalse(metrics["feedback"]["sufficient_for_retrieval_claim"])
@@ -1354,6 +1538,59 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])
+
+    def test_knowledge_file_can_be_previewed_downloaded_and_is_owner_isolated(self):
+        original_knowledge_dir = app.KNOWLEDGE_DIR
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
+        app.KNOWLEDGE_DIR = Path(self.temp_dir.name) / "knowledge"
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = True
+        source = "# 可预览资料\n\n这是知识库文件正文。"
+        try:
+            uploaded = self.request_json("/api/knowledge", {
+                "filename": "preview.md",
+                "mime_type": "text/markdown",
+                "content_base64": base64.b64encode(source.encode("utf-8")).decode("ascii"),
+            }, self.token)
+            document_id = uploaded["document"]["id"]
+            listed = self.request_json("/api/knowledge", token=self.token)["documents"][0]
+            self.assertTrue(listed["previewable"])
+            self.assertEqual(listed["kind"], "markdown")
+
+            preview_request = urllib.request.Request(
+                f"{self.base_url}/api/knowledge/{document_id}/preview",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            with urllib.request.urlopen(preview_request, timeout=3) as response:
+                preview = response.read().decode("utf-8")
+                self.assertEqual(response.headers.get_content_type(), "text/html")
+                self.assertEqual(response.headers["Content-Disposition"], "inline")
+            self.assertIn("可预览资料", preview)
+            self.assertIn("知识库文件正文", preview)
+
+            download_request = urllib.request.Request(
+                f"{self.base_url}/api/knowledge/{document_id}/download",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            with urllib.request.urlopen(download_request, timeout=3) as response:
+                self.assertEqual(response.read().decode("utf-8"), source)
+
+            invitation = app.create_trial_invitation("other-preview@example.com", 600)
+            other = self.request_json("/api/trial-invitations/accept", {
+                "token": invitation,
+                "email": "other-preview@example.com",
+                "name": "Other",
+                "password": "other-password-123",
+            })
+            denied = urllib.request.Request(
+                f"{self.base_url}/api/knowledge/{document_id}/preview",
+                headers={"Authorization": f"Bearer {other['token']}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(denied, timeout=3)
+            self.assertEqual(error.exception.code, 404)
+        finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
+            app.KNOWLEDGE_DIR = original_knowledge_dir
 
     def test_knowledge_citations_show_each_matched_document_once(self):
         answer = app.append_knowledge_sources("回答", [
@@ -1402,7 +1639,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         workbook = io.BytesIO()
         with zipfile.ZipFile(workbook, "w") as archive:
             archive.writestr("xl/workbook.xml", """<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"预算\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>""")
-            archive.writestr("xl/_rels/workbook.xml.rels", """<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"/></Relationships>""")
+            archive.writestr("xl/_rels/workbook.xml.rels", """<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Target=\"/xl/worksheets/sheet1.xml\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"/></Relationships>""")
             archive.writestr("xl/sharedStrings.xml", """<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><si><t>项目</t></si><si><t>预算</t></si></sst>""")
             archive.writestr("xl/worksheets/sheet1.xml", """<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row></sheetData></worksheet>""")
         text = app.extract_knowledge_text("budget.xlsx", workbook.getvalue())
@@ -1459,7 +1696,9 @@ class AgentPlatformApiTests(unittest.TestCase):
 
     def test_artifact_download_rechecks_current_user_and_hides_local_path(self):
         original_artifact_dir = app.ARTIFACT_DIR
+        original_preview_flag = app.HTML_ARTIFACT_PREVIEW_ENABLED
         app.ARTIFACT_DIR = Path(self.temp_dir.name) / "artifacts"
+        app.HTML_ARTIFACT_PREVIEW_ENABLED = True
         foreign_file = app.ARTIFACT_DIR / "other_user" / "private.md"
         foreign_file.parent.mkdir(parents=True)
         foreign_file.write_text("private", encoding="utf-8")
@@ -1473,7 +1712,15 @@ class AgentPlatformApiTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as denied:
                 urllib.request.urlopen(request, timeout=3)
             self.assertEqual(denied.exception.code, 404)
+            preview_request = urllib.request.Request(
+                f"{self.base_url}/api/artifacts/foreign_artifact/preview",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as preview_denied:
+                urllib.request.urlopen(preview_request, timeout=3)
+            self.assertEqual(preview_denied.exception.code, 404)
         finally:
+            app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
             app.ARTIFACT_DIR = original_artifact_dir
 
     def test_failed_run_can_retry_without_duplicate_user_message(self):

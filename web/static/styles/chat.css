@@ -323,14 +323,42 @@
 }
 
 .artifact-link {
-  display: inline-block;
+  display: flex;
+  width: fit-content;
+  max-width: min(100%, 520px);
+  align-items: center;
+  gap: 10px;
   margin-top: 12px;
+  padding: 9px 12px 9px 9px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
   color: #0f766e;
   text-decoration: none;
   font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.artifact-link:hover { text-decoration: underline; }
+.artifact-link::before {
+  content: attr(data-kind);
+  flex: 0 0 auto;
+  min-width: 38px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  background: #dff4ef;
+  color: #0f766e;
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+
+.artifact-link:hover {
+  border-color: #8acdc2;
+  background: #f5fbf9;
+}
 
 .retry-button:hover {
   background: var(--panel-soft);

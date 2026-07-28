@@ -6,6 +6,7 @@ window.AgentState = {
   threadContext: { sources: [], outputs: [] }, skills: [], models: [], artifacts: [], tools: [],
   knowledgeDocuments: [], memories: [], selectedSkillIds: [], activeView: "chat", streaming: false,
   currentThreadEditable: true, spaceComposerFolder: null, knowledgeUploadSpaceId: "", currentSpaceId: "",
+  selectedArtifactId: "", artifactPreviewOpen: false, artifactPreviewRevision: 0,
 };
 
 window.AgentUiState = {

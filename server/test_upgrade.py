@@ -45,7 +45,11 @@ class UpgradeSnapshotTests(unittest.TestCase):
             (data / "knowledge").mkdir(parents=True)
             (data / "artifacts").mkdir()
             (data / "knowledge" / "a.txt").write_text("knowledge", encoding="utf-8")
-            (data / "artifacts" / "b.txt").write_text("artifact", encoding="utf-8")
+            html_artifact = (
+                "<!doctype html><meta http-equiv=\"Content-Security-Policy\" "
+                "content=\"default-src 'none'\"><p>artifact preview</p>"
+            )
+            (data / "artifacts" / "b.html").write_text(html_artifact, encoding="utf-8")
             with sqlite3.connect(database) as conn:
                 conn.execute("CREATE TABLE marker (value TEXT)")
                 conn.execute("INSERT INTO marker VALUES ('before')")
@@ -59,7 +63,10 @@ class UpgradeSnapshotTests(unittest.TestCase):
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM marker").fetchone()[0], "before")
             self.assertEqual((data / "knowledge" / "a.txt").read_text(encoding="utf-8"), "knowledge")
-            self.assertEqual((data / "artifacts" / "b.txt").read_text(encoding="utf-8"), "artifact")
+            self.assertEqual(
+                (data / "artifacts" / "b.html").read_text(encoding="utf-8"),
+                html_artifact,
+            )
             self.assertTrue((snapshot / "manifest.json").is_file())
 
     def test_isolated_restore_never_overwrites_production_paths(self):

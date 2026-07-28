@@ -11,11 +11,24 @@ const localStorage = {
 const elements = new Map();
 const context = vm.createContext({
   window: {},
+  DOMParser: class {
+    parseFromString() {
+      return {
+        body: { childNodes: [{ nodeName: "MAIN" }] },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+      };
+    }
+  },
   localStorage,
-  document: { querySelector: (selector) => {
-    if (!elements.has(selector)) elements.set(selector, { selector });
-    return elements.get(selector);
-  } },
+  document: {
+    createDocumentFragment: () => ({ children: [], appendChild(node) { this.children.push(node); } }),
+    importNode: (node) => node,
+    querySelector: (selector) => {
+      if (!elements.has(selector)) elements.set(selector, { selector });
+      return elements.get(selector);
+    },
+  },
   TextDecoder,
   TextEncoder,
   fetch: async () => ({ ok: true, json: async () => ({ ok: true }) }),
@@ -53,12 +66,15 @@ const executionMode = readFileSync(new URL("../web/static/chat/execution-mode.js
 const markdown = readFileSync(new URL("../web/static/chat/markdown.js", import.meta.url), "utf8");
 const interactions = readFileSync(new URL("../web/static/chat/interactions.js", import.meta.url), "utf8");
 const runTrace = readFileSync(new URL("../web/static/chat/run-trace.js", import.meta.url), "utf8");
+const artifactPreview = readFileSync(new URL("../web/static/chat/artifact-preview.js", import.meta.url), "utf8");
 const knowledgeLibrary = readFileSync(new URL("../web/static/knowledge/library.js", import.meta.url), "utf8");
 const spaceWorkspace = readFileSync(new URL("../web/static/space/workspace.js", import.meta.url), "utf8");
 const resourceViews = readFileSync(new URL("../web/static/views/resources.js", import.meta.url), "utf8");
 const capabilityViews = readFileSync(new URL("../web/static/views/capabilities.js", import.meta.url), "utf8");
 const settingsView = readFileSync(new URL("../web/static/views/settings.js", import.meta.url), "utf8");
 const auditView = readFileSync(new URL("../web/static/views/audit.js", import.meta.url), "utf8");
+const responsiveStyles = readFileSync(new URL("../web/static/styles/responsive.css", import.meta.url), "utf8");
+const styleEntry = readFileSync(new URL("../web/static/styles.css", import.meta.url), "utf8");
 assert.match(app, /storage\.saveWorkspace\(UI_STATE_KEY/);
 assert.match(app, /storage\.loadWorkspace\(UI_STATE_KEY\)/);
 assert.match(app, /storage\.clearToken\(\)/);
@@ -84,6 +100,29 @@ assert.match(executionMode, /window\.AgentExecutionMode/);
 assert.match(markdown, /window\.AgentMarkdown/);
 assert.match(interactions, /window\.AgentChatInteractions/);
 assert.match(runTrace, /window\.AgentRunTrace/);
+assert.match(artifactPreview, /window\.AgentArtifactPreview/);
+assert.match(artifactPreview, /artifact\.preview_url \|\| `\/api\/artifacts\/\$\{artifact\.id\}\/preview`/);
+assert.match(artifactPreview, /Authorization: `Bearer \$\{state\.token\}`/);
+assert.match(artifactPreview, /new DOMParser\(\)\.parseFromString\(content, "text\/html"\)/);
+assert.match(artifactPreview, /artifactPreviewSurface\.replaceChildren\(previewFragment\)/);
+assert.match(artifactPreview, /attachShadow\(\{ mode: "open" \}\)/);
+assert.match(artifactPreview, /agent-preview-mode/);
+assert.match(loginPage, /id="artifactPreviewSurface"[^>]+role="document"/);
+assert.match(loginPage, /id="artifactPreviewContent"/);
+assert.match(loginPage, /\/static\/app\.js\?v=p48-4-3/);
+assert.match(loginPage, /\/static\/styles\.css\?v=p48-4-4/);
+assert.match(resourceViews, /artifact\.previewable/);
+assert.match(app, /artifactPreview\.bind\(state, els\)/);
+assert.match(app, /if \(state\.artifactPreviewOpen\) artifactPreview\.showContext\(state, els\)/);
+assert.match(artifactPreview, /threadContextPanel\.classList\.remove\("hidden"\)/);
+assert.match(app, /data\.artifact && !wrapper\.querySelector\("\.artifact-link"\)/);
+assert.match(app, /link\.dataset\.kind/);
+assert.match(app, /appendKnowledgeSourceLinks\(wrapper, data\.knowledge_sources/);
+assert.match(app, /preview_url: `\/api\/knowledge\/\$\{id\}\/preview`/);
+assert.match(knowledgeLibrary, /knowledge-preview/);
+assert.match(responsiveStyles, /\.workspace\.artifact-preview-open\s*\{[\s\S]*?grid-template-columns:\s*1fr;[\s\S]*?overflow:\s*hidden;/);
+assert.match(responsiveStyles, /@media \(min-width: 601px\) and \(max-width: 760px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 44%\) minmax\(0, 56%\)/);
+assert.match(styleEntry, /responsive\.css\?v=p48-3-1/);
 assert.match(knowledgeLibrary, /window\.AgentKnowledgeLibrary/);
 assert.match(spaceWorkspace, /window\.AgentSpaceWorkspace/);
 assert.match(resourceViews, /window\.AgentResourceViews/);
@@ -107,5 +146,49 @@ await context.AgentChatStream.consume({ body: { getReader: () => ({
 }) } }, (event) => { streamed = event; encodedEvent = null; });
 assert.equal(streamed.event, "meta");
 assert.equal(streamed.data.thread_id, "thread-1");
+
+vm.runInContext(artifactPreview, context);
+const classSet = () => {
+  const values = new Set();
+  return {
+    add: (...names) => names.forEach((name) => values.add(name)),
+    remove: (...names) => names.forEach((name) => values.delete(name)),
+    contains: (name) => values.has(name),
+  };
+};
+const previewEls = {};
+for (const key of [
+  "workspaceView", "threadContextContent", "artifactPreviewContent",
+  "threadContextTab", "artifactPreviewTab", "threadContextPanel",
+]) {
+  previewEls[key] = {
+    classList: classSet(),
+    setAttribute(name, value) { this[name] = value; },
+  };
+}
+Object.assign(previewEls, {
+  artifactPreviewTitle: { textContent: "" },
+  artifactPreviewMeta: { textContent: "" },
+  artifactPreviewNotice: { textContent: "" },
+  artifactPreviewSurface: { replaceChildren() {} },
+  artifactPreviewDownload: { onclick: null },
+});
+const previewState = { token: "preview-token" };
+context.fetch = async (path, options) => {
+  request = { path, options };
+  return {
+    ok: true,
+    text: async () => "<!doctype html><p>preview</p>",
+  };
+};
+await context.AgentArtifactPreview.open(
+  previewState,
+  previewEls,
+  { id: "artifact-1", filename: "report.html", kind: "html", revision: 1, previewable: true },
+  async () => {},
+);
+assert.equal(request.path, "/api/artifacts/artifact-1/preview");
+assert.equal(request.options.headers.Authorization, "Bearer preview-token");
+assert.equal(previewState.artifactPreviewOpen, true);
 
 console.log("frontend core module checks passed");

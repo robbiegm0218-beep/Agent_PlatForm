@@ -8,6 +8,7 @@ const chatStream = window.AgentChatStream;
 const markdown = window.AgentMarkdown;
 const chatInteractions = window.AgentChatInteractions;
 const runTrace = window.AgentRunTrace;
+const artifactPreview = window.AgentArtifactPreview;
 const knowledgeLibrary = window.AgentKnowledgeLibrary;
 const spaceWorkspace = window.AgentSpaceWorkspace;
 const resourceViews = window.AgentResourceViews;
@@ -281,28 +282,69 @@ async function loadArtifacts() {
 }
 
 function renderArtifacts() {
-  resourceViews.renderArtifacts(state, els, escapeHtml, { onDownload: downloadArtifact, onDelete: deleteArtifact });
+  resourceViews.renderArtifacts(state, els, escapeHtml, {
+    onPreview: openArtifact,
+    onDownload: downloadArtifact,
+    onDelete: deleteArtifact,
+  });
+}
+
+async function openArtifact(artifact) {
+  const resolved = artifact?.previewable === undefined
+    ? state.artifacts.find((item) => item.id === artifact?.id) || artifact
+    : artifact;
+  await artifactPreview.open(state, els, resolved, downloadArtifact);
+}
+
+function knowledgePreviewResource(document) {
+  const id = document.document_id || document.id;
+  return {
+    ...document,
+    id,
+    filename: document.filename || document.title || "知识库文件",
+    kind: document.file_kind || document.kind || "knowledge",
+    previewable: document.previewable !== false,
+    preview_url: `/api/knowledge/${id}/preview`,
+  };
+}
+
+async function openKnowledge(document) {
+  const resource = knowledgePreviewResource(document);
+  await artifactPreview.open(state, els, resource, downloadKnowledge);
+}
+
+async function downloadResource(resource, path) {
+  const response = await fetch(path, {
+    headers: { Authorization: `Bearer ${state.token}` },
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "文件下载失败");
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const download = document.createElement("a");
+  download.href = url;
+  download.download = resource.filename;
+  document.body.appendChild(download);
+  download.click();
+  download.remove();
+  URL.revokeObjectURL(url);
 }
 
 async function downloadArtifact(artifact) {
   try {
-    const response = await fetch(`/api/artifacts/${artifact.id}/download`, {
-      headers: { Authorization: `Bearer ${state.token}` },
-    });
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.error || "文件下载失败");
-    }
-    const url = URL.createObjectURL(await response.blob());
-    const download = document.createElement("a");
-    download.href = url;
-    download.download = artifact.filename;
-    document.body.appendChild(download);
-    download.click();
-    download.remove();
-    URL.revokeObjectURL(url);
+    await downloadResource(artifact, `/api/artifacts/${artifact.id}/download`);
   } catch (error) {
     window.alert(error.message);
+  }
+}
+
+async function downloadKnowledge(document) {
+  const resource = knowledgePreviewResource(document);
+  try {
+    await downloadResource(resource, `/api/knowledge/${resource.id}/download`);
+  } catch (error) {
+    window.alert(error.message || "知识库文件下载失败");
   }
 }
 
@@ -315,6 +357,7 @@ async function deleteArtifact(artifact) {
 function renderKnowledge(documents) {
   state.knowledgeDocuments = documents;
   knowledgeLibrary.renderDocuments(state, els, escapeHtml, {
+    onPreview: openKnowledge,
     onEdit: editKnowledge,
     onDelete: async (document) => {
       if (!window.confirm(`删除资料“${document.filename}”？`)) return;
@@ -343,7 +386,9 @@ function refreshKnowledgeAfterUpload(spaceId, document, retry = true) {
         const item = window.document.createElement("div"); item.className = "space-list-item space-knowledge-item"; item.dataset.knowledgeId = document.id;
         const name = window.document.createElement("span"); name.textContent = document.filename;
         const detail = window.document.createElement("small"); detail.textContent = `${document.chunk_count} 个检索片段 · 刚刚上传`;
-        item.append(name, detail); list.prepend(item);
+        const preview = window.document.createElement("button"); preview.type = "button"; preview.className = "space-knowledge-preview"; preview.textContent = "预览";
+        preview.addEventListener("click", () => openKnowledge(document));
+        item.append(name, detail, preview); list.prepend(item);
       }
       if (notice) notice.textContent = `已上传：${document.filename}`;
     }).catch((error) => {
@@ -398,7 +443,7 @@ async function searchKnowledge() {
     else params.set("project_scope", "all");
   }
   const data = await api(`/api/knowledge/search?${params}`);
-  knowledgeLibrary.renderSearchResults(els, data.results, escapeHtml);
+  knowledgeLibrary.renderSearchResults(els, data.results, escapeHtml, openKnowledge);
 }
 
 function renderThreads() {
@@ -607,7 +652,7 @@ async function openSpace(spaceId) {
     spaceWorkspace.render({ data, state, spaceId, userId: state.user?.id, escape: escapeHtml, detail: els.spaceDetail });
     mountSpaceComposer(data.space);
   els.spaceDetail.querySelectorAll(".space-task-link").forEach((button) => button.addEventListener("click", () => { switchView("chat"); loadThread(button.dataset.threadId); }));
-  els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => downloadArtifact({ id: button.dataset.artifactId })));
+  els.spaceDetail.querySelectorAll(".space-artifact-link").forEach((button) => button.addEventListener("click", () => openArtifact({ id: button.dataset.artifactId })));
   els.spaceDetail.querySelectorAll(".remove-space-member").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("移除该成员？")) return;
     button.disabled = true;
@@ -645,6 +690,10 @@ async function openSpace(spaceId) {
       await loadKnowledge();
       if (!els.spaceDetail.querySelector(".space-knowledge-item")) els.spaceDetail.querySelector("#spaceKnowledgeList").textContent = "该项目空间暂未上传知识资料";
     } catch (error) { window.alert(error.message || "删除资料失败"); button.disabled = false; }
+  }));
+  els.spaceDetail.querySelectorAll(".space-knowledge-preview").forEach((button) => button.addEventListener("click", () => {
+    const document = (data.knowledge_documents || []).find((item) => item.id === button.closest(".space-knowledge-item").dataset.knowledgeId);
+    if (document) openKnowledge(document);
   }));
   els.spaceDetail.querySelectorAll(".space-knowledge-edit").forEach((button) => button.addEventListener("click", () => {
     const document = (data.knowledge_documents || []).find((item) => item.id === button.closest(".space-knowledge-item").dataset.knowledgeId);
@@ -794,13 +843,13 @@ function renderThreadContext() {
   const hasThread = Boolean(state.currentThreadId);
   els.threadContextCount.textContent = hasThread ? `${sources.length + outputs.length} 项` : "新对话";
   renderContextList(els.threadOutputs, outputs, "暂无文件输出", (artifact) => {
-    const kind = artifact.kind === "xlsx" ? "Excel 文件" : "Markdown 文件";
+    const labels = { xlsx: "Excel 文件", html: "HTML 文件", markdown: "Markdown 文件", json: "JSON 文件" };
     return {
-      icon: "↧",
+      icon: artifact.previewable ? "◫" : "↧",
       title: artifact.filename,
-      detail: `${kind}${artifact.summary ? ` · ${artifact.summary}` : ""}`,
-      onClick: () => downloadArtifact(artifact),
-      titleAttr: "下载此对话生成的文件",
+      detail: `${labels[artifact.kind] || "文件"}${artifact.summary ? ` · ${artifact.summary}` : ""}`,
+      onClick: () => openArtifact(artifact),
+      titleAttr: artifact.previewable ? "预览此对话生成的文件" : "下载此对话生成的文件",
     };
   });
   renderContextList(els.threadSources, sources, "本次对话尚未命中资料或网页来源", (source) => {
@@ -813,16 +862,21 @@ function renderThreadContext() {
         titleAttr: "打开网页来源",
       };
     }
+    if (source.redacted) {
+      return {
+        icon: "—",
+        title: source.title || "资料引用已隐藏",
+        detail: "当前账号已无权访问该知识库文件",
+        onClick: () => {},
+        titleAttr: "该资料当前不可访问",
+      };
+    }
     return {
-      icon: "⌕",
+      icon: "◫",
       title: source.filename,
       detail: `片段 ${source.position + 1}${source.excerpt ? ` · ${source.excerpt}` : ""}`,
-      onClick: async () => {
-        switchView("knowledge");
-        els.knowledgeSearch.value = source.filename;
-        await searchKnowledge();
-      },
-      titleAttr: "在知识库中查看此来源",
+      onClick: () => openKnowledge(source),
+      titleAttr: "预览本次回答调用的知识库文件",
     };
   });
 }
@@ -993,6 +1047,10 @@ function appendMessage(role, content, runId = "") {
 async function appendSavedConversationRun(wrapper, runId) {
   const data = await api(`/api/runs/${runId}`);
   runTrace.appendSavedRunTrace(wrapper, data);
+  if (data.artifact && !wrapper.querySelector(".artifact-link")) {
+    appendArtifactLink(wrapper, data.artifact);
+  }
+  appendKnowledgeSourceLinks(wrapper, data.knowledge_sources || []);
   appendChatAnswerFeedback(wrapper, runId, data);
   await appendChatCitationFeedback(wrapper, runId, data);
 }
@@ -1117,8 +1175,13 @@ function renderMessageContent(element, content, role = "assistant") {
       .replace(/^【|】$/g, "")
       .replace(/（片段\s*\d+(?:\s*·\s*摘录：[\s\S]*)?）$/, "");
     source.textContent = sourceLabel;
-    source.title = `查看本地资料：${filename}`;
+    source.title = `预览本地资料：${filename}`;
     source.addEventListener("click", async () => {
+      const knowledgeDocument = state.knowledgeDocuments.find((item) => item.filename === filename);
+      if (knowledgeDocument) {
+        await openKnowledge(knowledgeDocument);
+        return;
+      }
       switchView("knowledge");
       els.knowledgeSearch.value = filename;
       await searchKnowledge();
@@ -1192,6 +1255,7 @@ function renderApps(apps, tools = []) {
 }
 
 function switchView(view) {
+  if (state.artifactPreviewOpen) artifactPreview.showContext(state, els);
   if (view !== "space") restoreChatComposer();
   state.activeView = view;
   persistWorkspaceState();
@@ -1395,6 +1459,7 @@ async function sendMessage(content, { retry = false } = {}) {
     state.messages.push({ role: "assistant", content: assistantContent, run_id: completedRunId });
     if (completedRunId) {
       const runDetail = await api(`/api/runs/${completedRunId}`);
+      appendKnowledgeSourceLinks(assistant.wrapper, runDetail.knowledge_sources || []);
       appendChatAnswerFeedback(assistant.wrapper, completedRunId, runDetail);
       await appendChatCitationFeedback(assistant.wrapper, completedRunId, runDetail);
     }
@@ -1426,6 +1491,7 @@ function appendConfirmationActions(assistant, confirmation, sourceContent) {
     appendArtifact: appendArtifactLink,
     appendCompletedFeedback: async (wrapper, runId) => {
       const detail = await api(`/api/runs/${runId}`);
+      appendKnowledgeSourceLinks(wrapper, detail.knowledge_sources || []);
       appendChatAnswerFeedback(wrapper, runId, detail);
       await appendChatCitationFeedback(wrapper, runId, detail);
     },
@@ -1438,10 +1504,15 @@ function appendArtifactLink(wrapper, artifact) {
   const link = document.createElement("a");
   link.className = "artifact-link";
   link.href = "#";
-  link.textContent = `下载文件：${artifact.filename}`;
-  link.title = artifact.summary || "下载本次生成的文件";
+  link.dataset.kind = String(artifact.kind || "file").toUpperCase();
+  link.textContent = `${artifact.previewable ? "预览" : "下载"}文件：${artifact.filename}`;
+  link.title = artifact.summary || `${artifact.previewable ? "预览" : "下载"}本次生成的文件`;
   link.addEventListener("click", async (event) => {
     event.preventDefault();
+    if (artifact.previewable) {
+      await openArtifact(artifact);
+      return;
+    }
     link.setAttribute("aria-busy", "true");
     const originalText = link.textContent;
     link.textContent = "正在下载文件...";
@@ -1470,6 +1541,27 @@ function appendArtifactLink(wrapper, artifact) {
     }
   });
   wrapper.appendChild(link);
+}
+
+function appendKnowledgeSourceLinks(wrapper, sources) {
+  (sources || []).forEach((source) => {
+    const resource = knowledgePreviewResource(source);
+    if (!resource.id || wrapper.querySelector(`[data-knowledge-preview-id="${resource.id}"]`)) return;
+    const link = document.createElement("a");
+    link.className = "artifact-link knowledge-preview-link";
+    link.href = "#";
+    link.dataset.kind = String(resource.kind || "knowledge").toUpperCase();
+    link.dataset.knowledgePreviewId = resource.id;
+    link.textContent = `调用资料：${resource.filename}`;
+    link.title = source.excerpt
+      ? `预览本次回答调用的资料：${source.excerpt}`
+      : "预览本次回答调用的知识库文件";
+    link.addEventListener("click", async (event) => {
+      event.preventDefault();
+      await openKnowledge(resource);
+    });
+    wrapper.appendChild(link);
+  });
 }
 
 function appendRetryButton(wrapper, content) {
@@ -1976,6 +2068,8 @@ els.logoutAllButton.addEventListener("click", async () => {
   state.user = null;
   showLogin();
 });
+
+artifactPreview.bind(state, els);
 
 if (window.location.protocol === "file:") {
   showDirectOpenNotice();

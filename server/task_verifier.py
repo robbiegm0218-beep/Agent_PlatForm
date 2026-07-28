@@ -14,7 +14,7 @@ def verify(task_frame: dict | None, ledger: dict | None, answer: str, *, tool_ev
     unsupported = []
     goal = str(frame.get("goal", ""))
     requested_artifact = (artifact_request or {}).get("kind", "")
-    task_type = "file" if requested_artifact or any(word in goal.lower() for word in ("文件", "markdown", "excel", "xlsx")) else "code" if any(word in goal for word in ("代码", "实现", "测试")) else "plan" if any(word in goal for word in ("方案", "计划", "复盘")) else "analysis" if any(word in goal for word in ("分析", "调研")) else "knowledge" if requirements else "answer"
+    task_type = "file" if requested_artifact or any(word in goal.lower() for word in ("文件", "markdown", "excel", "xlsx", "html", "网页报告")) else "code" if any(word in goal for word in ("代码", "实现", "测试")) else "plan" if any(word in goal for word in ("方案", "计划", "复盘")) else "analysis" if any(word in goal for word in ("分析", "调研")) else "knowledge" if requirements else "answer"
     lower = answer.lower()
     if task_type == "plan":
         missing = [label for label in ("行动", "负责人", "时间", "风险", "指标") if label not in answer]

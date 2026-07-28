@@ -77,11 +77,37 @@ def _trial_invitations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trial_invitations_email ON trial_invitations(email, expires_at DESC)")
 
 
+def _artifact_preview_contract(conn: sqlite3.Connection) -> None:
+    columns = _column_names(conn, "artifacts")
+    additions = (
+        ("mime_type", "TEXT NOT NULL DEFAULT ''"),
+        ("status", "TEXT NOT NULL DEFAULT 'ready'"),
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("content_sha256", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {declaration}")
+    conn.execute("""UPDATE artifacts
+        SET mime_type = CASE kind
+            WHEN 'markdown' THEN 'text/markdown; charset=utf-8'
+            WHEN 'html' THEN 'text/html; charset=utf-8'
+            WHEN 'xlsx' THEN 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            WHEN 'json' THEN 'application/json; charset=utf-8'
+            ELSE 'application/octet-stream'
+        END
+        WHERE mime_type = ''""")
+    conn.execute("UPDATE artifacts SET updated_at = created_at WHERE updated_at = 0")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "personal_accounts_and_security_events", _personal_accounts),
     Migration(2, "account_deletion_requests", _account_deletion_requests),
     Migration(3, "login_throttles", _login_throttles),
     Migration(4, "trial_invitations", _trial_invitations),
+    Migration(5, "artifact_preview_contract", _artifact_preview_contract),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

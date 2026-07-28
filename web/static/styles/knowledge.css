@@ -29,6 +29,24 @@
   font-size: 13px;
 }
 
+.knowledge-result-preview {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.knowledge-result-preview span {
+  color: #0f766e;
+  font-size: 12px;
+}
+
 .knowledge-result p {
   margin: 6px 0 0;
   color: var(--muted);
