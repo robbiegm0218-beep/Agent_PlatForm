@@ -90,37 +90,38 @@ window.AgentArtifactPreview = {
       const content = await response.text();
       if (state.selectedArtifactId !== artifact.id) return;
       const documentPreview = new DOMParser().parseFromString(content, "text/html");
-      const htmlDocumentMode = documentPreview.querySelector('meta[name="agent-preview-mode"]')?.content === "html-document";
       const previewFragment = document.createDocumentFragment();
       for (const child of [...documentPreview.body.childNodes]) {
         previewFragment.appendChild(document.importNode(child, true));
       }
-      if (htmlDocumentMode) {
-        const shadow = els.artifactPreviewSurface.shadowRoot || els.artifactPreviewSurface.attachShadow({ mode: "open" });
-        const artifactCss = [...documentPreview.querySelectorAll("style")].map((style) => style.textContent || "").join("\n");
-        const baseCss = `
-          :host { display: block; height: 100%; overflow: auto; background: white; color: #252522; }
-          *, *::before, *::after { box-sizing: border-box; }
-          .preview-document { min-height: 100%; }
-          img { max-width: 100%; }
-        `;
-        try {
-          const sheet = new CSSStyleSheet();
-          sheet.replaceSync(`${baseCss}\n${artifactCss}`);
-          shadow.adoptedStyleSheets = [sheet];
-          shadow.replaceChildren(previewFragment);
-        } catch (_error) {
-          const style = document.createElement("style");
-          style.textContent = `${baseCss}\n${artifactCss}`;
-          shadow.replaceChildren(style, previewFragment);
+      // A shadow root cannot be detached after the first HTML preview. Render
+      // every file type into the same isolated surface so switching from HTML
+      // to Markdown, Excel, JSON, PDF, Word, text, or images never hides the
+      // newly loaded light-DOM content behind an existing empty shadow root.
+      const shadow = els.artifactPreviewSurface.shadowRoot || els.artifactPreviewSurface.attachShadow({ mode: "open" });
+      const artifactCss = [...documentPreview.querySelectorAll("style")].map((style) => style.textContent || "").join("\n");
+      const baseCss = `
+        :host { display: block; height: 100%; overflow: auto; background: white; color: #252522; }
+        *, *::before, *::after { box-sizing: border-box; }
+        .preview-document { min-height: 100%; }
+        img { max-width: 100%; height: auto; }
+        .knowledge-hit-highlight {
+          background: #fff2a8 !important;
+          box-shadow: 0 0 0 3px #fff2a8;
+          border-radius: 3px;
         }
-      } else {
-        // Non-HTML files use the platform's fixed document template.
-        els.artifactPreviewSurface.replaceChildren(previewFragment);
+      `;
+      try {
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(`${baseCss}\n${artifactCss}`);
+        shadow.adoptedStyleSheets = [sheet];
+        shadow.replaceChildren(previewFragment);
+      } catch (_error) {
+        const style = document.createElement("style");
+        style.textContent = `${baseCss}\n${artifactCss}`;
+        shadow.replaceChildren(style, previewFragment);
       }
-      const previewRoot = htmlDocumentMode
-        ? els.artifactPreviewSurface.shadowRoot
-        : els.artifactPreviewSurface;
+      const previewRoot = shadow;
       this.highlightExcerpt(previewRoot, artifact);
       els.artifactPreviewNotice.textContent = "";
     } catch (error) {

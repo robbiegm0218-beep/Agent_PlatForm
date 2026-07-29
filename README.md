@@ -260,7 +260,7 @@ python3 -m server.startup_checks --create-directories
 | `AGENT_DATABASE_PATH` | SQLite 数据库文件 | `agent_platform.db` |
 | `AGENT_DATA_DIR` | 知识库、产物和运行数据目录 | `data/` |
 | `MAX_SKILL_PACKAGE_BYTES` | 单个技能 ZIP 的压缩包与解压后总大小上限 | `307200`（300 KB） |
-| `HTML_ARTIFACT_PREVIEW_ENABLED` | 启用静态 HTML 生成及 HTML/Markdown 右侧安全预览 | `false` |
+| `HTML_ARTIFACT_PREVIEW_ENABLED` | 启用静态 HTML 生成及文件右侧安全预览；可显式设为 `false` 关闭 | `true` |
 | `AUTO_KNOWLEDGE_GATE_V2` | 启用高精度自动知识库门控；普通写作/计划/代码任务不探测，隐式候选需通过强相关门禁 | `false` |
 | `MAX_KNOWLEDGE_UPLOAD_BYTES` | 单个知识文件原始字节上限 | `8388608`（8 MB） |
 | `MAX_KNOWLEDGE_ARCHIVE_FILES` / `MAX_KNOWLEDGE_ARCHIVE_UNCOMPRESSED_BYTES` | DOCX/XLSX 的条目数与展开后大小上限 | `256` / `33554432`（32 MB） |

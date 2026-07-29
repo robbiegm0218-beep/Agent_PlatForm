@@ -341,10 +341,15 @@
 }
 
 .settings-stack {
+  flex: 1;
+  min-height: 0;
   display: grid;
   gap: 16px;
   margin: 28px;
   padding-bottom: 28px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .settings-panel h3 { margin: 0 0 16px; }

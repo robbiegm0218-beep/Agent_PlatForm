@@ -11,6 +11,9 @@ const localStorage = {
 const elements = new Map();
 const context = vm.createContext({
   window: {},
+  CSSStyleSheet: class {
+    replaceSync(content) { this.content = content; }
+  },
   DOMParser: class {
     parseFromString() {
       return {
@@ -74,6 +77,8 @@ const capabilityViews = readFileSync(new URL("../web/static/views/capabilities.j
 const settingsView = readFileSync(new URL("../web/static/views/settings.js", import.meta.url), "utf8");
 const auditView = readFileSync(new URL("../web/static/views/audit.js", import.meta.url), "utf8");
 const responsiveStyles = readFileSync(new URL("../web/static/styles/responsive.css", import.meta.url), "utf8");
+const layoutStyles = readFileSync(new URL("../web/static/styles/layout.css", import.meta.url), "utf8");
+const componentStyles = readFileSync(new URL("../web/static/styles/components.css", import.meta.url), "utf8");
 const styleEntry = readFileSync(new URL("../web/static/styles.css", import.meta.url), "utf8");
 assert.match(app, /storage\.saveWorkspace\(UI_STATE_KEY/);
 assert.match(app, /storage\.loadWorkspace\(UI_STATE_KEY\)/);
@@ -111,15 +116,14 @@ assert.match(artifactPreview, /window\.AgentArtifactPreview/);
 assert.match(artifactPreview, /artifact\.preview_url \|\| `\/api\/artifacts\/\$\{artifact\.id\}\/preview`/);
 assert.match(artifactPreview, /Authorization: `Bearer \$\{state\.token\}`/);
 assert.match(artifactPreview, /new DOMParser\(\)\.parseFromString\(content, "text\/html"\)/);
-assert.match(artifactPreview, /artifactPreviewSurface\.replaceChildren\(previewFragment\)/);
+assert.match(artifactPreview, /shadow\.replaceChildren\(previewFragment\)/);
 assert.match(artifactPreview, /attachShadow\(\{ mode: "open" \}\)/);
-assert.match(artifactPreview, /agent-preview-mode/);
 assert.match(artifactPreview, /highlightExcerpt\(root, artifact\)/);
 assert.match(artifactPreview, /knowledge-hit-highlight/);
 assert.match(artifactPreview, /scrollIntoView\(\{ block: "center", behavior: "smooth" \}\)/);
 assert.match(loginPage, /id="artifactPreviewSurface"[^>]+role="document"/);
 assert.match(loginPage, /id="artifactPreviewContent"/);
-assert.match(loginPage, /\/static\/chat\/artifact-preview\.js\?v=p50-4-2/);
+assert.match(loginPage, /\/static\/chat\/artifact-preview\.js\?v=p50-4-3/);
 assert.match(loginPage, /\/static\/styles\.css\?v=p50-4-2/);
 assert.match(resourceViews, /artifact\.previewable/);
 assert.match(app, /artifactPreview\.bind\(state, els\)/);
@@ -134,6 +138,9 @@ assert.match(app, /preview_url: `\/api\/knowledge\/\$\{id\}\/preview`/);
 assert.match(knowledgeLibrary, /knowledge-preview/);
 assert.match(responsiveStyles, /\.workspace\.artifact-preview-open\s*\{[\s\S]*?grid-template-columns:\s*1fr;[\s\S]*?overflow:\s*hidden;/);
 assert.match(responsiveStyles, /@media \(min-width: 601px\) and \(max-width: 760px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 44%\) minmax\(0, 56%\)/);
+assert.match(layoutStyles, /#settingsPage\s*\{[\s\S]*?min-height:\s*0;[\s\S]*?overflow:\s*hidden;/);
+assert.match(componentStyles, /\.settings-stack\s*\{[\s\S]*?flex:\s*1;[\s\S]*?min-height:\s*0;[\s\S]*?overflow-y:\s*auto;/);
+assert.match(styleEntry, /components\.css\?v=p50-4-1/);
 assert.match(styleEntry, /responsive\.css\?v=p48-3-1/);
 assert.match(knowledgeLibrary, /window\.AgentKnowledgeLibrary/);
 assert.match(spaceWorkspace, /window\.AgentSpaceWorkspace/);
@@ -192,7 +199,19 @@ Object.assign(previewEls, {
   artifactPreviewTitle: { textContent: "" },
   artifactPreviewMeta: { textContent: "" },
   artifactPreviewNotice: { textContent: "" },
-  artifactPreviewSurface: { replaceChildren() {} },
+  artifactPreviewSurface: {
+    shadowRoot: null,
+    replaceChildren() {},
+    attachShadow() {
+      this.shadowRoot = {
+        adoptedStyleSheets: [],
+        children: [],
+        querySelectorAll: () => [],
+        replaceChildren(...children) { this.children = children; },
+      };
+      return this.shadowRoot;
+    },
+  },
   artifactPreviewDownload: { onclick: null },
 });
 const previewState = { token: "preview-token" };
@@ -212,5 +231,15 @@ await context.AgentArtifactPreview.open(
 assert.equal(request.path, "/api/artifacts/artifact-1/preview");
 assert.equal(request.options.headers.Authorization, "Bearer preview-token");
 assert.equal(previewState.artifactPreviewOpen, true);
+assert.equal(previewEls.artifactPreviewSurface.shadowRoot.children.length, 1);
+
+await context.AgentArtifactPreview.open(
+  previewState,
+  previewEls,
+  { id: "artifact-2", filename: "report.md", kind: "markdown", revision: 1, previewable: true },
+  async () => {},
+);
+assert.equal(request.path, "/api/artifacts/artifact-2/preview");
+assert.equal(previewEls.artifactPreviewSurface.shadowRoot.children.length, 1);
 
 console.log("frontend core module checks passed");

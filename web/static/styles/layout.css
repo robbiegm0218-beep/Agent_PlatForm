@@ -135,6 +135,11 @@
 #memoriesPage,
 #artifactsPage { grid-column: 2 / -1; }
 
+#settingsPage {
+  min-height: 0;
+  overflow: hidden;
+}
+
 .workspace.artifact-preview-open .chat-page,
 .workspace.artifact-preview-open .space-page,
 .workspace.artifact-preview-open #knowledgePage,

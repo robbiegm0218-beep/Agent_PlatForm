@@ -139,7 +139,7 @@ DB_PATH = Path(os.environ.get("AGENT_DATABASE_PATH", ROOT_DIR / "agent_platform.
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 ARTIFACT_DIR = DATA_DIR / "artifacts"
 ARTIFACT_NODE = resolve_artifact_node()
-HTML_ARTIFACT_PREVIEW_ENABLED = os.environ.get("HTML_ARTIFACT_PREVIEW_ENABLED", "false").lower() in {"1", "true", "yes"}
+HTML_ARTIFACT_PREVIEW_ENABLED = os.environ.get("HTML_ARTIFACT_PREVIEW_ENABLED", "true").lower() in {"1", "true", "yes"}
 AUTO_KNOWLEDGE_GATE_V2 = os.environ.get("AUTO_KNOWLEDGE_GATE_V2", "false").lower() in {"1", "true", "yes"}
 TESSERACT_BINARY = next((candidate for candidate in (os.environ.get("TESSERACT_BINARY", "").strip(), shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract") if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK)), "")
 
