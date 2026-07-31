@@ -112,7 +112,9 @@ class SpaceService:
             invitations = conn.execute("SELECT * FROM space_invitations WHERE space_id = ? ORDER BY created_at DESC", (space_id,)).fetchall()
             knowledge_documents = conn.execute("""SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
                 knowledge_documents.size_bytes, knowledge_documents.chunk_count, knowledge_documents.created_at,
-                knowledge_documents.upload_origin, users.name AS author_name FROM knowledge_documents
+                knowledge_documents.upload_origin, knowledge_documents.processing_status,
+                knowledge_documents.active_ingestion_run_id, knowledge_documents.updated_at,
+                users.name AS author_name FROM knowledge_documents
                 JOIN users ON users.id = knowledge_documents.created_by_user_id
                 WHERE knowledge_documents.scope = 'project' AND knowledge_documents.project_space_id = ?
                 ORDER BY knowledge_documents.created_at DESC""", (space_id,)).fetchall()

@@ -60,6 +60,11 @@ assert.equal(request.options.headers.Authorization, "Bearer token-1");
 
 context.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: "未授权" }) });
 await assert.rejects(() => context.AgentApi("/api/me"), (error) => error.status === 401 && error.message === "未授权");
+context.fetch = async () => { throw new TypeError("Failed to fetch"); };
+await assert.rejects(
+  () => context.AgentApi("/api/health"),
+  (error) => error.message === "无法连接本地服务，请确认服务已启动后重试。",
+);
 
 const app = readFileSync(new URL("../web/static/app.js", import.meta.url), "utf8");
 const loginPage = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
@@ -76,6 +81,7 @@ const resourceViews = readFileSync(new URL("../web/static/views/resources.js", i
 const capabilityViews = readFileSync(new URL("../web/static/views/capabilities.js", import.meta.url), "utf8");
 const settingsView = readFileSync(new URL("../web/static/views/settings.js", import.meta.url), "utf8");
 const auditView = readFileSync(new URL("../web/static/views/audit.js", import.meta.url), "utf8");
+const tokenStyles = readFileSync(new URL("../web/static/styles/tokens-base.css", import.meta.url), "utf8");
 const responsiveStyles = readFileSync(new URL("../web/static/styles/responsive.css", import.meta.url), "utf8");
 const layoutStyles = readFileSync(new URL("../web/static/styles/layout.css", import.meta.url), "utf8");
 const componentStyles = readFileSync(new URL("../web/static/styles/components.css", import.meta.url), "utf8");
@@ -97,6 +103,8 @@ assert.match(auditView, /citation_issue_reasons/);
 assert.doesNotMatch(app, /offerStartupChecklist\(\) \{[\s\S]{0,220}switchView\("settings"\)/);
 assert.match(loginPage, /使用邀请码注册/);
 assert.match(loginPage, /id="trialInvitationForm"/);
+assert.match(loginPage, /id="loginForm" class="login-form"/);
+assert.match(loginPage, /class="login-secondary-actions"/);
 assert.doesNotMatch(loginPage, /value="admin@example\.com"/);
 assert.doesNotMatch(loginPage, /value="admin123"/);
 assert.match(composer, /window\.AgentChatComposer/);
@@ -106,7 +114,7 @@ assert.match(composer, /document\.createTextNode\(normalized\)/);
 assert.match(app, /addEventListener\("paste"/);
 assert.match(app, /composer\.pastePlainText\(event, els\)/);
 assert.match(loginPage, /\/static\/chat\/composer\.js\?v=p50-4-1/);
-assert.match(loginPage, /\/static\/app\.js\?v=p50-4-2/);
+assert.match(loginPage, /\/static\/app\.js\?v=p50-5-1/);
 assert.match(stream, /window\.AgentChatStream/);
 assert.match(executionMode, /window\.AgentExecutionMode/);
 assert.match(markdown, /window\.AgentMarkdown/);
@@ -124,7 +132,10 @@ assert.match(artifactPreview, /scrollIntoView\(\{ block: "center", behavior: "sm
 assert.match(loginPage, /id="artifactPreviewSurface"[^>]+role="document"/);
 assert.match(loginPage, /id="artifactPreviewContent"/);
 assert.match(loginPage, /\/static\/chat\/artifact-preview\.js\?v=p50-4-3/);
-assert.match(loginPage, /\/static\/styles\.css\?v=p50-4-2/);
+assert.match(loginPage, /\/static\/styles\.css\?v=p50-5-1/);
+assert.match(tokenStyles, /\.login-form\s*\{[\s\S]*?display:\s*grid;[\s\S]*?gap:\s*18px;/);
+assert.match(tokenStyles, /\.login-form > button,[\s\S]*?width:\s*100%;/);
+assert.match(tokenStyles, /\.form-error:empty\s*\{\s*display:\s*none;/);
 assert.match(resourceViews, /artifact\.previewable/);
 assert.match(app, /artifactPreview\.bind\(state, els\)/);
 assert.match(app, /if \(state\.artifactPreviewOpen\) artifactPreview\.showContext\(state, els\)/);
@@ -136,10 +147,21 @@ assert.doesNotMatch(app, /link\.textContent = `调用资料：/);
 assert.match(app, /button\._knowledgeSource = source/);
 assert.match(app, /preview_url: `\/api\/knowledge\/\$\{id\}\/preview`/);
 assert.match(knowledgeLibrary, /knowledge-preview/);
+assert.match(knowledgeLibrary, /knowledge-structure/);
+assert.match(knowledgeLibrary, /renderStructure\(els, data, escape\)/);
+assert.match(knowledgeLibrary, /统一 Markdown（预览\/调试）/);
+assert.match(app, /\/api\/knowledge\/\$\{document\.id\}\/structure/);
+assert.match(knowledgeLibrary, /knowledge-chunks/);
+assert.match(knowledgeLibrary, /renderChunks\(els, data, escape/);
+assert.match(app, /\/api\/knowledge\/\$\{document\.id\}\/rechunk/);
+assert.match(app, /\/api\/knowledge\/\$\{document\.id\}\/chunk-rollback/);
+assert.match(app, /FTS5\/BM25/);
+assert.match(loginPage, /id="knowledgeIndexStatus"/);
 assert.match(responsiveStyles, /\.workspace\.artifact-preview-open\s*\{[\s\S]*?grid-template-columns:\s*1fr;[\s\S]*?overflow:\s*hidden;/);
 assert.match(responsiveStyles, /@media \(min-width: 601px\) and \(max-width: 760px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 44%\) minmax\(0, 56%\)/);
 assert.match(layoutStyles, /#settingsPage\s*\{[\s\S]*?min-height:\s*0;[\s\S]*?overflow:\s*hidden;/);
 assert.match(componentStyles, /\.settings-stack\s*\{[\s\S]*?flex:\s*1;[\s\S]*?min-height:\s*0;[\s\S]*?overflow-y:\s*auto;/);
+assert.match(styleEntry, /tokens-base\.css\?v=p50-5-1/);
 assert.match(styleEntry, /components\.css\?v=p50-4-1/);
 assert.match(styleEntry, /responsive\.css\?v=p48-3-1/);
 assert.match(knowledgeLibrary, /window\.AgentKnowledgeLibrary/);

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent_Platform</title>
-    <link rel="stylesheet" href="/static/styles.css?v=p50-4-2" />
+    <link rel="stylesheet" href="/static/styles.css?v=p50-5-1" />
   </head>
   <body class="booting">
     <main id="app">
@@ -13,7 +13,7 @@
           <div class="brand-mark">Agent_Platform</div>
           <h1>登录</h1>
           <p>进入你的个人 Agent 工作台</p>
-          <form id="loginForm">
+          <form id="loginForm" class="login-form">
             <label>
               邮箱
               <input id="emailInput" type="email" placeholder="name@example.com" autocomplete="email" required />
@@ -23,10 +23,12 @@
               <input id="passwordInput" type="password" placeholder="请输入密码" autocomplete="current-password" required />
             </label>
             <button type="submit">登录</button>
-            <div id="loginError" class="form-error"></div>
+            <div id="loginError" class="form-error" role="alert" aria-live="polite"></div>
           </form>
-          <button id="showPasswordResetButton" class="text-button" type="button">使用本地重置凭证</button>
-          <button id="showTrialInvitationButton" class="text-button" type="button">使用邀请码注册</button>
+          <div class="login-secondary-actions">
+            <button id="showPasswordResetButton" class="text-button" type="button">使用本地重置凭证</button>
+            <button id="showTrialInvitationButton" class="text-button" type="button">使用邀请码注册</button>
+          </div>
           <form id="passwordResetForm" class="password-reset-form hidden">
             <label>
               一次性重置凭证
@@ -307,7 +309,15 @@
             <input id="knowledgeSearch" type="search" placeholder="检索本地资料" />
             <select id="knowledgeScopeSelect" aria-label="选择知识资料范围"><option value="general">通用知识库</option><option value="project">项目专属</option></select>
             <select id="knowledgeProjectSelect" class="hidden" aria-label="选择项目空间"></select>
+            <span id="knowledgeIndexStatus" class="status-pill">检索索引加载中</span>
           </div>
+          <section id="knowledgeProcessingPanel" class="knowledge-processing-panel hidden" aria-labelledby="knowledgeProcessingTitle">
+            <div class="knowledge-processing-heading">
+              <div><h3 id="knowledgeProcessingTitle">最近处理</h3><p>处理记录不展示正文；点击“解析结果”可按权限查看结构块与统一 Markdown。</p></div>
+              <button id="closeKnowledgeProcessing" type="button">关闭</button>
+            </div>
+            <div id="knowledgeProcessingList" class="knowledge-processing-list"></div>
+          </section>
           <div id="knowledgeResults" class="knowledge-results hidden"></div>
           <div id="knowledgeList" class="card-grid"></div>
         </section>
@@ -365,6 +375,6 @@
     <script src="/static/chat/interactions.js?v=p48-4-3"></script>
     <script src="/static/chat/run-trace.js?v=p48-4-3"></script>
     <script src="/static/chat/artifact-preview.js?v=p50-4-3"></script>
-    <script src="/static/app.js?v=p50-4-2"></script>
+    <script src="/static/app.js?v=p50-5-1"></script>
   </body>
 </html>

@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "format_capabilities": [
+    {
+      "format": "markdown",
+      "parser": "utf8-text-v1",
+      "current_structure": ["plain_text"],
+      "coverage_test": "server.test_app.AppTests.test_local_knowledge_upload_retrieval_citation_and_delete"
+    },
+    {
+      "format": "docx",
+      "parser": "python-docx-v1",
+      "current_structure": ["paragraph"],
+      "coverage_test": "optional_parser_dependency"
+    },
+    {
+      "format": "pdf",
+      "parser": "pypdf-v1",
+      "current_structure": ["page_marker", "plain_text"],
+      "coverage_test": "optional_parser_dependency"
+    },
+    {
+      "format": "xlsx",
+      "parser": "xlsx-xml-v1",
+      "current_structure": ["sheet_marker", "row_text"],
+      "coverage_test": "server.test_app.AppTests.test_xlsx_knowledge_extraction_preserves_sheet_and_cell_text"
+    },
+    {
+      "format": "image",
+      "parser": "tesseract-local-v1",
+      "current_structure": ["image_ocr_marker", "plain_text"],
+      "coverage_test": "server.test_app.AppTests.test_image_knowledge_uses_bounded_local_ocr_without_network"
+    }
+  ],
+  "chunk_cases": [
+    {
+      "id": "short-markdown",
+      "text": "# 产品说明\n\n这是一个短文档。",
+      "size": 900,
+      "overlap": 120,
+      "expected_sha256": [
+        "408e3ea154c071593fd28726633b4bbcaa6e1f4a4153768f9ffb1987a1e270b4"
+      ]
+    },
+    {
+      "id": "paragraph-boundary",
+      "text": "第一段说明产品背景和目标。\n\n第二段说明执行步骤和负责人。\n\n第三段说明验收标准和时间安排。",
+      "size": 32,
+      "overlap": 6,
+      "expected_sha256": [
+        "b0718fdc1738242e141db914b7a2f7f0a90412cf3769bcf9cdaa7d8537ef5af1",
+        "1f261f96b89be64d2c8f48de81d72b27131f9f4920f61dcea3c60dff3578f0a1"
+      ]
+    },
+    {
+      "id": "sentence-boundary",
+      "text": "系统边界决定核算范围。功能单位用于量化产品系统。数据质量需要评估完整性和准确性。结果应经过复核。",
+      "size": 30,
+      "overlap": 5,
+      "expected_sha256": [
+        "019b98818cb74656e1b86609642eff5271d8f9a70afd4e3c1c0d30e8d6057e4d",
+        "149fbe04378dea5344810fd037873409196b0b5ddf88e4264a4fa76621924edd"
+      ]
+    },
+    {
+      "id": "hard-boundary",
+      "text": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz",
+      "size": 20,
+      "overlap": 4,
+      "expected_sha256": [
+        "40800c4dc7925aa3ce2bd450f0b46efe056dbf5f4a83844555a43564b680a8ae",
+        "0a516049b967a77ee8699241bb52870862421aad9311384b927020955c164990",
+        "8d0f6b9b1d8f9aa2eeb9317106d7d2646283e0261220449387c5e1eeca71df42",
+        "872808ffbf0158b200d397a9884342497f23b153b1630229014cea1886ca6f20"
+      ]
+    }
+  ]
+}

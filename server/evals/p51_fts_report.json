@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "policy_version": "fts5-bm25-v1",
+  "cases": 20,
+  "recall_at_4": 1.0,
+  "top1_accuracy": 1.0,
+  "no_match_accuracy": 1.0,
+  "indexed_cases": 15,
+  "fallback_cases": 5,
+  "full_scan_avoided_cases": 9,
+  "candidate_row_ratio": 0.7027,
+  "p95_ms": 0.0701,
+  "scale_benchmark": {
+    "rows": 2000,
+    "repetitions": 25,
+    "fts_candidates": 1,
+    "legacy_p95_ms": 9.2349,
+    "fts_p95_ms": 0.0848,
+    "p95_speedup": 108.86,
+    "candidate_row_ratio": 0.0005
+  },
+  "case_results": [
+    {
+      "id": "exact-chinese-phrase",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "filename-title-boost",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d2",
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "english-terms",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "noisy-request-wording",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "doc-a"
+      ],
+      "passed": true
+    },
+    {
+      "id": "distractor-overlap",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1",
+        "d2"
+      ],
+      "passed": true
+    },
+    {
+      "id": "repeated-term-weight",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1",
+        "d2"
+      ],
+      "passed": true
+    },
+    {
+      "id": "stable-tie-break",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "exact-phrase-beats-scattered",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "adjacent-both-sides",
+      "document_rows": 3,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "adjacent-left-edge",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "adjacent-document-boundary",
+      "document_rows": 3,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "duplicate-content-dedup",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "budget-pressure-ranking",
+      "document_rows": 3,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1",
+        "d2"
+      ],
+      "passed": true
+    },
+    {
+      "id": "standard-number",
+      "document_rows": 2,
+      "fts_candidates": 2,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "filename-and-content",
+      "document_rows": 2,
+      "fts_candidates": 1,
+      "fallback_reason": "",
+      "actual_document_ids": [
+        "d1"
+      ],
+      "passed": true
+    },
+    {
+      "id": "empty-unrelated-policy",
+      "document_rows": 1,
+      "fts_candidates": 0,
+      "fallback_reason": "no_fts_candidates",
+      "actual_document_ids": [],
+      "passed": true
+    },
+    {
+      "id": "empty-unrelated-technical",
+      "document_rows": 1,
+      "fts_candidates": 0,
+      "fallback_reason": "no_fts_candidates",
+      "actual_document_ids": [],
+      "passed": true
+    },
+    {
+      "id": "empty-query-noise-only",
+      "document_rows": 1,
+      "fts_candidates": 0,
+      "fallback_reason": "no_fts_candidates",
+      "actual_document_ids": [],
+      "passed": true
+    },
+    {
+      "id": "empty-no-documents",
+      "document_rows": 0,
+      "fts_candidates": 0,
+      "fallback_reason": "no_fts_candidates",
+      "actual_document_ids": [],
+      "passed": true
+    },
+    {
+      "id": "empty-single-overlap-noise",
+      "document_rows": 1,
+      "fts_candidates": 0,
+      "fallback_reason": "no_fts_candidates",
+      "actual_document_ids": [],
+      "passed": true
+    }
+  ],
+  "failures": []
+}

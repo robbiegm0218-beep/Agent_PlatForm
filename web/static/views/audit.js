@@ -167,6 +167,46 @@ window.AgentAuditView = {
     if (governance) {
       const adminTitle = document.createElement("h4"); adminTitle.textContent = "管理员策略控制"; panel.append(adminTitle);
       const admin = document.createElement("div"); admin.className = "retrieval-governance";
+      const presetTitle = document.createElement("strong"); presetTitle.textContent = "知识处理预设";
+      admin.append(presetTitle, Object.assign(document.createElement("small"), { textContent: "预设修改只影响后续上传或重新切分，历史版本仍可回滚。" }));
+      (governance.presets || []).forEach((preset) => {
+        const item = document.createElement("div"); item.className = "governance-item";
+        const config = preset.chunk_config || {};
+        item.append(
+          Object.assign(document.createElement("strong"), { textContent: `${preset.label} · r${preset.revision || 1}` }),
+          Object.assign(document.createElement("small"), { textContent: `${preset.parser_profile} · 目标 ${config.target_tokens} / 最大 ${config.max_tokens} / 重叠 ${config.overlap_tokens}` }),
+        );
+        const edit = document.createElement("button"); edit.type = "button"; edit.className = "secondary"; edit.textContent = "修改预设";
+        edit.addEventListener("click", () => governance.onEditPreset(preset, edit)); item.append(edit); admin.append(item);
+      });
+      const migration = governance.migrations || {};
+      admin.append(
+        Object.assign(document.createElement("strong"), { textContent: "历史资料迁移与灰度" }),
+        Object.assign(document.createElement("small"), { textContent: `待迁移 ${migration.eligible_count || 0} 份 · 先暂存新版本和 Shadow 对比，再按 25% / 100% 激活；旧片段持续可用。` }),
+      );
+      const latestBatch = (migration.batches || [])[0];
+      if (!latestBatch && migration.eligible_count) {
+        const create = document.createElement("button"); create.type = "button"; create.className = "secondary"; create.textContent = "创建迁移批次";
+        create.addEventListener("click", () => governance.onCreateMigration(create)); admin.append(create);
+      }
+      if (latestBatch) {
+        const item = document.createElement("div"); item.className = "governance-item";
+        const shadow = latestBatch.shadow || {};
+        item.append(
+          Object.assign(document.createElement("strong"), { textContent: `${latestBatch.id} · ${latestBatch.status}` }),
+          Object.assign(document.createElement("small"), { textContent: `成功 ${latestBatch.succeeded_count || 0}/${latestBatch.total_count || 0} · 灰度 ${latestBatch.rollout_percentage || 0}% · Shadow ${shadow.comparison_count || 0} 次 · 文档重合 ${shadow.document_overlap == null ? "暂无" : `${(shadow.document_overlap * 100).toFixed(1)}%`}` }),
+        );
+        const action = (label, callback, primary = false) => {
+          const button = document.createElement("button"); button.type = "button"; if (!primary) button.className = "secondary"; button.textContent = label;
+          button.addEventListener("click", () => callback(button)); item.append(button);
+        };
+        if (["queued", "partial"].includes(latestBatch.status)) action("生成暂存版本", (button) => governance.onRunMigration(latestBatch.id, button));
+        if (latestBatch.status === "staged") action("运行迁移门禁", (button) => governance.onEvaluateMigration(latestBatch.id, button));
+        if (["verified", "rolled_back"].includes(latestBatch.status)) action("灰度 25%", (button) => governance.onPromoteMigration(latestBatch.id, 25, button));
+        if (["verified", "canary", "rolled_back"].includes(latestBatch.status)) action("激活 100%", (button) => governance.onPromoteMigration(latestBatch.id, 100, button), true);
+        if (["canary", "active"].includes(latestBatch.status)) action("恢复迁移前版本", (button) => governance.onRollbackMigration(latestBatch.id, button));
+        admin.append(item);
+      }
       if (governance.evidence?.source === "trial_feedback_aggregate") {
         admin.append(Object.assign(document.createElement("p"), { textContent: `试用汇总信号：${governance.evidence.document_feedback_count || 0} 条引用评价。仅用于生成离线候选，不展示测试用户或文档内容。` }));
       }
@@ -180,6 +220,26 @@ window.AgentAuditView = {
         const button = document.createElement("button"); button.type = "button"; button.className = "secondary"; button.textContent = "创建候选策略";
         button.addEventListener("click", () => governance.onCreateCandidate(suggestion.id, button)); item.append(button); admin.append(item);
       });
+      const activePolicy = (governance.policies || []).find((item) => item.status === "active");
+      if (activePolicy) {
+        const custom = document.createElement("div"); custom.className = "governance-item";
+        custom.append(
+          Object.assign(document.createElement("strong"), { textContent: "创建底层策略候选" }),
+          Object.assign(document.createElement("small"), { textContent: "复制当前活动版本后调整参数；创建不会覆盖生产，仍需离线评测和确认发布。" }),
+        );
+        const button = document.createElement("button"); button.type = "button"; button.className = "secondary"; button.textContent = "配置候选";
+        button.addEventListener("click", () => {
+          const config = { ...(activePolicy.config || {}) };
+          const vectorScore = Number(globalThis.prompt("向量最低相似度（0.50–0.95）", String(config.vector_min_score ?? 0.72)));
+          if (!Number.isFinite(vectorScore)) return;
+          const rrfK = Number(globalThis.prompt("RRF k（10–200）", String(config.rrf_k ?? 60)));
+          if (!Number.isFinite(rrfK)) return;
+          const candidateLimit = Number(globalThis.prompt("候选数量（8–200）", String(config.candidate_limit ?? 64)));
+          if (!Number.isFinite(candidateLimit)) return;
+          governance.onCreateCustomCandidate({ ...config, vector_min_score: vectorScore, rrf_k: rrfK, candidate_limit: candidateLimit }, button);
+        });
+        custom.append(button); admin.append(custom);
+      }
       (governance.policies || []).filter((policy) => policy.status !== "retired").forEach((policy) => {
         const item = document.createElement("div"); item.className = "governance-item";
         item.append(Object.assign(document.createElement("strong"), { textContent: `${policy.version} · ${policy.status}` }), Object.assign(document.createElement("small"), { textContent: policy.changed_variable ? `仅调整：${policy.changed_variable}` : "当前或历史基线策略" }));
@@ -196,6 +256,47 @@ window.AgentAuditView = {
       if ((governance.policies || []).some((policy) => policy.status === "stable")) {
         const rollback = document.createElement("button"); rollback.type = "button"; rollback.className = "secondary"; rollback.textContent = "回滚到上一稳定策略";
         rollback.addEventListener("click", () => governance.onRollback(rollback)); admin.append(rollback);
+      }
+      const comparable = (governance.policies || []).filter((item) => item.status !== "retired");
+      if (comparable.length >= 2) {
+        const lab = document.createElement("div"); lab.className = "retrieval-lab";
+        lab.append(
+          Object.assign(document.createElement("strong"), { textContent: "检索实验室" }),
+          Object.assign(document.createElement("small"), { textContent: "用同一问题对比两个版本；不修改生产策略，记录中不保存问题或知识正文。" }),
+        );
+        const query = document.createElement("input"); query.type = "text"; query.maxLength = 300; query.placeholder = "输入测试问题";
+        const select = (selectedIndex) => {
+          const element = document.createElement("select");
+          comparable.forEach((item, index) => {
+            const option = document.createElement("option"); option.value = item.version; option.textContent = `${item.version} · ${item.status}`;
+            option.selected = index === selectedIndex; element.append(option);
+          });
+          return element;
+        };
+        const left = select(0); const right = select(1);
+        const compare = document.createElement("button"); compare.type = "button"; compare.textContent = "运行对比";
+        const output = document.createElement("div"); output.className = "retrieval-lab-output";
+        const strategyCard = (title, strategy) => {
+          const card = document.createElement("div"); card.className = "governance-item";
+          const stages = strategy.stages || {};
+          card.append(
+            Object.assign(document.createElement("strong"), { textContent: `${title}：${strategy.version}` }),
+            Object.assign(document.createElement("small"), { textContent: `改写 ${stages.rewrite?.applied ? "已执行" : "未执行"} · 关键词 ${stages.lexical_candidates?.length || 0} · 向量 ${stages.vector_candidates?.length || 0} · 融合 ${stages.fusion?.length || 0} · 最终上下文 ${stages.final_context?.length || 0}` }),
+          );
+          (stages.final_context || []).forEach((item) => card.append(Object.assign(document.createElement("p"), { textContent: `${item.filename} · 片段 ${item.position + 1} · ${item.excerpt}` })));
+          return card;
+        };
+        compare.addEventListener("click", async () => {
+          if (!query.value.trim()) { query.focus(); return; }
+          compare.disabled = true; output.textContent = "正在对比…";
+          try {
+            const result = await governance.onCompare({ query: query.value.trim(), left_version: left.value, right_version: right.value });
+            output.replaceChildren(strategyCard("左侧", result.left), strategyCard("右侧", result.right));
+          } catch (error) {
+            output.textContent = error.message || "对比失败";
+          } finally { compare.disabled = false; }
+        });
+        lab.append(query, left, right, compare, output); admin.append(lab);
       }
       panel.append(admin);
     }

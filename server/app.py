@@ -50,6 +50,7 @@ from server.knowledge_retrieval import (
 )
 from server.retrieval_governance import MIN_FEEDBACK_FOR_SUGGESTION, apply_suggestion, config_as_dict, config_from_json, suggestions_for_feedback
 from server.evaluate_knowledge_retrieval import DEFAULT_FIXTURE as RETRIEVAL_EVAL_FIXTURE, evaluate as evaluate_retrieval, validate_cases as validate_retrieval_cases
+from server.evaluate_knowledge_hybrid import run as evaluate_hybrid_retrieval
 from server.evaluate_p45_rollout import fixed_report as p45_fixed_report, recommend as recommend_p45_rollout, shadow_report as p45_shadow_report
 from server.structured_context import StructuredContextBuilder
 from server.memory_policy import MEMORY_KINDS, MEMORY_SCOPES, MEMORY_STATUSES, extract_candidates, select_memories, validate_memory_content
@@ -63,6 +64,26 @@ from server.task_verifier import verify as verify_task
 from server.decision_quality import policy_snapshot
 from server.auth_service import AuthService, validate_new_password
 from server.knowledge_service import KnowledgeService
+from server.knowledge_ingestion_service import KnowledgeIngestionService
+from server.knowledge_embeddings import EmbeddingConfig, EmbeddingError, KnowledgeEmbeddingService
+from server.knowledge_presets import KnowledgePresetService
+from server.knowledge_parsing import build_document_ir, document_ir_to_markdown, persisted_block_rows
+from server.knowledge_pipeline_contracts import DocumentBlock, DocumentIR
+from server.knowledge_chunking import (
+    chunk_document_ir,
+    persisted_chunk_rows,
+)
+from server.knowledge_fts import (
+    FTS_POLICY_VERSION,
+    build_fts_query,
+    candidate_trace_summary,
+    query_sha256,
+)
+from server.knowledge_hybrid import (
+    HYBRID_POLICY_VERSION,
+    bounded_query_rewrite,
+    reciprocal_rank_fusion,
+)
 from server.space_service import SpaceService
 from server.chat_service import ChatService
 from server.artifact_service import (
@@ -849,6 +870,12 @@ def db() -> sqlite3.Connection:
 SPACE_SERVICE = SpaceService(db, now, new_id)
 AUTH_SERVICE = AuthService(db, now, new_id, verify_password, hash_password, SESSION_TTL_SECONDS, SPACE_SERVICE, LOGIN_FAILURE_LIMIT, LOGIN_LOCK_SECONDS)
 KNOWLEDGE_SERVICE = KnowledgeService(db)
+KNOWLEDGE_INGESTION_SERVICE = KnowledgeIngestionService(db, now, new_id)
+KNOWLEDGE_PRESET_SERVICE = KnowledgePresetService(db, now)
+KNOWLEDGE_EMBEDDING_SERVICE = KnowledgeEmbeddingService(
+    db, now, new_id, EmbeddingConfig.from_env()
+)
+RETRIEVAL_TRACE_LOCAL = threading.local()
 CHAT_SERVICE = ChatService(db, now, new_id)
 
 
@@ -1179,7 +1206,7 @@ def init_db() -> None:
         if not user:
             user_id = new_id("user")
             conn.execute(
-                "INSERT INTO users (id, email, password_hash, name, created_at, is_admin) VALUES (?, ?, ?, ?, ?, 1)",
+                "INSERT INTO users (id, email, password_hash, name, created_at, is_admin, is_knowledge_admin) VALUES (?, ?, ?, ?, ?, 1, 1)",
                 (user_id, admin_email, hash_password(admin_password), admin_name, now()),
             )
             for skill in skill_snapshot():
@@ -1188,7 +1215,7 @@ def init_db() -> None:
                     (user_id, skill["id"], 1 if skill["default_enabled"] else 0, now()),
                 )
         else:
-            conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user["id"],))
+            conn.execute("UPDATE users SET is_admin = 1, is_knowledge_admin = 1 WHERE id = ?", (user["id"],))
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -1235,6 +1262,22 @@ def knowledge_kind(filename: str) -> str:
         ".tif": "image",
         ".tiff": "image",
     }.get(suffix, "file")
+
+
+def knowledge_parser_version(filename: str) -> str:
+    return {
+        ".md": "utf8-text-v1",
+        ".txt": "utf8-text-v1",
+        ".docx": "python-docx-v1",
+        ".pdf": "pypdf-v1",
+        ".xlsx": "xlsx-xml-v1",
+        ".png": "tesseract-local-v1",
+        ".jpg": "tesseract-local-v1",
+        ".jpeg": "tesseract-local-v1",
+        ".webp": "tesseract-local-v1",
+        ".tif": "tesseract-local-v1",
+        ".tiff": "tesseract-local-v1",
+    }.get(Path(filename).suffix.lower(), "unknown-v1")
 
 
 def public_knowledge_document(row: sqlite3.Row | dict) -> dict:
@@ -1302,6 +1345,40 @@ def safe_json_object(value: object) -> dict:
     except (TypeError, json.JSONDecodeError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+def safe_json_list(value: object) -> list:
+    try:
+        decoded = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def document_ir_from_rows(document: sqlite3.Row | dict, rows) -> DocumentIR | None:
+    blocks = [
+        DocumentBlock(
+            block_id=str(row["id"]),
+            block_type=str(row["block_type"]),
+            ordinal=int(row["ordinal"]),
+            text=str(row["text"]),
+            section_path=tuple(safe_json_list(row["section_path_json"])),
+            source_location=safe_json_object(row["source_location_json"]),
+            metadata=safe_json_object(row["metadata_json"]),
+        )
+        for row in rows
+    ]
+    if not blocks:
+        return None
+    return DocumentIR(
+        document_id=str(document["id"]),
+        source_mime=str(document["mime_type"]),
+        source_sha256=str(document["content_hash"]),
+        parser_id=f"{Path(str(document['filename'])).suffix.lower().lstrip('.') or 'plain'}-structured",
+        parser_version=str(document["parser_version"]),
+        blocks=tuple(blocks),
+        schema_version=int(document["document_ir_version"]),
+    )
 
 
 CITATION_FEEDBACK_REASON_CODES = {
@@ -1373,6 +1450,10 @@ def active_retrieval_policy_snapshot() -> dict:
 
 def is_platform_admin(user: dict) -> bool:
     return bool(user.get("is_admin", 0))
+
+
+def is_knowledge_admin(user: dict) -> bool:
+    return is_platform_admin(user) or bool(user.get("is_knowledge_admin", 0))
 
 
 def current_startup_status(create_directories: bool = False) -> dict:
@@ -1737,18 +1818,390 @@ def chunk_knowledge_text(text: str, size: int = 900, overlap: int = 120) -> list
 
 
 def search_knowledge(user_id: str, query: str, limit: int = 4, project_space_id: str = "", include_all_projects: bool = False) -> list[dict]:
-    rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id, include_all_projects)
-    _, active_config = active_retrieval_policy()
+    started = time.perf_counter()
+    active_version, active_config = active_retrieval_policy()
+    fts_query = build_fts_query(query)
+    rows, lexical_fallback_reason = KNOWLEDGE_SERVICE.fts_candidates(
+        user_id,
+        fts_query,
+        project_space_id=project_space_id,
+        include_all_projects=include_all_projects,
+        limit=active_config.candidate_limit,
+    )
+    backend = FTS_POLICY_VERSION
+    fts_candidates = [dict(row) for row in rows if row.get("retrieval_candidate")]
+    vector_candidates: list[dict] = []
+    vector_fallback_reason = ""
+    trace_candidates = list(fts_candidates)
+    if lexical_fallback_reason:
+        rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id, include_all_projects)
+        backend = "python_lexical_v1"
+    elif active_config.hybrid_enabled and KNOWLEDGE_EMBEDDING_SERVICE.config.enabled:
+        try:
+            embedded = KNOWLEDGE_EMBEDDING_SERVICE.embed_query(query)
+            if embedded:
+                query_vector, model_version = embedded
+                vector_candidates = KNOWLEDGE_SERVICE.vector_candidates(
+                    user_id,
+                    query_vector,
+                    model_version,
+                    project_space_id=project_space_id,
+                    include_all_projects=include_all_projects,
+                    limit=active_config.candidate_limit,
+                    minimum_score=active_config.vector_min_score,
+                )
+            if vector_candidates:
+                fused = reciprocal_rank_fusion(
+                    fts_candidates, vector_candidates,
+                    limit=min(active_config.candidate_limit * 2, 200),
+                    rrf_k=active_config.rrf_k,
+                )
+                neighbors = KNOWLEDGE_SERVICE.candidate_neighbors(fused, radius=active_config.neighbor_radius)
+                seen = {
+                    (str(item.get("document_id", "")), int(item.get("position", 0)))
+                    for item in fused
+                }
+                rows = [
+                    *fused,
+                    *[
+                        dict(item) for item in neighbors
+                        if (str(item["document_id"]), int(item["position"])) not in seen
+                    ],
+                ]
+                trace_candidates = fused
+                backend = HYBRID_POLICY_VERSION
+            else:
+                vector_fallback_reason = "vector_no_candidates"
+        except (EmbeddingError, OSError, ValueError, TypeError):
+            vector_fallback_reason = "vector_provider_unavailable"
     retriever = KnowledgeRetriever(active_config)
     if limit != retriever.config.limit:
         retriever = KnowledgeRetriever(replace(retriever.config, limit=min(max(limit, 1), 20)))
-    return retriever.search(query, rows, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
+    results = retriever.search(query, rows, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
+    if not results and rows and not lexical_fallback_reason:
+        lexical_fallback_reason = "candidates_filtered"
+        backend = "python_lexical_v1"
+        rows = KNOWLEDGE_SERVICE.searchable_chunks(user_id, project_space_id, include_all_projects)
+        results = retriever.search(query, rows, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
+    bm25_by_key = {
+        (str(item.get("document_id", "")), int(item.get("position", 0))): item.get("bm25_score")
+        for item in trace_candidates
+    }
+    for result in results:
+        key = (str(result.get("document_id", "")), int(result.get("position", 0)))
+        result["retrieval_backend"] = backend
+        if key in bm25_by_key:
+            result["bm25_score"] = bm25_by_key[key]
+    trace_record = {
+            "id": new_id("knowledge_retrieval"),
+            "user_id": user_id,
+            "project_space_id": project_space_id,
+            "query_sha256": query_sha256(query),
+            "backend": backend,
+            "policy_version": active_version,
+            "candidate_count": len(trace_candidates),
+            "selected_count": len(results),
+            "fallback_reason": ",".join(filter(None, [lexical_fallback_reason, vector_fallback_reason])),
+            "candidate_summary_json": candidate_trace_summary(trace_candidates, results),
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+            "created_at": now(),
+        }
+    RETRIEVAL_TRACE_LOCAL.last = {
+        key: value for key, value in trace_record.items()
+        if key not in {"id", "user_id", "created_at", "candidate_summary_json"}
+    }
+    RETRIEVAL_TRACE_LOCAL.last["candidates"] = json.loads(trace_record["candidate_summary_json"])
+    try:
+        KNOWLEDGE_SERVICE.record_retrieval_trace(trace_record)
+    except sqlite3.Error:
+        LOGGER.debug("knowledge_retrieval_trace_write_deferred")
+    try:
+        record_knowledge_migration_shadow(
+            user_id,
+            query,
+            results,
+            project_space_id=project_space_id,
+            include_all_projects=include_all_projects,
+        )
+    except (sqlite3.Error, ValueError, TypeError):
+        LOGGER.debug("knowledge_migration_shadow_write_deferred")
+    return results
+
+
+def _retrieval_lab_candidate(item: dict) -> dict:
+    return {
+        "chunk_id": str(item.get("id", "")),
+        "document_id": str(item.get("document_id", "")),
+        "filename": str(item.get("filename", "")),
+        "position": int(item.get("position", 0)),
+        "bm25_score": item.get("bm25_score"),
+        "vector_score": item.get("vector_score"),
+        "lexical_rank": item.get("lexical_rank"),
+        "vector_rank": item.get("vector_rank"),
+        "rrf_score": item.get("hybrid_rrf_score"),
+    }
+
+
+def run_retrieval_lab_strategy(
+    user_id: str,
+    query: str,
+    version: str,
+    config: RetrievalConfig,
+    *,
+    project_space_id: str = "",
+    include_all_projects: bool = False,
+) -> dict:
+    """Run one governed strategy without changing production state or traces."""
+    def run_once(search_query: str) -> tuple[list[dict], dict]:
+        fts_query = build_fts_query(search_query)
+        rows, lexical_fallback = KNOWLEDGE_SERVICE.fts_candidates(
+            user_id,
+            fts_query,
+            project_space_id=project_space_id,
+            include_all_projects=include_all_projects,
+            limit=config.candidate_limit,
+            neighbor_radius=0,
+        )
+        lexical = [dict(row) for row in rows if row.get("retrieval_candidate")]
+        vector: list[dict] = []
+        vector_state = "disabled"
+        if config.hybrid_enabled and KNOWLEDGE_EMBEDDING_SERVICE.config.enabled:
+            vector_state = "no_candidates"
+            try:
+                embedded = KNOWLEDGE_EMBEDDING_SERVICE.embed_query(search_query)
+                if embedded:
+                    query_vector, model_version = embedded
+                    vector = KNOWLEDGE_SERVICE.vector_candidates(
+                        user_id,
+                        query_vector,
+                        model_version,
+                        project_space_id=project_space_id,
+                        include_all_projects=include_all_projects,
+                        limit=config.candidate_limit,
+                        minimum_score=config.vector_min_score,
+                    )
+                    vector_state = "ready" if vector else "no_candidates"
+            except (EmbeddingError, OSError, ValueError, TypeError):
+                vector_state = "provider_unavailable"
+        fused = reciprocal_rank_fusion(
+            lexical,
+            vector,
+            limit=min(config.candidate_limit * 2, 200),
+            rrf_k=config.rrf_k,
+        )
+        ranked_rows = fused
+        if fused and config.neighbor_radius:
+            neighbors = KNOWLEDGE_SERVICE.candidate_neighbors(
+                fused, radius=config.neighbor_radius
+            )
+            seen = {
+                (str(item.get("document_id", "")), int(item.get("position", 0)))
+                for item in fused
+            }
+            neighbor_items = [dict(item) for item in neighbors]
+            ranked_rows = [
+                *fused,
+                *[
+                    item for item in neighbor_items
+                    if (str(item.get("document_id", "")), int(item.get("position", 0))) not in seen
+                ],
+            ]
+        if lexical_fallback:
+            ranked_rows = [
+                dict(row) for row in KNOWLEDGE_SERVICE.searchable_chunks(
+                    user_id, project_space_id, include_all_projects
+                )
+            ]
+        results = KnowledgeRetriever(config).search(
+            search_query, ranked_rows, gate_v2=AUTO_KNOWLEDGE_GATE_V2
+        )
+        return results, {
+            "lexical": [_retrieval_lab_candidate(item) for item in lexical],
+            "lexical_fallback": lexical_fallback,
+            "vector": [_retrieval_lab_candidate(item) for item in vector],
+            "vector_state": vector_state,
+            "fusion": [_retrieval_lab_candidate(item) for item in fused],
+        }
+
+    primary, primary_stages = run_once(query)
+    assessment = assess_candidate_relevance(
+        query, primary, gate_v2=AUTO_KNOWLEDGE_GATE_V2
+    )
+    rewrite = ""
+    retry: list[dict] = []
+    retry_stages: dict = {}
+    results = list(primary)
+    if config.rewrite_enabled and not assessment["sufficient"]:
+        rewrite = bounded_query_rewrite(query)
+        if rewrite and rewrite != query:
+            retry, retry_stages = run_once(rewrite)
+            seen = {
+                (str(item.get("document_id", "")), int(item.get("position", 0)))
+                for item in results
+            }
+            for item in retry:
+                key = (str(item.get("document_id", "")), int(item.get("position", 0)))
+                if key not in seen:
+                    results.append(item)
+                    seen.add(key)
+            results = results[:config.limit]
+    return {
+        "version": version,
+        "config": config_as_dict(config),
+        "stages": {
+            "rewrite": {
+                "enabled": config.rewrite_enabled,
+                "applied": bool(rewrite),
+                "query": rewrite,
+            },
+            "lexical_candidates": primary_stages["lexical"],
+            "vector_candidates": primary_stages["vector"],
+            "fusion": primary_stages["fusion"],
+            "retry": retry_stages,
+            "rerank": [
+                {
+                    **_retrieval_lab_candidate(item),
+                    "score": item.get("score"),
+                    "score_breakdown": item.get("score_breakdown", {}),
+                    "match_signals": item.get("match_signals", []),
+                }
+                for item in results
+            ],
+            "final_context": [
+                {
+                    "document_id": str(item.get("document_id", "")),
+                    "filename": str(item.get("filename", "")),
+                    "position": int(item.get("position", 0)),
+                    "excerpt": str(item.get("excerpt") or item.get("content", ""))[:config.max_excerpt_chars],
+                    "score": item.get("score"),
+                }
+                for item in results
+            ],
+        },
+        "result_count": len(results),
+    }
+
+
+def knowledge_acl_snapshot() -> tuple[int, str]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT id, user_id, scope, project_space_id, created_by_user_id
+               FROM knowledge_documents ORDER BY id"""
+        ).fetchall()
+    payload = [
+        [
+            str(row["id"]), str(row["user_id"]), str(row["scope"]),
+            str(row["project_space_id"]), str(row["created_by_user_id"]),
+        ]
+        for row in rows
+    ]
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return len(rows), digest
+
+
+def _migration_result_documents(results: list[dict]) -> list[str]:
+    documents: list[str] = []
+    for item in results:
+        document_id = str(item.get("document_id", ""))
+        if document_id and document_id not in documents:
+            documents.append(document_id)
+    return documents
+
+
+def record_migration_shadow_diff(
+    batch_id: str,
+    actor_user_id: str,
+    query: str,
+    baseline: list[dict],
+    candidate: list[dict],
+    *,
+    source_kind: str,
+) -> dict:
+    baseline_documents = _migration_result_documents(baseline)
+    candidate_documents = _migration_result_documents(candidate)
+    baseline_set = set(baseline_documents)
+    candidate_set = set(candidate_documents)
+    union = baseline_set | candidate_set
+    overlap = len(baseline_set & candidate_set) / len(union) if union else 1.0
+    top_agreement = int(baseline_documents[:1] == candidate_documents[:1])
+    row = {
+        "id": new_id("migration_shadow"),
+        "batch_id": batch_id,
+        "actor_user_id": actor_user_id,
+        "query_sha256": query_sha256(query),
+        "source_kind": source_kind,
+        "baseline_count": len(baseline),
+        "candidate_count": len(candidate),
+        "top_document_agreement": top_agreement,
+        "document_overlap": round(overlap, 6),
+        "baseline_documents_json": json.dumps(baseline_documents, ensure_ascii=False),
+        "candidate_documents_json": json.dumps(candidate_documents, ensure_ascii=False),
+        "created_at": now(),
+    }
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO knowledge_migration_shadow_diffs
+               (id, batch_id, actor_user_id, query_sha256, source_kind,
+                baseline_count, candidate_count, top_document_agreement,
+                document_overlap, baseline_documents_json,
+                candidate_documents_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(row[key] for key in (
+                "id", "batch_id", "actor_user_id", "query_sha256", "source_kind",
+                "baseline_count", "candidate_count", "top_document_agreement",
+                "document_overlap", "baseline_documents_json",
+                "candidate_documents_json", "created_at",
+            )),
+        )
+    return row
+
+
+def record_knowledge_migration_shadow(
+    user_id: str,
+    query: str,
+    baseline: list[dict],
+    *,
+    project_space_id: str = "",
+    include_all_projects: bool = False,
+) -> None:
+    if getattr(RETRIEVAL_TRACE_LOCAL, "migration_shadow_running", False):
+        return
+    with db() as conn:
+        batch = conn.execute(
+            """SELECT id FROM knowledge_migration_batches
+               WHERE status IN ('staged', 'verified', 'canary')
+               ORDER BY created_at DESC LIMIT 1"""
+        ).fetchone()
+    if not batch:
+        return
+    rows = KNOWLEDGE_SERVICE.migration_candidate_chunks(
+        str(batch["id"]),
+        user_id,
+        project_space_id,
+        include_all_projects,
+    )
+    if not rows:
+        return
+    RETRIEVAL_TRACE_LOCAL.migration_shadow_running = True
+    try:
+        _, config = active_retrieval_policy()
+        candidate = KnowledgeRetriever(config).search(
+            query, [dict(row) for row in rows], gate_v2=AUTO_KNOWLEDGE_GATE_V2
+        )
+        record_migration_shadow_diff(
+            str(batch["id"]), user_id, query, baseline, candidate,
+            source_kind="live_shadow",
+        )
+    finally:
+        RETRIEVAL_TRACE_LOCAL.migration_shadow_running = False
 
 
 def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: dict, project_space_id: str = "") -> tuple[list[dict], dict]:
     """Retrieve once, then make at most one explainable lexical retry."""
     primary = search_knowledge(user_id, content, project_space_id=project_space_id)
-    terms = query_terms(content, gate_v2=AUTO_KNOWLEDGE_GATE_V2)
+    primary_candidate_trace = dict(getattr(RETRIEVAL_TRACE_LOCAL, "last", {}))
     assessment = assess_candidate_relevance(
         content, primary, gate_v2=AUTO_KNOWLEDGE_GATE_V2,
     )
@@ -1758,13 +2211,16 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
         **assessment,
         "retry_query": "",
         "retry_matches": 0,
+        "candidate_retrieval": primary_candidate_trace,
     }
     if assessment["sufficient"] or not intent_plan.get("knowledge_needed"):
         return primary, trace
-    retry_query = " ".join(terms[:8]).strip()
+    _, retry_config = active_retrieval_policy()
+    retry_query = bounded_query_rewrite(content) if retry_config.rewrite_enabled else ""
     if not retry_query or retry_query == content:
         return primary, trace
     retry = search_knowledge(user_id, retry_query, project_space_id=project_space_id)
+    retry_candidate_trace = dict(getattr(RETRIEVAL_TRACE_LOCAL, "last", {}))
     merged: list[dict] = []
     seen: set[tuple[str, int]] = set()
     for reference in [*primary, *retry]:
@@ -1779,6 +2235,7 @@ def retrieve_knowledge_with_fallback(user_id: str, content: str, intent_plan: di
     trace.update({
         "retry_query": retry_query,
         "retry_matches": len(retry),
+        "retry_candidate_retrieval": retry_candidate_trace,
         **assessment,
     })
     return merged, trace
@@ -2317,11 +2774,29 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/retrieval-policies":
             self.list_retrieval_policies(user)
             return
+        if self.path == "/api/knowledge-presets":
+            self.list_knowledge_presets(user)
+            return
+        if self.path == "/api/knowledge-migrations":
+            self.list_knowledge_migrations(user)
+            return
+        if self.path == "/api/embedding-index":
+            self.get_embedding_index(user)
+            return
         if self.path.startswith("/api/memories"):
             self.list_memories(user)
             return
         if self.path == "/api/knowledge":
             self.list_knowledge(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/processing"):
+            self.knowledge_processing_history(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/structure"):
+            self.knowledge_document_structure(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/chunks"):
+            self.knowledge_chunk_results(user)
             return
         if self.path.startswith("/api/knowledge/") and self.path.endswith("/download"):
             self.download_knowledge(user)
@@ -2435,6 +2910,43 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/knowledge":
             self.create_knowledge(user)
             return
+        if self.path == "/api/embedding-index/rebuild":
+            self.rebuild_embedding_index(user)
+            return
+        if self.path == "/api/embedding-index/run":
+            self.run_embedding_index_job(user)
+            return
+        if self.path == "/api/retrieval-policies/candidates":
+            self.create_custom_retrieval_candidate(user)
+            return
+        if self.path == "/api/retrieval-lab/compare":
+            self.compare_retrieval_policies(user)
+            return
+        if self.path == "/api/knowledge-migrations/batches":
+            self.create_knowledge_migration_batch(user)
+            return
+        if self.path.startswith("/api/knowledge-migrations/"):
+            if self.path.endswith("/run"):
+                self.run_knowledge_migration_batch(user)
+                return
+            if self.path.endswith("/evaluate"):
+                self.evaluate_knowledge_migration_batch(user)
+                return
+            if self.path.endswith("/promote"):
+                self.promote_knowledge_migration_batch(user)
+                return
+            if self.path.endswith("/rollback"):
+                self.rollback_knowledge_migration_batch(user)
+                return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/rechunk"):
+            self.rechunk_knowledge(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/chunk-rollback"):
+            self.rollback_knowledge_chunks(user)
+            return
+        if self.path.startswith("/api/knowledge/") and self.path.endswith("/embedding-rollback"):
+            self.rollback_knowledge_embedding(user)
+            return
         if self.path.startswith("/api/folders/") and self.path.endswith("/knowledge"):
             self.create_space_knowledge(user)
             return
@@ -2503,6 +3015,9 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/me":
             self.update_me(user)
+            return
+        if self.path.startswith("/api/knowledge-presets/"):
+            self.update_knowledge_preset(user)
             return
         if self.path.startswith("/api/memories/"):
             try:
@@ -3515,6 +4030,7 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def get_retrieval_diagnostics(self, user: dict) -> None:
         """Return aggregate, user-isolated retrieval feedback without source text."""
+        search_traces = KNOWLEDGE_SERVICE.retrieval_trace_summary(user["id"])
         with db() as conn:
             runs = conn.execute("""SELECT runs.id, runs.execution_context FROM runs JOIN threads ON threads.id = runs.thread_id
                 WHERE threads.user_id = ? ORDER BY runs.started_at DESC LIMIT 500""", (user["id"],)).fetchall()
@@ -3615,6 +4131,13 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
                 "missing_evidence_rate": round(reason_counts.get("missing_evidence", 0) / document_feedback_count, 4) if document_feedback_count else None,
             },
             "auto_route_stages": auto_route_stages,
+            "search_index": {
+                "policy_version": FTS_POLICY_VERSION,
+                "hybrid_policy_version": HYBRID_POLICY_VERSION,
+                "embedding": KNOWLEDGE_EMBEDDING_SERVICE.status(),
+                "recent_traces": [row_to_dict(row) for row in search_traces],
+                "privacy": "仅保存查询哈希、候选/选择数量、后端、回退原因和耗时，不保存查询或知识正文。",
+            },
             "reason_counts": reason_counts,
             "documents": document_rows,
             "policy_feedback": [{
@@ -3665,6 +4188,556 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             policies.append(item)
         self.send_json({"active": active_retrieval_policy_snapshot(), "policies": policies})
 
+    def list_knowledge_presets(self, user: dict) -> None:
+        presets = KNOWLEDGE_PRESET_SERVICE.list()
+        manageable = is_knowledge_admin(user)
+        if not manageable:
+            presets = [
+                {
+                    "id": item["id"],
+                    "label": item["label"],
+                    "description": item["description"],
+                    "parser_profile": item["parser_profile"],
+                    "chunk_config": item["chunk_config"],
+                }
+                for item in presets
+            ]
+        self.send_json({
+            "presets": presets,
+            "manageable": manageable,
+            "role": "platform_admin" if is_platform_admin(user) else (
+                "knowledge_admin" if manageable else "user"
+            ),
+        })
+
+    def update_knowledge_preset(self, user: dict) -> None:
+        if not is_knowledge_admin(user):
+            self.send_error_json("只有知识库管理员可以修改知识处理预设", HTTPStatus.FORBIDDEN)
+            return
+        preset_id = self.path.split("/")[-1]
+        try:
+            preset = KNOWLEDGE_PRESET_SERVICE.update(
+                preset_id, self.read_json(), user["id"]
+            )
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"ok": True, "preset": preset})
+
+    def list_knowledge_migrations(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以查看历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            batches = conn.execute(
+                """SELECT * FROM knowledge_migration_batches
+                   ORDER BY created_at DESC LIMIT 20"""
+            ).fetchall()
+            items = conn.execute(
+                """SELECT knowledge_migration_items.*, knowledge_documents.filename,
+                          knowledge_documents.scope,
+                          knowledge_documents.project_space_id
+                   FROM knowledge_migration_items
+                   JOIN knowledge_documents
+                     ON knowledge_documents.id = knowledge_migration_items.document_id
+                   ORDER BY knowledge_migration_items.created_at,
+                            knowledge_migration_items.document_id"""
+            ).fetchall()
+            shadow = conn.execute(
+                """SELECT batch_id, COUNT(*) AS comparison_count,
+                          AVG(top_document_agreement) AS top_document_agreement,
+                          AVG(document_overlap) AS document_overlap,
+                          SUM(CASE WHEN source_kind = 'live_shadow' THEN 1 ELSE 0 END)
+                            AS live_comparison_count
+                   FROM knowledge_migration_shadow_diffs GROUP BY batch_id"""
+            ).fetchall()
+            eligible = conn.execute(
+                """SELECT COUNT(*) FROM knowledge_documents
+                   WHERE document_ir_version = 0
+                      OR chunk_policy_version = 'fixed-char-v1'"""
+            ).fetchone()[0]
+        grouped: dict[str, list[dict]] = {}
+        for row in items:
+            grouped.setdefault(str(row["batch_id"]), []).append(row_to_dict(row))
+        shadows = {str(row["batch_id"]): row_to_dict(row) for row in shadow}
+        result = []
+        for row in batches:
+            item = row_to_dict(row)
+            item["evaluation"] = safe_json_object(item.pop("evaluation_json"))
+            item["items"] = grouped.get(str(item["id"]), [])
+            item["shadow"] = shadows.get(str(item["id"]), {
+                "comparison_count": 0,
+                "top_document_agreement": None,
+                "document_overlap": None,
+                "live_comparison_count": 0,
+            })
+            result.append(item)
+        document_count, acl_sha256 = knowledge_acl_snapshot()
+        self.send_json({
+            "eligible_count": int(eligible),
+            "document_count": document_count,
+            "acl_sha256": acl_sha256,
+            "batches": result,
+            "rollout_steps": [25, 100],
+            "privacy": "Shadow 仅保存查询哈希、文档 ID、数量与一致率，不保存查询或知识正文。",
+        })
+
+    def create_knowledge_migration_batch(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以创建历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        try:
+            payload = self.read_json()
+            limit = int(payload.get("limit", 10))
+            preset = str(payload.get("preset", "standard")).strip()
+            if not 1 <= limit <= 50:
+                raise ValueError("单批迁移数量必须在 1 到 50 之间")
+            KNOWLEDGE_PRESET_SERVICE.policy(preset)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            active = conn.execute(
+                """SELECT id FROM knowledge_migration_batches
+                   WHERE status IN ('queued', 'running', 'staged', 'verified', 'canary')
+                   LIMIT 1"""
+            ).fetchone()
+            if active:
+                self.send_error_json("已有未结束的历史资料迁移批次", HTTPStatus.CONFLICT)
+                return
+            documents = conn.execute(
+                """SELECT id, active_chunk_version, chunk_count
+                   FROM knowledge_documents
+                   WHERE document_ir_version = 0
+                      OR chunk_policy_version = 'fixed-char-v1'
+                   ORDER BY created_at, id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            if not documents:
+                self.send_error_json("没有待迁移的历史资料", HTTPStatus.CONFLICT)
+                return
+            document_count, acl_sha256 = knowledge_acl_snapshot()
+            batch_id = new_id("knowledge_migration")
+            timestamp = now()
+            conn.execute(
+                """INSERT INTO knowledge_migration_batches
+                   (id, actor_user_id, preset, status, total_count,
+                    baseline_document_count, baseline_acl_sha256,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+                (
+                    batch_id, user["id"], preset, len(documents),
+                    document_count, acl_sha256, timestamp, timestamp,
+                ),
+            )
+            conn.executemany(
+                """INSERT INTO knowledge_migration_items
+                   (id, batch_id, document_id, status, source_chunk_version,
+                    source_chunk_count, created_at, updated_at)
+                   VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)""",
+                [
+                    (
+                        new_id("knowledge_migration_item"), batch_id, row["id"],
+                        int(row["active_chunk_version"]), int(row["chunk_count"]),
+                        timestamp, timestamp,
+                    )
+                    for row in documents
+                ],
+            )
+        self.send_json({
+            "batch": {
+                "id": batch_id, "status": "queued", "preset": preset,
+                "total_count": len(documents),
+            }
+        }, HTTPStatus.CREATED)
+
+    def run_knowledge_migration_batch(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以执行历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        batch_id = self.path.split("/")[-2]
+        with db() as conn:
+            batch = conn.execute(
+                """SELECT * FROM knowledge_migration_batches
+                   WHERE id = ? AND status IN ('queued', 'running', 'partial')""",
+                (batch_id,),
+            ).fetchone()
+            items = conn.execute(
+                """SELECT knowledge_migration_items.*, knowledge_documents.*
+                   FROM knowledge_migration_items
+                   JOIN knowledge_documents
+                     ON knowledge_documents.id = knowledge_migration_items.document_id
+                   WHERE knowledge_migration_items.batch_id = ?
+                     AND knowledge_migration_items.status IN ('queued', 'failed')
+                   ORDER BY knowledge_migration_items.created_at,
+                            knowledge_migration_items.document_id""",
+                (batch_id,),
+            ).fetchall()
+            if batch:
+                conn.execute(
+                    """UPDATE knowledge_migration_batches
+                       SET status = 'running', started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
+                           updated_at = ? WHERE id = ?""",
+                    (now(), now(), batch_id),
+                )
+        if not batch:
+            self.send_error_json("迁移批次不存在或当前状态不可执行", HTTPStatus.CONFLICT)
+            return
+        chunk_policy, preset_config = KNOWLEDGE_PRESET_SERVICE.policy(str(batch["preset"]))
+        for combined in items:
+            item = dict(combined)
+            document_id = str(item["document_id"])
+            ingestion_run_id = new_id("knowledge_ingestion")
+            timestamp = now()
+            try:
+                with db() as conn:
+                    conn.execute(
+                        """INSERT INTO knowledge_ingestion_runs
+                           (id, document_id, user_id, filename, scope, project_space_id,
+                            trigger_type, status, current_stage, parser_profile,
+                            raw_sha256, size_bytes, started_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 'historical_migration', 'running',
+                                   'parsing', ?, ?, ?, ?, ?)""",
+                        (
+                            ingestion_run_id, document_id, item["user_id"],
+                            item["filename"], item["scope"], item["project_space_id"],
+                            preset_config["parser_profile"], item["content_hash"],
+                            item["size_bytes"], timestamp, timestamp,
+                        ),
+                    )
+                KNOWLEDGE_INGESTION_SERVICE.stage(
+                    ingestion_run_id, "parsing", "started",
+                    {
+                        "batch_id": batch_id,
+                        "parser_profile": preset_config["parser_profile"],
+                        "preset_revision": preset_config["revision"],
+                    },
+                )
+                path = resolve_knowledge_path(item)
+                raw = path.read_bytes()
+                stored_filename = str(item["filename"])
+                parse_filename = (
+                    stored_filename
+                    if Path(stored_filename).suffix
+                    else f"{stored_filename}{path.suffix.lower()}"
+                )
+                text = extract_knowledge_text(parse_filename, raw)
+                document_ir = build_document_ir(
+                    document_id=document_id,
+                    filename=parse_filename,
+                    raw=raw,
+                    extracted_text=text,
+                    source_mime=str(item["mime_type"]),
+                    source_sha256=hashlib.sha256(raw).hexdigest(),
+                    parser_version=knowledge_parser_version(parse_filename),
+                )
+                KNOWLEDGE_INGESTION_SERVICE.stage(
+                    ingestion_run_id, "parsing", "completed",
+                    {
+                        "block_count": len(document_ir.blocks),
+                        "document_ir_version": document_ir.schema_version,
+                    },
+                )
+                KNOWLEDGE_INGESTION_SERVICE.stage(
+                    ingestion_run_id, "chunking", "started",
+                    {
+                        "policy_version": chunk_policy.version,
+                        "preset": batch["preset"],
+                    },
+                )
+                chunks = chunk_document_ir(document_ir, str(batch["preset"]), chunk_policy)
+                if not chunks:
+                    raise ValueError("历史资料未能生成结构化片段")
+                normalized_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                created_at = now()
+                chunk_rows = persisted_chunk_rows(
+                    document_id, chunks, chunk_version=1, active=False,
+                    created_at=created_at,
+                )
+                target_version = KNOWLEDGE_SERVICE.stage_migration_version(
+                    document_id, user["id"], chunk_rows,
+                    persisted_block_rows(document_ir, ingestion_run_id, created_at),
+                    ingestion_run_id=ingestion_run_id,
+                    document_ir_version=document_ir.schema_version,
+                    parser_version=document_ir.parser_version,
+                    normalized_sha256=normalized_sha256,
+                    created_at=created_at,
+                )
+                KNOWLEDGE_INGESTION_SERVICE.stage(
+                    ingestion_run_id, "chunking", "completed",
+                    {"chunk_count": len(chunks), "target_version": target_version},
+                )
+                KNOWLEDGE_INGESTION_SERVICE.complete(
+                    ingestion_run_id,
+                    document_id=document_id,
+                    normalized_sha256=normalized_sha256,
+                    block_count=len(document_ir.blocks),
+                    chunk_count=len(chunks),
+                    parser_version=document_ir.parser_version,
+                    chunk_policy_version=chunk_policy.version,
+                    index_policy_version=FTS_POLICY_VERSION,
+                )
+                with db() as conn:
+                    conn.execute(
+                        """UPDATE knowledge_migration_items
+                           SET status = 'staged', target_chunk_version = ?,
+                               target_chunk_count = ?, parser_version = ?,
+                               chunk_policy_version = ?, normalized_sha256 = ?,
+                               error_code = '', error_message = '', updated_at = ?
+                           WHERE batch_id = ? AND document_id = ?""",
+                        (
+                            target_version, len(chunks), document_ir.parser_version,
+                            chunk_policy.version, normalized_sha256, now(),
+                            batch_id, document_id,
+                        ),
+                    )
+            except (OSError, ValueError, TypeError, UnicodeError, sqlite3.Error) as exc:
+                KNOWLEDGE_INGESTION_SERVICE.fail(
+                    ingestion_run_id, "parsing", type(exc).__name__, str(exc)
+                )
+                with db() as conn:
+                    conn.execute(
+                        """UPDATE knowledge_migration_items
+                           SET status = 'failed', error_code = ?, error_message = ?,
+                               updated_at = ? WHERE batch_id = ? AND document_id = ?""",
+                        (
+                            type(exc).__name__[:80], str(exc)[:500], now(),
+                            batch_id, document_id,
+                        ),
+                    )
+        with db() as conn:
+            counts = conn.execute(
+                """SELECT COUNT(*) AS processed,
+                          SUM(status = 'staged') AS succeeded,
+                          SUM(status = 'failed') AS failed
+                   FROM knowledge_migration_items WHERE batch_id = ?""",
+                (batch_id,),
+            ).fetchone()
+            status = "staged" if int(counts["failed"] or 0) == 0 else "partial"
+            conn.execute(
+                """UPDATE knowledge_migration_batches
+                   SET status = ?, processed_count = ?, succeeded_count = ?,
+                       failed_count = ?, completed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    status, int(counts["processed"] or 0),
+                    int(counts["succeeded"] or 0), int(counts["failed"] or 0),
+                    now(), now(), batch_id,
+                ),
+            )
+        self.send_json({
+            "ok": status == "staged",
+            "batch_id": batch_id,
+            "status": status,
+            "processed_count": int(counts["processed"] or 0),
+            "succeeded_count": int(counts["succeeded"] or 0),
+            "failed_count": int(counts["failed"] or 0),
+            "active_versions_unchanged": True,
+        })
+
+    def evaluate_knowledge_migration_batch(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以评测历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        batch_id = self.path.split("/")[-2]
+        with db() as conn:
+            batch = conn.execute(
+                """SELECT * FROM knowledge_migration_batches
+                   WHERE id = ? AND status IN ('staged', 'verified')""",
+                (batch_id,),
+            ).fetchone()
+            items = conn.execute(
+                """SELECT knowledge_migration_items.*, knowledge_documents.filename
+                   FROM knowledge_migration_items
+                   JOIN knowledge_documents
+                     ON knowledge_documents.id = knowledge_migration_items.document_id
+                   WHERE knowledge_migration_items.batch_id = ?
+                   ORDER BY knowledge_migration_items.document_id""",
+                (batch_id,),
+            ).fetchall()
+        if not batch:
+            self.send_error_json("迁移批次尚未完成暂存", HTTPStatus.CONFLICT)
+            return
+        _, config = active_retrieval_policy()
+        comparisons = []
+        for item in items:
+            baseline_rows = [
+                dict(row) for row in KNOWLEDGE_SERVICE.chunks_for_version(
+                    str(item["document_id"]), int(item["source_chunk_version"])
+                )
+            ]
+            candidate_rows = [
+                dict(row) for row in KNOWLEDGE_SERVICE.chunks_for_version(
+                    str(item["document_id"]), int(item["target_chunk_version"])
+                )
+            ]
+            seed = baseline_rows[0]["content"] if baseline_rows else ""
+            terms = query_terms(str(seed))[:8]
+            query = " ".join([
+                Path(str(item["filename"])).stem,
+                *terms,
+            ]).strip()
+            baseline_result = KnowledgeRetriever(config).search(query, baseline_rows)
+            candidate_result = KnowledgeRetriever(config).search(query, candidate_rows)
+            diff = record_migration_shadow_diff(
+                batch_id, user["id"], query, baseline_result, candidate_result,
+                source_kind="offline_migration_gate",
+            )
+            comparisons.append({
+                "document_id": str(item["document_id"]),
+                "baseline_count": diff["baseline_count"],
+                "candidate_count": diff["candidate_count"],
+                "top_document_agreement": bool(diff["top_document_agreement"]),
+                "document_overlap": diff["document_overlap"],
+            })
+        document_count, acl_sha256 = knowledge_acl_snapshot()
+        gates = {
+            "all_items_staged": bool(items) and all(row["status"] == "staged" for row in items),
+            "no_failed_items": int(batch["failed_count"]) == 0,
+            "document_count_preserved": document_count == int(batch["baseline_document_count"]),
+            "acl_preserved": acl_sha256 == str(batch["baseline_acl_sha256"]),
+            "candidate_recall_preserved": bool(comparisons) and all(
+                item["candidate_count"] >= item["baseline_count"]
+                for item in comparisons
+            ),
+            "top_document_preserved": bool(comparisons) and all(
+                item["top_document_agreement"] for item in comparisons
+            ),
+        }
+        verified = all(gates.values())
+        evaluation = {
+            "comparison_count": len(comparisons),
+            "gates": gates,
+            "average_document_overlap": (
+                round(sum(item["document_overlap"] for item in comparisons) / len(comparisons), 6)
+                if comparisons else 0
+            ),
+            "decision": "promote" if verified else "rollback",
+        }
+        with db() as conn:
+            conn.execute(
+                """UPDATE knowledge_migration_batches SET status = ?,
+                   evaluation_json = ?, updated_at = ? WHERE id = ?""",
+                (
+                    "verified" if verified else "staged",
+                    json.dumps(evaluation, ensure_ascii=False), now(), batch_id,
+                ),
+            )
+        self.send_json({
+            "batch_id": batch_id,
+            "status": "verified" if verified else "staged",
+            "evaluation": evaluation,
+        })
+
+    def promote_knowledge_migration_batch(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以灰度历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        batch_id = self.path.split("/")[-2]
+        try:
+            percentage = int(self.read_json().get("percentage", 0))
+            if percentage not in {25, 100}:
+                raise ValueError("灰度比例只能是 25 或 100")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        document_count, acl_sha256 = knowledge_acl_snapshot()
+        with db() as conn:
+            batch = conn.execute(
+                """SELECT * FROM knowledge_migration_batches
+                   WHERE id = ? AND status IN ('verified', 'canary', 'rolled_back')""",
+                (batch_id,),
+            ).fetchone()
+            items = conn.execute(
+                """SELECT * FROM knowledge_migration_items
+                   WHERE batch_id = ? ORDER BY document_id""",
+                (batch_id,),
+            ).fetchall()
+        if not batch or safe_json_object(batch["evaluation_json"]).get("decision") != "promote":
+            self.send_error_json("迁移批次未通过评测，不能灰度", HTTPStatus.CONFLICT)
+            return
+        if (
+            document_count != int(batch["baseline_document_count"])
+            or acl_sha256 != str(batch["baseline_acl_sha256"])
+        ):
+            self.send_error_json("文档数量或权限边界已变化，请重新评测", HTTPStatus.CONFLICT)
+            return
+        desired = max(1, (len(items) * percentage + 99) // 100)
+        promoted_ids = {str(row["document_id"]) for row in items[:desired]}
+        for item in items:
+            if str(item["document_id"]) not in promoted_ids:
+                continue
+            KNOWLEDGE_SERVICE.activate_migration_version(
+                str(item["document_id"]), int(item["target_chunk_version"]), now()
+            )
+            with db() as conn:
+                conn.execute(
+                    """UPDATE knowledge_migration_items SET status = ?, updated_at = ?
+                       WHERE id = ?""",
+                    ("active" if percentage == 100 else "canary", now(), item["id"]),
+                )
+        status = "active" if percentage == 100 else "canary"
+        if percentage == 100:
+            with db() as conn:
+                conn.execute(
+                    """UPDATE knowledge_migration_items SET status = 'active', updated_at = ?
+                       WHERE batch_id = ? AND status = 'canary'""",
+                    (now(), batch_id),
+                )
+        with db() as conn:
+            conn.execute(
+                """UPDATE knowledge_migration_batches
+                   SET status = ?, rollout_percentage = ?, updated_at = ?
+                   WHERE id = ?""",
+                (status, percentage, now(), batch_id),
+            )
+        self.send_json({
+            "ok": True, "batch_id": batch_id, "status": status,
+            "rollout_percentage": percentage,
+            "activated_document_count": desired,
+        })
+
+    def rollback_knowledge_migration_batch(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以回滚历史资料迁移", HTTPStatus.FORBIDDEN)
+            return
+        batch_id = self.path.split("/")[-2]
+        with db() as conn:
+            batch = conn.execute(
+                """SELECT * FROM knowledge_migration_batches
+                   WHERE id = ? AND status IN ('canary', 'active')""",
+                (batch_id,),
+            ).fetchone()
+            items = conn.execute(
+                """SELECT * FROM knowledge_migration_items
+                   WHERE batch_id = ? AND status IN ('canary', 'active')
+                   ORDER BY document_id""",
+                (batch_id,),
+            ).fetchall()
+        if not batch:
+            self.send_error_json("迁移批次当前不可回滚", HTTPStatus.CONFLICT)
+            return
+        for item in items:
+            KNOWLEDGE_SERVICE.restore_migration_source(
+                str(item["document_id"]), int(item["source_chunk_version"]), now()
+            )
+        with db() as conn:
+            conn.execute(
+                """UPDATE knowledge_migration_items SET status = 'rolled_back', updated_at = ?
+                   WHERE batch_id = ? AND status IN ('canary', 'active')""",
+                (now(), batch_id),
+            )
+            conn.execute(
+                """UPDATE knowledge_migration_batches
+                   SET status = 'rolled_back', rollout_percentage = 0, updated_at = ?
+                   WHERE id = ?""",
+                (now(), batch_id),
+            )
+        self.send_json({
+            "ok": True, "batch_id": batch_id, "status": "rolled_back",
+            "restored_document_count": len(items),
+        })
+
     def create_retrieval_candidate(self, user: dict) -> None:
         if not is_platform_admin(user):
             self.send_error_json("只有平台管理员可以创建检索候选策略", HTTPStatus.FORBIDDEN)
@@ -3684,6 +4757,150 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             conn.execute("INSERT INTO retrieval_policy_events (id, version, event_type, actor_user_id, detail_json, created_at) VALUES (?, ?, 'candidate_created', ?, ?, ?)", (new_id("retrieval_policy_event"), version, user["id"], json.dumps({"suggestion_id": suggestion_id}, ensure_ascii=False), now()))
         self.send_json({"policy": {"version": version, "parent_version": parent_version, "changed_variable": suggestion["changed_variable"], "config": config_as_dict(candidate_config), "status": "candidate"}})
 
+    def create_custom_retrieval_candidate(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以创建检索候选策略", HTTPStatus.FORBIDDEN)
+            return
+        try:
+            payload = self.read_json()
+            parent_version, base_config = active_retrieval_policy()
+            candidate_config = config_from_json(
+                payload.get("config"), base_config, strict=True
+            )
+            base = config_as_dict(base_config)
+            candidate = config_as_dict(candidate_config)
+            changed = sorted(key for key in base if base[key] != candidate[key])
+            if not changed:
+                raise ValueError("候选策略至少需要修改一个参数")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        version = f"candidate-{uuid.uuid4().hex[:12]}"
+        evidence = {
+            "source": "manual_admin_configuration",
+            "changed_variables": changed,
+        }
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO retrieval_policies
+                   (version, config_json, status, parent_version, changed_variable,
+                    evidence_json, created_by_user_id, created_at)
+                   VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?)""",
+                (
+                    version,
+                    json.dumps(candidate, ensure_ascii=False, sort_keys=True),
+                    parent_version,
+                    ",".join(changed),
+                    json.dumps(evidence, ensure_ascii=False),
+                    user["id"],
+                    now(),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO retrieval_policy_events
+                   (id, version, event_type, actor_user_id, detail_json, created_at)
+                   VALUES (?, ?, 'candidate_created', ?, ?, ?)""",
+                (
+                    new_id("retrieval_policy_event"),
+                    version,
+                    user["id"],
+                    json.dumps(evidence, ensure_ascii=False),
+                    now(),
+                ),
+            )
+        self.send_json({
+            "policy": {
+                "version": version,
+                "parent_version": parent_version,
+                "changed_variable": ",".join(changed),
+                "config": candidate,
+                "status": "candidate",
+            }
+        }, HTTPStatus.CREATED)
+
+    def compare_retrieval_policies(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以使用检索实验室", HTTPStatus.FORBIDDEN)
+            return
+        try:
+            payload = self.read_json()
+            query = str(payload.get("query", "")).strip()
+            left_version = str(payload.get("left_version", "")).strip()
+            right_version = str(payload.get("right_version", "")).strip()
+            project_space_id = str(payload.get("project_space_id", "")).strip()
+            include_all_projects = bool(payload.get("include_all_projects", False))
+            if not query or len(query) > 300:
+                raise ValueError("检索实验问题必须为 1 到 300 个字符")
+            if not left_version or not right_version or left_version == right_version:
+                raise ValueError("请选择两个不同的策略版本")
+            with db() as conn:
+                rows = conn.execute(
+                    """SELECT version, config_json, status FROM retrieval_policies
+                       WHERE version IN (?, ?)""",
+                    (left_version, right_version),
+                ).fetchall()
+            policies = {str(row["version"]): row for row in rows}
+            if set(policies) != {left_version, right_version}:
+                raise ValueError("检索策略版本不存在")
+            left_config = config_from_json(
+                safe_json_object(policies[left_version]["config_json"]), strict=True
+            )
+            right_config = config_from_json(
+                safe_json_object(policies[right_version]["config_json"]), strict=True
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        left = run_retrieval_lab_strategy(
+            user["id"], query, left_version, left_config,
+            project_space_id=project_space_id,
+            include_all_projects=include_all_projects,
+        )
+        right = run_retrieval_lab_strategy(
+            user["id"], query, right_version, right_config,
+            project_space_id=project_space_id,
+            include_all_projects=include_all_projects,
+        )
+        experiment_id = new_id("retrieval_lab")
+        summary = {
+            "left_result_count": left["result_count"],
+            "right_result_count": right["result_count"],
+            "left_documents": [
+                item["document_id"] for item in left["stages"]["final_context"]
+            ],
+            "right_documents": [
+                item["document_id"] for item in right["stages"]["final_context"]
+            ],
+        }
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO retrieval_lab_experiments
+                   (id, actor_user_id, query_sha256, left_policy_version,
+                    right_policy_version, project_space_id, summary_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    experiment_id, user["id"], query_sha256(query), left_version,
+                    right_version, project_space_id,
+                    json.dumps(summary, ensure_ascii=False), now(),
+                ),
+            )
+        self.send_json({
+            "experiment_id": experiment_id,
+            "left": left,
+            "right": right,
+            "differences": {
+                "result_count_delta": right["result_count"] - left["result_count"],
+                "same_top_document": (
+                    summary["left_documents"][:1] == summary["right_documents"][:1]
+                ),
+                "changed_config": sorted(
+                    key for key in left["config"]
+                    if left["config"][key] != right["config"][key]
+                ),
+            },
+            "privacy": "实验记录仅保存问题哈希、策略版本和结果摘要，不保存问题或知识正文。",
+        })
+
     def evaluate_retrieval_candidate(self, user: dict) -> None:
         if not is_platform_admin(user):
             self.send_error_json("只有平台管理员可以评测检索候选策略", HTTPStatus.FORBIDDEN)
@@ -3699,12 +4916,30 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("候选策略缺少基线版本", HTTPStatus.CONFLICT)
             return
         cases = validate_retrieval_cases(json.loads(RETRIEVAL_EVAL_FIXTURE.read_text(encoding="utf-8")))
-        baseline_report = evaluate_retrieval(cases, KnowledgeRetriever(config_from_json(safe_json_object(baseline["config_json"]))))
-        candidate_report = evaluate_retrieval(cases, KnowledgeRetriever(config_from_json(safe_json_object(candidate["config_json"]))))
+        baseline_config = config_from_json(safe_json_object(baseline["config_json"]))
+        candidate_config = config_from_json(safe_json_object(candidate["config_json"]))
+        baseline_report = evaluate_retrieval(cases, KnowledgeRetriever(baseline_config))
+        candidate_report = evaluate_retrieval(cases, KnowledgeRetriever(candidate_config))
         gates = ("recall_at_4", "top1_accuracy", "no_match_accuracy", "neighbor_accuracy")
-        regressions = [metric for metric in gates if candidate_report[metric] < baseline_report[metric] or candidate_report["failures"]]
+        regressions = [
+            metric for metric in gates
+            if candidate_report[metric] < baseline_report[metric]
+        ]
+        if candidate_report["failures"]:
+            regressions.append("fixture_failures")
+        hybrid_report = evaluate_hybrid_retrieval(candidate_config)
+        if not hybrid_report["passed"]:
+            regressions.append("hybrid_targeted_gates")
         decision = "promote" if not regressions else "rollback"
-        experiment = {"fixture": RETRIEVAL_EVAL_FIXTURE.name, "baseline": {metric: baseline_report[metric] for metric in gates}, "candidate": {metric: candidate_report[metric] for metric in gates}, "failures": candidate_report["failures"], "decision": decision, "regressions": sorted(set(regressions))}
+        experiment = {
+            "fixture": RETRIEVAL_EVAL_FIXTURE.name,
+            "baseline": {metric: baseline_report[metric] for metric in gates},
+            "candidate": {metric: candidate_report[metric] for metric in gates},
+            "failures": candidate_report["failures"],
+            "hybrid_targeted_gates": hybrid_report["targeted_gates"],
+            "decision": decision,
+            "regressions": sorted(set(regressions)),
+        }
         status = "verified" if decision == "promote" else "blocked"
         with db() as conn:
             conn.execute("UPDATE retrieval_policies SET status = ?, experiment_json = ? WHERE version = ?", (status, json.dumps(experiment, ensure_ascii=False), version))
@@ -3731,8 +4966,21 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
             self.send_error_json("只有平台管理员可以回滚检索策略", HTTPStatus.FORBIDDEN)
             return
         with db() as conn:
-            current = conn.execute("SELECT version FROM retrieval_policies WHERE status = 'active'").fetchone()
-            target = conn.execute("SELECT version FROM retrieval_policies WHERE status = 'stable' ORDER BY activated_at DESC, created_at DESC LIMIT 1").fetchone()
+            current = conn.execute(
+                "SELECT version, parent_version FROM retrieval_policies WHERE status = 'active'"
+            ).fetchone()
+            target = None
+            if current and current["parent_version"]:
+                target = conn.execute(
+                    """SELECT version FROM retrieval_policies
+                       WHERE version = ? AND status = 'stable'""",
+                    (current["parent_version"],),
+                ).fetchone()
+            if not target:
+                target = conn.execute(
+                    """SELECT version FROM retrieval_policies WHERE status = 'stable'
+                       ORDER BY activated_at DESC, created_at DESC LIMIT 1"""
+                ).fetchone()
             if not current or not target:
                 self.send_error_json("没有可回滚的稳定检索策略", HTTPStatus.CONFLICT)
                 return
@@ -3743,7 +4991,209 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
 
     def list_knowledge(self, user: dict) -> None:
         rows = KNOWLEDGE_SERVICE.list_visible(user["id"])
-        self.send_json({"documents": [public_knowledge_document(row) for row in rows], "pdf_supported": bool(PdfReader), "image_ocr_supported": bool(TESSERACT_BINARY)})
+        processing_runs = KNOWLEDGE_INGESTION_SERVICE.list_visible(user["id"])
+        index_state = KNOWLEDGE_SERVICE.search_index_state()
+        self.send_json({
+            "documents": [public_knowledge_document(row) for row in rows],
+            "processing_runs": [row_to_dict(row) for row in processing_runs],
+            "search_index": row_to_dict(index_state) if index_state else {},
+            "embedding_index": KNOWLEDGE_EMBEDDING_SERVICE.status(),
+            "pdf_supported": bool(PdfReader),
+            "image_ocr_supported": bool(TESSERACT_BINARY),
+        })
+
+    def knowledge_processing_history(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        result = KNOWLEDGE_INGESTION_SERVICE.document_history(document_id, user["id"])
+        if result is None:
+            self.send_error_json("知识库文件不存在", HTTPStatus.NOT_FOUND)
+            return
+        runs, events_by_run = result
+        response = []
+        for run in runs:
+            item = row_to_dict(run)
+            item["events"] = []
+            for event in events_by_run.get(str(run["id"]), []):
+                event_item = row_to_dict(event)
+                event_item["detail"] = safe_json_object(event_item.pop("detail_json", "{}"))
+                item["events"].append(event_item)
+            response.append(item)
+        self.send_json({"document_id": document_id, "runs": response})
+
+    def knowledge_document_structure(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        result = KNOWLEDGE_SERVICE.document_blocks(document_id, user["id"])
+        if result is None:
+            self.send_error_json("知识库文件不存在", HTTPStatus.NOT_FOUND)
+            return
+        document, rows = result
+        document_ir = document_ir_from_rows(document, rows)
+        blocks = list(document_ir.blocks) if document_ir else []
+        markdown = document_ir_to_markdown(document_ir) if document_ir else ""
+        self.send_json({
+            "document": public_knowledge_document(document),
+            "blocks": [
+                {
+                    "id": block.block_id,
+                    "ordinal": block.ordinal,
+                    "block_type": block.block_type,
+                    "text": block.text,
+                    "section_path": list(block.section_path),
+                    "source_location": block.source_location,
+                    "metadata": block.metadata,
+                }
+                for block in blocks
+            ],
+            "markdown": markdown,
+            "available": bool(blocks),
+            "message": "" if blocks else "该资料创建于结构化解析启用前；原文件保持可用，重新上传后可查看解析结构。",
+        })
+
+    def knowledge_chunk_results(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        result = KNOWLEDGE_SERVICE.chunk_results(document_id, user["id"])
+        if result is None:
+            self.send_error_json("知识库文件不存在", HTTPStatus.NOT_FOUND)
+            return
+        document, versions, chunks = result
+        self.send_json({
+            "document": public_knowledge_document(document),
+            "presets": [
+                {"id": item["id"], **item["chunk_config"]}
+                for item in KNOWLEDGE_PRESET_SERVICE.list()
+            ],
+            "versions": [row_to_dict(row) for row in versions],
+            "chunks": [
+                {
+                    "id": row["id"],
+                    "position": row["position"],
+                    "content": row["content"],
+                    "chunk_version": row["chunk_version"],
+                    "block_ids": safe_json_list(row["block_ids_json"]),
+                    "section_path": safe_json_list(row["section_path_json"]),
+                    "source_location": safe_json_object(row["source_location_json"]),
+                    "token_count": row["token_count"],
+                    "overlap_tokens": row["overlap_tokens"],
+                    "policy_version": row["policy_version"],
+                    "preset": row["preset"],
+                    "content_sha256": row["content_sha256"],
+                }
+                for row in chunks
+            ],
+            "structure_available": bool(int(document["document_ir_version"] or 0)),
+            "manageable": bool(KNOWLEDGE_SERVICE.get_manageable(document_id, user["id"])),
+        })
+
+    def rechunk_knowledge(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        document = KNOWLEDGE_SERVICE.get_manageable(document_id, user["id"])
+        if not document:
+            self.send_error_json("知识库文件不存在或无管理权限", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            payload = self.read_json()
+            preset = str(payload.get("preset", "standard")).strip()
+            chunk_policy, _preset = KNOWLEDGE_PRESET_SERVICE.policy(preset)
+            structure = KNOWLEDGE_SERVICE.document_blocks(document_id, user["id"])
+            document_ir = document_ir_from_rows(structure[0], structure[1]) if structure else None
+            if not document_ir:
+                raise ValueError("历史资料没有结构化解析结果，请重新上传原文件后再切分")
+            chunks = chunk_document_ir(document_ir, preset, chunk_policy)
+            if not chunks:
+                raise ValueError("未能生成可检索片段")
+            created_at = now()
+            next_version = int(document["active_chunk_version"]) + 1
+            rows = persisted_chunk_rows(
+                document_id,
+                chunks,
+                chunk_version=next_version,
+                active=False,
+                created_at=created_at,
+            )
+            version = KNOWLEDGE_SERVICE.activate_new_chunks(document_id, user["id"], rows, created_at)
+            embedding_job = KNOWLEDGE_EMBEDDING_SERVICE.enqueue_document(document_id, user["id"])
+        except (ValueError, TypeError) as exc:
+            self.send_error_json(str(exc))
+            return
+        self.send_json({
+            "ok": True,
+            "document_id": document_id,
+            "active_chunk_version": version,
+            "chunk_count": len(chunks),
+            "preset": preset,
+            "policy_version": chunk_policy.version,
+            "embedding_job": embedding_job,
+        })
+
+    def rollback_knowledge_chunks(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        document = KNOWLEDGE_SERVICE.get_manageable(document_id, user["id"])
+        if not document:
+            self.send_error_json("知识库文件不存在或无管理权限", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            payload = self.read_json()
+            target_version = int(payload.get("version", 0))
+            if target_version <= 0 or target_version == int(document["active_chunk_version"]):
+                raise ValueError("请选择非当前活动切分版本")
+            version = KNOWLEDGE_SERVICE.rollback_chunks(document_id, user["id"], target_version, now())
+            embedding_job = KNOWLEDGE_EMBEDDING_SERVICE.enqueue_document(document_id, user["id"])
+        except (ValueError, TypeError) as exc:
+            self.send_error_json(str(exc))
+            return
+        self.send_json({"ok": True, "document_id": document_id, "active_chunk_version": version, "embedding_job": embedding_job})
+
+    def get_embedding_index(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以查看向量索引状态", HTTPStatus.FORBIDDEN)
+            return
+        self.send_json({
+            "index": KNOWLEDGE_EMBEDDING_SERVICE.status(),
+            "models": KNOWLEDGE_EMBEDDING_SERVICE.models(),
+            "jobs": KNOWLEDGE_EMBEDDING_SERVICE.recent_jobs(),
+            "privacy": "仅返回任务计数和失败诊断，不返回知识正文或向量。",
+        })
+
+    def rebuild_embedding_index(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以重建向量索引", HTTPStatus.FORBIDDEN)
+            return
+        if not KNOWLEDGE_EMBEDDING_SERVICE.config.enabled:
+            self.send_error_json("向量服务尚未配置", HTTPStatus.CONFLICT)
+            return
+        with db() as conn:
+            document_ids = [str(row[0]) for row in conn.execute(
+                "SELECT id FROM knowledge_documents ORDER BY created_at"
+            ).fetchall()]
+        jobs = [
+            KNOWLEDGE_EMBEDDING_SERVICE.enqueue_document(document_id, user["id"])
+            for document_id in document_ids
+        ]
+        self.send_json({"ok": True, "document_count": len(document_ids), "jobs": jobs})
+
+    def run_embedding_index_job(self, user: dict) -> None:
+        if not is_platform_admin(user):
+            self.send_error_json("只有平台管理员可以执行向量索引任务", HTTPStatus.FORBIDDEN)
+            return
+        if not KNOWLEDGE_EMBEDDING_SERVICE.config.enabled:
+            self.send_error_json("向量服务尚未配置", HTTPStatus.CONFLICT)
+            return
+        self.send_json({"ok": True, "job": KNOWLEDGE_EMBEDDING_SERVICE.process_next()})
+
+    def rollback_knowledge_embedding(self, user: dict) -> None:
+        document_id = self.path.split("/")[-2]
+        if not KNOWLEDGE_SERVICE.get_manageable(document_id, user["id"]):
+            self.send_error_json("知识库文件不存在或无管理权限", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            model_version = str(self.read_json().get("model_version", "")).strip()
+            if not model_version:
+                raise ValueError("请选择目标向量模型版本")
+            KNOWLEDGE_EMBEDDING_SERVICE.rollback_document(document_id, model_version)
+        except (ValueError, TypeError) as exc:
+            self.send_error_json(str(exc), HTTPStatus.CONFLICT)
+            return
+        self.send_json({"ok": True, "document_id": document_id, "active_embedding_model_version": model_version})
 
     def download_knowledge(self, user: dict) -> None:
         document_id = self.path.split("/")[-2]
@@ -3874,48 +5324,159 @@ class AgentPlatformHandler(SimpleHTTPRequestHandler):
         self.create_knowledge_for_scope(user, forced_space_id=space_id, origin="project_space")
 
     def create_knowledge_for_scope(self, user: dict, forced_space_id: str = "", origin: str = "knowledge_library") -> None:
+        ingestion_run_id = ""
+        current_stage = "validating"
+        document_id = new_id("knowledge")
         try:
             payload = self.read_json(MAX_KNOWLEDGE_UPLOAD_BYTES * 2)
             filename = Path(payload.get("filename", "")).name
             encoded = payload.get("content_base64", "")
             if not filename or not isinstance(encoded, str):
                 raise ValueError("资料文件无效")
+            chunk_preset = str(payload.get("chunk_preset", "standard")).strip()
+            chunk_policy, preset_config = KNOWLEDGE_PRESET_SERVICE.policy(chunk_preset)
             raw = base64.b64decode(encoded, validate=True)
             if not raw or len(raw) > MAX_KNOWLEDGE_UPLOAD_BYTES:
                 raise ValueError(f"资料为空或超过大小限制（单个文件最多 {MAX_KNOWLEDGE_UPLOAD_BYTES // 1024 // 1024} MB），请拆分后上传")
+            scope = "project" if forced_space_id or payload.get("scope") == "project" else "general"
+            project_space_id = forced_space_id or str(payload.get("project_space_id", "")).strip()
+            idempotency_key = str(payload.get("idempotency_key", "")).strip()
+            if idempotency_key and not re.fullmatch(r"[A-Za-z0-9._:-]{8,120}", idempotency_key):
+                raise ValueError("资料处理幂等键无效")
+            ingestion_run_id, existing_document_id = KNOWLEDGE_INGESTION_SERVICE.begin(
+                user_id=user["id"],
+                filename=filename,
+                scope=scope,
+                project_space_id=project_space_id,
+                size_bytes=len(raw),
+                raw_sha256=hashlib.sha256(raw).hexdigest(),
+                idempotency_key=idempotency_key,
+            )
+            if existing_document_id:
+                existing_document = KNOWLEDGE_SERVICE.get_visible(existing_document_id, user["id"])
+                if existing_document:
+                    self.send_json({
+                        "document": public_knowledge_document(existing_document),
+                        "processing_run_id": ingestion_run_id,
+                        "idempotent_replay": True,
+                    })
+                    return
+                self.send_error_json("相同上传请求对应的资料已不可访问，请重新选择文件上传", HTTPStatus.CONFLICT)
+                return
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "validating", "started")
             mime_type = validate_knowledge_upload(filename, payload.get("mime_type"), raw)
+            if scope == "project" and not project_space_id:
+                raise ValueError("项目专属资料必须选择项目空间")
+            if project_space_id:
+                with db() as conn:
+                    allowed = conn.execute("""SELECT id FROM thread_folders WHERE id = ? AND section = 'project' AND EXISTS
+                        (SELECT 1 FROM space_members WHERE space_members.space_id = thread_folders.id AND space_members.user_id = ?)""", (project_space_id, user["id"])).fetchone()
+                if not allowed:
+                    KNOWLEDGE_INGESTION_SERVICE.fail(ingestion_run_id, "validating", "project_access_denied", "没有该项目空间的资料上传权限")
+                    self.send_error_json("没有该项目空间的资料上传权限", HTTPStatus.FORBIDDEN)
+                    return
             if Path(filename).suffix.lower() in IMAGE_KNOWLEDGE_SUFFIXES:
                 budget_error = personal_run_budget_error(user["id"])
                 if budget_error:
+                    KNOWLEDGE_INGESTION_SERVICE.fail(ingestion_run_id, "validating", "run_budget_exceeded", budget_error)
                     self.send_error_json(budget_error, HTTPStatus.TOO_MANY_REQUESTS)
                     return
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "validating", "completed", {"mime_type": mime_type})
+            current_stage = "parsing"
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "parsing", "started", {
+                "parser_version": knowledge_parser_version(filename),
+                "parser_profile": preset_config["parser_profile"],
+                "preset_revision": preset_config["revision"],
+            })
             text = extract_knowledge_text(filename, raw)
-            chunks = chunk_knowledge_text(text)
+            raw_sha256 = hashlib.sha256(raw).hexdigest()
+            document_ir = build_document_ir(
+                document_id=document_id,
+                filename=filename,
+                raw=raw,
+                extracted_text=text,
+                source_mime=mime_type,
+                source_sha256=raw_sha256,
+                parser_version=knowledge_parser_version(filename),
+            )
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "parsing", "completed", {
+                "extracted_chars": len(text),
+                "block_count": len(document_ir.blocks),
+                "document_ir_version": document_ir.schema_version,
+            })
+            current_stage = "normalized"
+            normalized_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "normalized", "completed", {
+                "normalized_sha256": normalized_sha256,
+                "normalized_chars": len(text),
+            })
+            current_stage = "chunking"
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "chunking", "started", {
+                "policy_version": chunk_policy.version,
+                "preset": chunk_preset,
+                "target_tokens": chunk_policy.target_tokens,
+                "max_tokens": chunk_policy.max_tokens,
+            })
+            chunks = chunk_document_ir(document_ir, chunk_preset, chunk_policy)
             if not chunks:
                 raise ValueError("未能从资料中提取可检索文本")
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "chunking", "completed", {
+                "chunk_count": len(chunks),
+                "token_count": sum(chunk.token_count for chunk in chunks),
+            })
         except (ValueError, TypeError, UnicodeError, binascii.Error) as exc:
+            if ingestion_run_id:
+                KNOWLEDGE_INGESTION_SERVICE.fail(ingestion_run_id, current_stage, type(exc).__name__, str(exc))
             self.send_error_json(str(exc))
             return
-        scope = "project" if forced_space_id or payload.get("scope") == "project" else "general"
-        project_space_id = forced_space_id or str(payload.get("project_space_id", "")).strip()
-        if scope == "project" and not project_space_id:
-            self.send_error_json("项目专属资料必须选择项目空间")
-            return
-        if project_space_id:
-            with db() as conn:
-                allowed = conn.execute("""SELECT id FROM thread_folders WHERE id = ? AND section = 'project' AND EXISTS
-                    (SELECT 1 FROM space_members WHERE space_members.space_id = thread_folders.id AND space_members.user_id = ?)""", (project_space_id, user["id"])).fetchone()
-            if not allowed:
-                self.send_error_json("没有该项目空间的资料上传权限", HTTPStatus.FORBIDDEN)
-                return
-        document_id = new_id("knowledge")
         storage_path = KNOWLEDGE_DIR / user["id"] / f"{document_id}{Path(filename).suffix.lower()}"
         try:
-            KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": now(), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "raw": raw}, [(new_id("chunk"), document_id, position, chunk) for position, chunk in enumerate(chunks)])
-        except OSError:
+            current_stage = "lexical_indexing"
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "lexical_indexing", "started", {"policy_version": FTS_POLICY_VERSION})
+            created_at = now()
+            chunk_rows = persisted_chunk_rows(
+                document_id,
+                chunks,
+                chunk_version=1,
+                active=True,
+                created_at=created_at,
+            )
+            KNOWLEDGE_SERVICE.persist_upload({"id": document_id, "user_id": user["id"], "filename": filename, "storage_path": storage_path, "mime_type": mime_type, "content_hash": raw_sha256, "size_bytes": len(raw), "chunk_count": len(chunks), "created_at": created_at, "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "created_by_user_id": user["id"], "processing_status": "processing", "active_ingestion_run_id": ingestion_run_id, "updated_at": created_at, "document_ir_version": document_ir.schema_version, "parser_version": document_ir.parser_version, "parsed_block_count": len(document_ir.blocks), "normalized_text_sha256": normalized_sha256, "active_chunk_version": 1, "chunk_policy_version": chunk_policy.version, "chunk_preset": chunk_preset, "raw": raw}, chunk_rows, persisted_block_rows(document_ir, ingestion_run_id, created_at))
+            KNOWLEDGE_INGESTION_SERVICE.stage(ingestion_run_id, "lexical_indexing", "completed", {"indexed_chunks": len(chunks)})
+            embedding_job = KNOWLEDGE_EMBEDDING_SERVICE.enqueue_document(document_id, user["id"])
+            KNOWLEDGE_INGESTION_SERVICE.stage(
+                ingestion_run_id,
+                "embedding",
+                "completed" if embedding_job["status"] == "queued" else "skipped",
+                embedding_job if embedding_job["status"] == "queued" else {"reason": "not_configured"},
+            )
+            KNOWLEDGE_INGESTION_SERVICE.complete(
+                ingestion_run_id,
+                document_id=document_id,
+                normalized_sha256=normalized_sha256,
+                block_count=len(document_ir.blocks),
+                chunk_count=len(chunks),
+                parser_version=document_ir.parser_version,
+                chunk_policy_version=chunk_policy.version,
+                index_policy_version=FTS_POLICY_VERSION,
+            )
+        except OSError as exc:
+            try:
+                storage_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            KNOWLEDGE_INGESTION_SERVICE.fail(ingestion_run_id, current_stage, type(exc).__name__, "资料无法保存到本机磁盘")
             self.send_error_json("资料无法保存到本机磁盘，请释放空间或确认 data/knowledge 目录可写后重试", HTTPStatus.INSUFFICIENT_STORAGE)
             return
-        self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "scope": scope, "project_space_id": project_space_id, "upload_origin": origin}}, HTTPStatus.CREATED)
+        except sqlite3.Error as exc:
+            try:
+                storage_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            KNOWLEDGE_INGESTION_SERVICE.fail(ingestion_run_id, current_stage, type(exc).__name__, "资料索引写入失败")
+            self.send_error_json("资料索引写入失败，请稍后重新上传", HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self.send_json({"document": {"id": document_id, "filename": filename, "chunk_count": len(chunks), "parsed_block_count": len(document_ir.blocks), "document_ir_version": document_ir.schema_version, "active_chunk_version": 1, "chunk_policy_version": chunk_policy.version, "chunk_preset": chunk_preset, "scope": scope, "project_space_id": project_space_id, "upload_origin": origin, "processing_status": "ready", "active_ingestion_run_id": ingestion_run_id, "embedding_status": embedding_job["status"]}, "processing_run_id": ingestion_run_id, "embedding_job": embedding_job}, HTTPStatus.CREATED)
 
     def delete_knowledge(self, user: dict) -> None:
         document_id = self.path.split("?")[0].split("/")[-1]
@@ -4411,6 +5972,7 @@ def public_user(user: dict) -> dict:
         "name": user["name"],
         "avatar_url": user.get("avatar_url", ""),
         "is_admin": bool(user.get("is_admin", 0)),
+        "is_knowledge_admin": bool(user.get("is_knowledge_admin", 0) or user.get("is_admin", 0)),
     }
 
 
@@ -4808,7 +6370,102 @@ def create_personal_data_export(user_id: str) -> dict:
             (user_id,),
         ).fetchall()
         knowledge = conn.execute(
-            "SELECT id, filename, mime_type, content_hash, size_bytes, chunk_count, scope, project_space_id, upload_origin, created_at FROM knowledge_documents WHERE user_id = ? ORDER BY created_at, id",
+            "SELECT id, filename, mime_type, content_hash, size_bytes, chunk_count, scope, project_space_id, upload_origin, processing_status, active_ingestion_run_id, document_ir_version, parser_version, parsed_block_count, normalized_text_sha256, active_chunk_version, chunk_policy_version, chunk_preset, created_at, updated_at FROM knowledge_documents WHERE user_id = ? ORDER BY created_at, id",
+            (user_id,),
+        ).fetchall()
+        knowledge_blocks = conn.execute(
+            """SELECT knowledge_document_blocks.id, knowledge_document_blocks.document_id,
+                      knowledge_document_blocks.ordinal, knowledge_document_blocks.block_type,
+                      knowledge_document_blocks.section_path_json,
+                      knowledge_document_blocks.source_location_json,
+                      knowledge_document_blocks.char_count,
+                      knowledge_document_blocks.content_sha256,
+                      knowledge_document_blocks.parser_version,
+                      knowledge_document_blocks.created_at
+               FROM knowledge_document_blocks
+               JOIN knowledge_documents ON knowledge_documents.id = knowledge_document_blocks.document_id
+               WHERE knowledge_documents.user_id = ?
+               ORDER BY knowledge_document_blocks.document_id, knowledge_document_blocks.ordinal""",
+            (user_id,),
+        ).fetchall()
+        knowledge_chunk_versions = conn.execute(
+            """SELECT knowledge_chunk_versions.id, knowledge_chunk_versions.document_id,
+                      knowledge_chunk_versions.version, knowledge_chunk_versions.policy_version,
+                      knowledge_chunk_versions.preset, knowledge_chunk_versions.status,
+                      knowledge_chunk_versions.chunk_count,
+                      knowledge_chunk_versions.supersedes_version,
+                      knowledge_chunk_versions.created_at,
+                      knowledge_chunk_versions.activated_at
+               FROM knowledge_chunk_versions
+               JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunk_versions.document_id
+               WHERE knowledge_documents.user_id = ?
+               ORDER BY knowledge_chunk_versions.document_id, knowledge_chunk_versions.version""",
+            (user_id,),
+        ).fetchall()
+        knowledge_chunks = conn.execute(
+            """SELECT knowledge_chunks.id, knowledge_chunks.document_id,
+                      knowledge_chunks.position, knowledge_chunks.chunk_version,
+                      knowledge_chunks.active, knowledge_chunks.block_ids_json,
+                      knowledge_chunks.section_path_json,
+                      knowledge_chunks.source_location_json,
+                      knowledge_chunks.token_count, knowledge_chunks.overlap_tokens,
+                      knowledge_chunks.policy_version, knowledge_chunks.preset,
+                      knowledge_chunks.content_sha256, knowledge_chunks.created_at
+               FROM knowledge_chunks
+               JOIN knowledge_documents ON knowledge_documents.id = knowledge_chunks.document_id
+               WHERE knowledge_documents.user_id = ?
+               ORDER BY knowledge_chunks.document_id, knowledge_chunks.chunk_version,
+                        knowledge_chunks.position""",
+            (user_id,),
+        ).fetchall()
+        knowledge_retrieval_traces = conn.execute(
+            """SELECT id, project_space_id, query_sha256, backend, policy_version,
+                      candidate_count, selected_count, fallback_reason,
+                      candidate_summary_json, duration_ms, created_at
+               FROM knowledge_retrieval_traces WHERE user_id = ?
+               ORDER BY created_at, id""",
+            (user_id,),
+        ).fetchall()
+        knowledge_processing = conn.execute(
+            """SELECT id, document_id, filename, scope, project_space_id, trigger_type,
+                      status, current_stage, parser_profile, parser_version,
+                      chunk_policy_version, index_policy_version, size_bytes,
+                      block_count, chunk_count, warning_count, error_code,
+                      error_message, started_at, completed_at, updated_at
+               FROM knowledge_ingestion_runs WHERE user_id = ?
+               ORDER BY started_at, id""",
+            (user_id,),
+        ).fetchall()
+        knowledge_migrations = conn.execute(
+            """SELECT id, preset, status, total_count, processed_count,
+                      succeeded_count, failed_count, rollout_percentage,
+                      baseline_document_count, baseline_acl_sha256,
+                      evaluation_json, created_at, started_at, completed_at, updated_at
+               FROM knowledge_migration_batches WHERE actor_user_id = ?
+               ORDER BY created_at, id""",
+            (user_id,),
+        ).fetchall()
+        knowledge_migration_items = conn.execute(
+            """SELECT knowledge_migration_items.id,
+                      knowledge_migration_items.batch_id,
+                      knowledge_migration_items.document_id,
+                      knowledge_migration_items.status,
+                      knowledge_migration_items.source_chunk_version,
+                      knowledge_migration_items.target_chunk_version,
+                      knowledge_migration_items.source_chunk_count,
+                      knowledge_migration_items.target_chunk_count,
+                      knowledge_migration_items.parser_version,
+                      knowledge_migration_items.chunk_policy_version,
+                      knowledge_migration_items.normalized_sha256,
+                      knowledge_migration_items.error_code,
+                      knowledge_migration_items.created_at,
+                      knowledge_migration_items.updated_at
+               FROM knowledge_migration_items
+               JOIN knowledge_documents
+                 ON knowledge_documents.id = knowledge_migration_items.document_id
+               WHERE knowledge_documents.user_id = ?
+               ORDER BY knowledge_migration_items.created_at,
+                        knowledge_migration_items.id""",
             (user_id,),
         ).fetchall()
         artifacts = conn.execute(
@@ -4831,9 +6488,16 @@ def create_personal_data_export(user_id: str) -> dict:
         "messages": [row_to_dict(row) for row in messages],
         "memories": [row_to_dict(row) for row in memories],
         "knowledge_index": [row_to_dict(row) for row in knowledge],
+        "knowledge_structure_index": [row_to_dict(row) for row in knowledge_blocks],
+        "knowledge_chunk_version_index": [row_to_dict(row) for row in knowledge_chunk_versions],
+        "knowledge_chunk_index": [row_to_dict(row) for row in knowledge_chunks],
+        "knowledge_retrieval_trace_index": [row_to_dict(row) for row in knowledge_retrieval_traces],
+        "knowledge_processing_index": [row_to_dict(row) for row in knowledge_processing],
+        "knowledge_migration_index": [row_to_dict(row) for row in knowledge_migrations],
+        "knowledge_migration_item_index": [row_to_dict(row) for row in knowledge_migration_items],
         "artifact_index": [row_to_dict(row) for row in artifacts],
         "run_index": [row_to_dict(row) for row in runs],
-        "exclusions": ["password_hash", "session_tokens", "password_reset_tokens", "local_storage_paths", "knowledge_original_files"],
+        "exclusions": ["password_hash", "session_tokens", "password_reset_tokens", "local_storage_paths", "knowledge_original_files", "knowledge_structure_block_text", "knowledge_chunk_text"],
     }
     artifact_id = new_id("artifact")
     storage_dir = ARTIFACT_DIR / user_id
@@ -5418,6 +7082,16 @@ def main() -> None:
     port = int(os.environ.get("PORT", "8765"))
     host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
     server = ThreadingHTTPServer((host, port), AgentPlatformHandler)
+    if KNOWLEDGE_EMBEDDING_SERVICE.config.enabled:
+        def embedding_worker() -> None:
+            while True:
+                try:
+                    processed = KNOWLEDGE_EMBEDDING_SERVICE.process_next()
+                except Exception:
+                    LOGGER.exception("embedding_worker_failed")
+                    processed = None
+                time.sleep(0.2 if processed else 2.0)
+        threading.Thread(target=embedding_worker, name="knowledge-embedding-worker", daemon=True).start()
     print(f"Agent_Platform {APP_VERSION} running at http://{host}:{port}")
     server.serve_forever()
 

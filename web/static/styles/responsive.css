@@ -78,6 +78,17 @@
     margin: 18px 16px 0;
   }
 
+  .knowledge-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    padding-inline: 16px;
+  }
+  .knowledge-toolbar select { max-width: none; }
+  .knowledge-processing-panel,
+  .knowledge-results { margin-inline: 16px; }
+  .knowledge-processing-heading { align-items: flex-start; }
+  .knowledge-structure-layout { grid-template-columns: 1fr; }
+
   .run-drawer { width: min(380px, 100vw); padding: 14px; }
   .run-drawer-tab { font-size: 11px; }
 }

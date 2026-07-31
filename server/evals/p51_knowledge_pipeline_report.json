@@ -1,0 +1,143 @@
+{
+  "chunk_baseline": [
+    {
+      "chunk_count": 1,
+      "chunk_sha256": [
+        "408e3ea154c071593fd28726633b4bbcaa6e1f4a4153768f9ffb1987a1e270b4"
+      ],
+      "id": "short-markdown",
+      "passed": true
+    },
+    {
+      "chunk_count": 2,
+      "chunk_sha256": [
+        "b0718fdc1738242e141db914b7a2f7f0a90412cf3769bcf9cdaa7d8537ef5af1",
+        "1f261f96b89be64d2c8f48de81d72b27131f9f4920f61dcea3c60dff3578f0a1"
+      ],
+      "id": "paragraph-boundary",
+      "passed": true
+    },
+    {
+      "chunk_count": 2,
+      "chunk_sha256": [
+        "019b98818cb74656e1b86609642eff5271d8f9a70afd4e3c1c0d30e8d6057e4d",
+        "149fbe04378dea5344810fd037873409196b0b5ddf88e4264a4fa76621924edd"
+      ],
+      "id": "sentence-boundary",
+      "passed": true
+    },
+    {
+      "chunk_count": 4,
+      "chunk_sha256": [
+        "40800c4dc7925aa3ce2bd450f0b46efe056dbf5f4a83844555a43564b680a8ae",
+        "0a516049b967a77ee8699241bb52870862421aad9311384b927020955c164990",
+        "8d0f6b9b1d8f9aa2eeb9317106d7d2646283e0261220449387c5e1eeca71df42",
+        "872808ffbf0158b200d397a9884342497f23b153b1630229014cea1886ca6f20"
+      ],
+      "id": "hard-boundary",
+      "passed": true
+    }
+  ],
+  "contract": {
+    "chunk_policy_presets": [
+      "long_document",
+      "standard",
+      "table_dense"
+    ],
+    "default_chunk_policy": {
+      "max_tokens": 900,
+      "overlap_tokens": 120,
+      "preserve_headings": true,
+      "preserve_tables": true,
+      "preset": "standard",
+      "target_tokens": 600,
+      "version": "fixed-char-v1"
+    },
+    "default_index_policy": {
+      "candidate_limit": 4,
+      "embedding_enabled": false,
+      "embedding_model": "",
+      "hybrid_method": "lexical_only",
+      "lexical_backend": "python_lexical_v1",
+      "lexical_weight": 1.0,
+      "rerank_limit": 0,
+      "vector_dimensions": 0,
+      "vector_weight": 0.0,
+      "version": "lexical-retrieval-v1"
+    },
+    "document_block_types": [
+      "heading",
+      "image_ocr",
+      "list",
+      "paragraph",
+      "sheet",
+      "table"
+    ],
+    "document_ir_schema_version": 1,
+    "hybrid_methods": [
+      "lexical_only",
+      "rrf",
+      "weighted"
+    ],
+    "lexical_backends": [
+      "python_lexical_v1",
+      "sqlite_fts5"
+    ]
+  },
+  "failures": [],
+  "format_capabilities": [
+    {
+      "coverage_test": "server.test_app.AppTests.test_local_knowledge_upload_retrieval_citation_and_delete",
+      "current_structure": [
+        "plain_text"
+      ],
+      "format": "markdown",
+      "parser": "utf8-text-v1"
+    },
+    {
+      "coverage_test": "optional_parser_dependency",
+      "current_structure": [
+        "paragraph"
+      ],
+      "format": "docx",
+      "parser": "python-docx-v1"
+    },
+    {
+      "coverage_test": "optional_parser_dependency",
+      "current_structure": [
+        "page_marker",
+        "plain_text"
+      ],
+      "format": "pdf",
+      "parser": "pypdf-v1"
+    },
+    {
+      "coverage_test": "server.test_app.AppTests.test_xlsx_knowledge_extraction_preserves_sheet_and_cell_text",
+      "current_structure": [
+        "sheet_marker",
+        "row_text"
+      ],
+      "format": "xlsx",
+      "parser": "xlsx-xml-v1"
+    },
+    {
+      "coverage_test": "server.test_app.AppTests.test_image_knowledge_uses_bounded_local_ocr_without_network",
+      "current_structure": [
+        "image_ocr_marker",
+        "plain_text"
+      ],
+      "format": "image",
+      "parser": "tesseract-local-v1"
+    }
+  ],
+  "pipeline_behavior": "fixed-character-chunking-v1",
+  "retrieval_baseline": {
+    "cases": 20,
+    "neighbor_accuracy": 1.0,
+    "no_match_accuracy": 1.0,
+    "recall_at_4": 1.0,
+    "top1_accuracy": 1.0
+  },
+  "retrieval_policy_version": "lexical-retrieval-v1",
+  "schema_version": 1
+}

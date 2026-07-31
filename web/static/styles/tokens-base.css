@@ -76,14 +76,17 @@ button {
   display: grid;
   place-items: center;
   padding: 24px;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(15, 118, 110, 0.055), transparent 34%),
+    var(--bg);
 }
 
 .login-panel {
-  width: min(420px, 100%);
+  width: min(440px, 100%);
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 32px;
+  border-radius: 12px;
+  padding: 36px;
   box-shadow: var(--shadow);
 }
 
@@ -94,8 +97,44 @@ button {
 }
 
 .login-panel h1 {
-  margin: 28px 0 8px;
+  margin: 30px 0 8px;
   font-size: 28px;
+}
+
+.login-panel > p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.login-form {
+  display: grid;
+  gap: 18px;
+  margin-top: 24px;
+}
+
+.login-form label {
+  gap: 7px;
+  margin-top: 0;
+}
+
+.login-form > button,
+.password-reset-form > button {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.login-secondary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 18px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.login-secondary-actions .text-button {
+  margin-top: 0;
 }
 
 .login-panel p,
@@ -160,7 +199,14 @@ form button:hover,
 }
 
 .form-error {
-  min-height: 20px;
-  margin-top: 14px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #f1c6c1;
+  border-radius: 8px;
+  background: #fff5f4;
   color: var(--danger);
+  font-size: 13px;
+  line-height: 1.5;
 }
+
+.form-error:empty { display: none; }

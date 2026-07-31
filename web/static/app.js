@@ -44,7 +44,7 @@ async function boot() {
       showLogin();
       return;
     }
-    els.loginError.textContent = `无法连接本地服务：${error.message}`;
+    els.loginError.textContent = error.message;
     showLogin();
   }
 }
@@ -232,7 +232,23 @@ async function loadApps() {
 async function loadKnowledge() {
   const data = await api("/api/knowledge");
   state.knowledgeDocuments = data.documents;
+  state.knowledgeProcessingRuns = data.processing_runs || [];
+  const searchIndex = data.search_index || {};
+  const embeddingIndex = data.embedding_index || {};
+  const vectorLabel = embeddingIndex.enabled
+    ? `向量 ${embeddingIndex.model || "已配置"}`
+    : "向量未配置";
+  els.knowledgeIndexStatus.textContent = searchIndex.backend
+    ? `${searchIndex.backend === "fts5_trigram" ? "FTS5/BM25" : searchIndex.backend} · ${searchIndex.indexed_chunk_count || 0} 片段 · ${vectorLabel}`
+    : `词法回退 · ${vectorLabel}`;
+  els.knowledgeIndexStatus.title = [searchIndex.policy_version, embeddingIndex.model_version].filter(Boolean).join(" · ");
   renderKnowledge(data.documents);
+  knowledgeLibrary.renderProcessingRuns(els, state.knowledgeProcessingRuns.slice(0, 6), escapeHtml, "最近处理", retryKnowledgeUpload);
+}
+
+function retryKnowledgeUpload(run) {
+  state.knowledgeUploadSpaceId = run.scope === "project" ? run.project_space_id || "" : "";
+  els.knowledgeFileInput.click();
 }
 
 async function loadMemories() {
@@ -361,6 +377,49 @@ function renderKnowledge(documents) {
   knowledgeLibrary.renderDocuments(state, els, escapeHtml, {
     onPreview: openKnowledge,
     onEdit: editKnowledge,
+    onStructure: async (document) => {
+      try {
+        const data = await api(`/api/knowledge/${document.id}/structure`);
+        knowledgeLibrary.renderStructure(els, data, escapeHtml);
+        els.knowledgeProcessingPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (error) {
+        window.alert(error.message || "无法加载解析结果");
+      }
+    },
+    onChunks: async (document) => {
+      const showChunks = async () => {
+        const data = await api(`/api/knowledge/${document.id}/chunks`);
+        knowledgeLibrary.renderChunks(els, data, escapeHtml, {
+          onRechunk: async (preset) => {
+            if (!window.confirm(`使用“${preset}”预设生成新切分版本并切换？`)) return;
+            await api(`/api/knowledge/${document.id}/rechunk`, { method: "POST", body: JSON.stringify({ preset }) });
+            await loadKnowledge();
+            await showChunks();
+          },
+          onRollback: async (version) => {
+            if (!window.confirm(`回滚到切分版本 v${version}？`)) return;
+            await api(`/api/knowledge/${document.id}/chunk-rollback`, { method: "POST", body: JSON.stringify({ version }) });
+            await loadKnowledge();
+            await showChunks();
+          },
+        });
+        els.knowledgeProcessingPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      };
+      try {
+        await showChunks();
+      } catch (error) {
+        window.alert(error.message || "无法加载切分结果");
+      }
+    },
+    onHistory: async (document) => {
+      try {
+        const data = await api(`/api/knowledge/${document.id}/processing`);
+        knowledgeLibrary.renderProcessingRuns(els, data.runs, escapeHtml, `处理记录：${document.filename}`, retryKnowledgeUpload);
+        els.knowledgeProcessingPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (error) {
+        window.alert(error.message || "无法加载处理记录");
+      }
+    },
     onDelete: async (document) => {
       if (!window.confirm(`删除资料“${document.filename}”？`)) return;
       await api(`/api/knowledge/${document.id}`, { method: "DELETE" });
@@ -969,7 +1028,12 @@ async function loadRetrievalDiagnostics() {
   const data = await api("/api/retrieval-diagnostics");
   let governance;
   try {
-    const [suggestionData, policyData] = await Promise.all([api("/api/retrieval-suggestions"), api("/api/retrieval-policies")]);
+    const [suggestionData, policyData, presetData, migrationData] = await Promise.all([
+      api("/api/retrieval-suggestions"),
+      api("/api/retrieval-policies"),
+      api("/api/knowledge-presets"),
+      api("/api/knowledge-migrations"),
+    ]);
     const reload = async (request, button) => {
       button.disabled = true;
       try { await request(); await loadRetrievalDiagnostics(); }
@@ -979,10 +1043,35 @@ async function loadRetrievalDiagnostics() {
       suggestions: suggestionData.suggestions,
       evidence: suggestionData.evidence,
       policies: policyData.policies,
+      presets: presetData.presets,
+      migrations: migrationData,
       onCreateCandidate: (id, button) => reload(() => api(`/api/retrieval-suggestions/${id}/candidate`, { method: "POST", body: "{}" }), button),
+      onCreateCustomCandidate: (config, button) => reload(() => api("/api/retrieval-policies/candidates", { method: "POST", body: JSON.stringify({ config }) }), button),
       onEvaluate: (version, button) => reload(() => api(`/api/retrieval-policies/${version}/evaluate`, { method: "POST", body: "{}" }), button),
       onPublish: (version, button) => reload(() => api(`/api/retrieval-policies/${version}/publish`, { method: "POST", body: "{}" }), button),
       onRollback: (button) => reload(() => api("/api/retrieval-policies/rollback", { method: "POST", body: "{}" }), button),
+      onEditPreset: async (preset, button) => {
+        const config = preset.chunk_config || {};
+        const target = Number(globalThis.prompt("目标 Token", String(config.target_tokens ?? 600)));
+        if (!Number.isFinite(target)) return;
+        const maximum = Number(globalThis.prompt("最大 Token", String(config.max_tokens ?? 900)));
+        if (!Number.isFinite(maximum)) return;
+        const overlap = Number(globalThis.prompt("重叠 Token", String(config.overlap_tokens ?? 120)));
+        if (!Number.isFinite(overlap)) return;
+        await reload(() => api(`/api/knowledge-presets/${preset.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            parser_profile: preset.parser_profile,
+            chunk_config: { target_tokens: target, max_tokens: maximum, overlap_tokens: overlap },
+          }),
+        }), button);
+      },
+      onCompare: (payload) => api("/api/retrieval-lab/compare", { method: "POST", body: JSON.stringify(payload) }),
+      onCreateMigration: (button) => reload(() => api("/api/knowledge-migrations/batches", { method: "POST", body: JSON.stringify({ preset: "standard", limit: 10 }) }), button),
+      onRunMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/run`, { method: "POST", body: "{}" }), button),
+      onEvaluateMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/evaluate`, { method: "POST", body: "{}" }), button),
+      onPromoteMigration: (id, percentage, button) => reload(() => api(`/api/knowledge-migrations/${id}/promote`, { method: "POST", body: JSON.stringify({ percentage }) }), button),
+      onRollbackMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/rollback`, { method: "POST", body: "{}" }), button),
     };
   } catch (_error) {
     // Policy controls are deliberately hidden from non-administrators.
@@ -1907,7 +1996,7 @@ els.knowledgeFileInput.addEventListener("change", async () => {
     if (els.knowledgeScopeSelect.value === "project" && !projectSpaceId) throw new Error("请先选择项目空间");
     const result = await api(uploadSpaceId ? `/api/folders/${uploadSpaceId}/knowledge` : "/api/knowledge", {
       method: "POST",
-      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId }),
+      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId, idempotency_key: window.crypto?.randomUUID?.() || `upload-${Date.now()}-${Math.random().toString(16).slice(2)}` }),
     });
     uploadedDocument = result.document;
     // The POST is the durable upload boundary. Refresh independently so a
@@ -1915,12 +2004,16 @@ els.knowledgeFileInput.addEventListener("change", async () => {
     // error dialog.
     refreshKnowledgeAfterUpload(uploadSpaceId, uploadedDocument);
   } catch (error) {
-    if (!uploadedDocument) window.alert(error.message || "资料上传失败");
+    if (!uploadedDocument) {
+      await loadKnowledge().catch(() => {});
+      window.alert(error.message || "资料上传失败");
+    }
   } finally {
     els.knowledgeFileInput.value = "";
     state.knowledgeUploadSpaceId = "";
   }
 });
+els.closeKnowledgeProcessing.addEventListener("click", () => els.knowledgeProcessingPanel.classList.add("hidden"));
 
 els.knowledgeScopeSelect.addEventListener("change", syncKnowledgeScopeControls);
 els.knowledgeProjectSelect.addEventListener("change", () => { renderKnowledge(state.knowledgeDocuments); searchKnowledge(); });

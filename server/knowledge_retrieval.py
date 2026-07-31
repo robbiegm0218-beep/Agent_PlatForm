@@ -134,6 +134,11 @@ class RetrievalConfig:
     max_excerpt_chars: int = 900
     max_total_chars: int = 2800
     neighbor_radius: int = 1
+    hybrid_enabled: bool = True
+    vector_min_score: float = 0.72
+    rrf_k: int = 60
+    candidate_limit: int = 64
+    rewrite_enabled: bool = True
 
 
 def retrieval_policy_snapshot(config: RetrievalConfig | None = None, version: str = RETRIEVAL_POLICY_VERSION) -> dict:
@@ -146,6 +151,11 @@ def retrieval_policy_snapshot(config: RetrievalConfig | None = None, version: st
             "max_excerpt_chars": active.max_excerpt_chars,
             "max_total_chars": active.max_total_chars,
             "neighbor_radius": active.neighbor_radius,
+            "hybrid_enabled": active.hybrid_enabled,
+            "vector_min_score": active.vector_min_score,
+            "rrf_k": active.rrf_k,
+            "candidate_limit": active.candidate_limit,
+            "rewrite_enabled": active.rewrite_enabled,
         },
     }
 
@@ -171,8 +181,11 @@ class KnowledgeRetriever:
             content = str(row.get("content", ""))
             normalized_content = normalize_text(content)
             normalized_filename = normalize_text(str(row.get("filename", "")))
-            matched = [term for term in terms if term in normalized_content or term in normalized_filename]
+            normalized_section = normalize_text(str(row.get("section_path_json", "")))
+            searchable_heading = f"{normalized_filename}{normalized_section}"
+            matched = [term for term in terms if term in normalized_content or term in searchable_heading]
             filename_matches = [term for term in matched if term in normalized_filename]
+            section_matches = [term for term in matched if term in normalized_section]
             rare_matches = [
                 term for term in matched
                 if document_frequency[term] <= max(1, math.ceil(len(records) * 0.25))
@@ -181,8 +194,10 @@ class KnowledgeRetriever:
                 anchor for anchor in named_anchors
                 if anchor in normalized_content or anchor in normalized_filename
             ]
+            vector_score = float(row.get("vector_score") or 0.0)
+            semantic_candidate = bool(row.get("semantic_candidate")) and vector_score >= self.config.vector_min_score
             minimum_matches = 1 if len(terms) == 1 else 2
-            if len(matched) < minimum_matches:
+            if len(matched) < minimum_matches and not semantic_candidate:
                 continue
 
             lexical = 0.0
@@ -194,33 +209,50 @@ class KnowledgeRetriever:
                     lexical += (1 + math.log(min(frequency, 6))) * inverse_document_frequency
                 if term in normalized_filename:
                     title += 2.5
+                elif term in normalized_section:
+                    title += 1.5
             coverage = 4.0 * len(matched) / len(terms)
             phrase = 8.0 if len(normalized_query) >= 4 and normalized_query in normalized_content else 0.0
             length_normalization = 1 / math.sqrt(max(len(normalized_content), 120) / 120)
-            score = (lexical * length_normalization) + title + coverage + phrase
+            semantic = max(0.0, vector_score) * 3.0 if semantic_candidate else 0.0
+            fusion = float(row.get("hybrid_rrf_score") or 0.0) * 30.0
+            score = (lexical * length_normalization) + title + coverage + phrase + semantic + fusion
             ranked.append((
-                score, phrase, title, lexical, coverage, matched, row,
-                filename_matches, rare_matches, matched_named_anchors,
+                score, phrase, title, lexical, coverage, semantic, fusion, matched, row,
+                filename_matches, section_matches, rare_matches, matched_named_anchors,
             ))
 
-        ranked.sort(key=lambda item: (-item[0], int(item[6].get("position", 0)), str(item[6].get("id", ""))))
+        ranked.sort(key=lambda item: (-item[0], int(item[8].get("position", 0)), str(item[8].get("id", ""))))
         by_document_position = {
             (str(row.get("document_id", "")), int(row.get("position", 0))): row for row in records
         }
         results = []
         seen_hashes: set[str] = set()
+        seen_normalized: list[str] = []
         remaining_budget = self.config.max_total_chars
         for (
-            score, phrase, title, lexical, coverage, matched, row,
-            filename_matches, rare_matches, matched_named_anchors,
+            score, phrase, title, lexical, coverage, semantic, fusion, matched, row,
+            filename_matches, section_matches, rare_matches, matched_named_anchors,
         ) in ranked:
             if len(results) >= self.config.limit or remaining_budget <= 0:
                 break
             primary_content = str(row.get("content", "")).strip()
-            content_hash = hashlib.sha256(normalize_text(primary_content).encode("utf-8")).hexdigest()
+            normalized_primary = normalize_text(primary_content)
+            content_hash = hashlib.sha256(normalized_primary.encode("utf-8")).hexdigest()
             if content_hash in seen_hashes:
                 continue
+            if any(
+                min(len(normalized_primary), len(previous)) >= 80
+                and (
+                    normalized_primary in previous
+                    or previous in normalized_primary
+                )
+                and min(len(normalized_primary), len(previous)) / max(len(normalized_primary), len(previous)) >= 0.85
+                for previous in seen_normalized
+            ):
+                continue
             seen_hashes.add(content_hash)
+            seen_normalized.append(normalized_primary)
 
             document_id = str(row.get("document_id", ""))
             position = int(row.get("position", 0))
@@ -252,10 +284,13 @@ class KnowledgeRetriever:
                     "title": round(title, 6),
                     "lexical": round(lexical, 6),
                     "coverage": round(coverage, 6),
+                    "semantic": round(semantic, 6),
+                    "fusion": round(fusion, 6),
                 },
                 "match_signals": {
                     "exact_phrase": bool(phrase),
                     "filename_terms": filename_matches,
+                    "section_terms": section_matches,
                     "rare_terms": rare_matches,
                     "coverage_ratio": round(len(matched) / len(terms), 6),
                     "named_anchors": named_anchors,
@@ -264,6 +299,11 @@ class KnowledgeRetriever:
                         anchor for anchor in named_anchors
                         if anchor not in matched_named_anchors
                     ],
+                    "semantic_candidate": bool(row.get("semantic_candidate")),
+                    "vector_score": row.get("vector_score"),
+                    "lexical_rank": row.get("lexical_rank"),
+                    "vector_rank": row.get("vector_rank"),
+                    "rrf_score": round(float(row.get("hybrid_rrf_score") or 0.0), 8),
                 },
             })
         if results:

@@ -1,0 +1,25 @@
+{
+  "policy_version": "hybrid-rrf-v1",
+  "baseline": {
+    "cases": 20,
+    "recall_at_4": 1.0,
+    "top1_accuracy": 1.0,
+    "no_match_accuracy": 1.0,
+    "neighbor_accuracy": 1.0,
+    "legacy_recall_at_4": 0.875,
+    "legacy_top1_accuracy": 0.9333333333333333,
+    "failures": []
+  },
+  "targeted_gates": {
+    "baseline_recall_preserved": true,
+    "baseline_top1_preserved": true,
+    "baseline_negative_accuracy_preserved": true,
+    "semantic_synonym_recalled": true,
+    "low_vector_not_forced": true,
+    "neighbor_expansion": true,
+    "rrf_shared_candidate_first": true,
+    "named_anchor_blocks_implicit_injection": true,
+    "rewrite_preserves_anchors": true
+  },
+  "passed": true
+}

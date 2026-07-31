@@ -155,6 +155,28 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertIn("agent_intelligence", health)
         self.assertIn("enabled", health["agent_intelligence"])
 
+    def test_embedding_index_is_disabled_by_default_and_admin_only(self):
+        report = self.request_json("/api/embedding-index", token=self.token)
+        self.assertFalse(report["index"]["enabled"])
+        self.assertEqual(report["index"]["fallback"], "fts5-bm25")
+        self.assertNotIn("api_key", json.dumps(report))
+        with self.assertRaises(urllib.error.HTTPError) as disabled:
+            self.request_json("/api/embedding-index/rebuild", {}, self.token)
+        self.assertEqual(disabled.exception.code, 409)
+        with app.db() as conn:
+            conn.execute(
+                """INSERT INTO users (id, email, password_hash, name, created_at, is_admin)
+                   VALUES ('embedding-viewer', 'viewer@example.com', ?, 'Viewer', 1, 0)""",
+                (app.hash_password("viewer-password-123"),),
+            )
+        viewer = self.request_json(
+            "/api/login",
+            {"email": "viewer@example.com", "password": "viewer-password-123"},
+        )["token"]
+        with self.assertRaises(urllib.error.HTTPError) as forbidden:
+            self.request_json("/api/embedding-index", token=viewer)
+        self.assertEqual(forbidden.exception.code, 403)
+
     def test_api_security_headers_and_cross_origin_write_are_rejected(self):
         request = urllib.request.Request(f"{self.base_url}/api/health")
         with urllib.request.urlopen(request, timeout=3) as response:
@@ -1247,11 +1269,26 @@ class AgentPlatformApiTests(unittest.TestCase):
         }, self.token)["document"]
         member_space = self.request_json(f"/api/folders/{space['id']}", token=member_token)
         self.assertEqual(member_space["knowledge_documents"][0]["filename"], "项目资料.md")
+        member_chunks = self.request_json(f"/api/knowledge/{document['id']}/chunks", token=member_token)
+        self.assertFalse(member_chunks["manageable"])
+        self.assertEqual(member_chunks["chunks"][0]["policy_version"], "structure-token-v1:standard:r1")
+        with self.assertRaises(urllib.error.HTTPError) as denied_rechunk:
+            self.request_json(
+                f"/api/knowledge/{document['id']}/rechunk",
+                {"preset": "table_dense"},
+                member_token,
+            )
+        self.assertEqual(denied_rechunk.exception.code, 404)
         self.assertEqual(len(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"])), 1)
         matches = app.search_knowledge(self.request_json("/api/me", token=self.token)["user"]["id"], "通用指标", project_space_id=space["id"])
         self.assertEqual(matches[0]["document_id"], general["id"])
         self.request_json(f"/api/folders/{space['id']}", token=self.token, method="DELETE")
         self.assertEqual(app.search_knowledge("knowledge_member", "项目专属指标", project_space_id=space["id"]), [])
+        with app.db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM knowledge_chunk_versions WHERE document_id = ?",
+                (document["id"],),
+            ).fetchone()[0], 0)
 
     def test_project_knowledge_delete_requires_space_owner(self):
         with app.db() as conn:
@@ -1631,6 +1668,56 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertTrue(app.infer_task_profile("帮我查一下，今天上海的天气")["needs_tools"])
         self.assertTrue(app.infer_task_profile("帮我查一下：https://openai.com/zh-Hant-HK/index/harness-engineering/")["needs_tools"])
 
+    def test_hybrid_search_fuses_ready_vectors_and_falls_back_on_provider_failure(self):
+        source = "# 发布审批\n\nAtlas-42 上线前需要安全负责人签字。"
+        uploaded = self.request_json(
+            "/api/knowledge",
+            {
+                "filename": "atlas-42.md",
+                "mime_type": "text/markdown",
+                "content_base64": base64.b64encode(source.encode("utf-8")).decode("ascii"),
+            },
+            self.token,
+        )
+        document_id = uploaded["document"]["id"]
+        original_service = app.KNOWLEDGE_EMBEDDING_SERVICE
+
+        class Provider:
+            def __init__(self, fail=False):
+                self.fail = fail
+
+            def embed(self, texts):
+                if self.fail:
+                    raise app.EmbeddingError("fixture unavailable")
+                return [[1.0, 2.0, 3.0] for _ in texts]
+
+        config = app.EmbeddingConfig(
+            provider="openai_compatible", base_url="https://example.test/v1",
+            api_key="secret", model="fixture-embed", dimensions=3,
+        )
+        try:
+            service = app.KnowledgeEmbeddingService(app.db, app.now, app.new_id, config, Provider())
+            service.enqueue_document(document_id, "admin")
+            self.assertEqual(service.process_next()["status"], "ready")
+            app.KNOWLEDGE_EMBEDDING_SERVICE = service
+            hybrid = self.request_json(
+                f"/api/knowledge/search?query={quote('Atlas-42 发布审批')}",
+                token=self.token,
+            )["results"]
+            self.assertEqual(hybrid[0]["retrieval_backend"], "hybrid-rrf-v1")
+            self.assertIsNotNone(hybrid[0]["match_signals"]["vector_score"])
+
+            app.KNOWLEDGE_EMBEDDING_SERVICE = app.KnowledgeEmbeddingService(
+                app.db, app.now, app.new_id, config, Provider(fail=True)
+            )
+            fallback = self.request_json(
+                f"/api/knowledge/search?query={quote('Atlas-42 发布审批')}",
+                token=self.token,
+            )["results"]
+            self.assertEqual(fallback[0]["retrieval_backend"], "fts5-bm25-v1")
+        finally:
+            app.KNOWLEDGE_EMBEDDING_SERVICE = original_service
+
     def test_local_knowledge_upload_retrieval_citation_and_delete(self):
         source = "# 产品资料\n\n北极星指标是每周完成首次核心任务的活跃用户数。"
         uploaded = self.request_json(
@@ -1643,10 +1730,120 @@ class AgentPlatformApiTests(unittest.TestCase):
             self.token,
         )
         document_id = uploaded["document"]["id"]
-        documents = self.request_json("/api/knowledge", token=self.token)["documents"]
+        knowledge_payload = self.request_json("/api/knowledge", token=self.token)
+        documents = knowledge_payload["documents"]
+        self.assertEqual(knowledge_payload["search_index"]["backend"], "fts5_trigram")
+        self.assertEqual(knowledge_payload["search_index"]["policy_version"], "fts5-bm25-v1")
+        self.assertEqual(knowledge_payload["search_index"]["indexed_chunk_count"], 1)
         self.assertEqual(documents[0]["id"], document_id)
-        results = self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"]
+        self.assertEqual(documents[0]["processing_status"], "ready")
+        self.assertEqual(documents[0]["document_ir_version"], 1)
+        self.assertEqual(documents[0]["parsed_block_count"], 2)
+        self.assertEqual(documents[0]["active_chunk_version"], 1)
+        self.assertEqual(documents[0]["chunk_policy_version"], "structure-token-v1:standard:r1")
+        self.assertEqual(documents[0]["chunk_preset"], "standard")
+        self.assertEqual(knowledge_payload["processing_runs"][0]["status"], "ready")
+        self.assertEqual(knowledge_payload["processing_runs"][0]["block_count"], 2)
+        history = self.request_json(f"/api/knowledge/{document_id}/processing", token=self.token)
+        self.assertEqual(history["runs"][0]["status"], "ready")
+        self.assertEqual(
+            [event["stage"] for event in history["runs"][0]["events"]],
+            ["uploaded", "validating", "validating", "parsing", "parsing", "normalized", "chunking", "chunking", "lexical_indexing", "lexical_indexing", "embedding", "ready"],
+        )
+        self.assertNotIn(source, json.dumps(history, ensure_ascii=False))
+        structure = self.request_json(f"/api/knowledge/{document_id}/structure", token=self.token)
+        self.assertTrue(structure["available"])
+        self.assertEqual([block["block_type"] for block in structure["blocks"]], ["heading", "paragraph"])
+        self.assertEqual(structure["blocks"][0]["source_location"], {"line_start": 1, "line_end": 1})
+        self.assertIn("# 产品资料", structure["markdown"])
+        self.assertIn("北极星指标", structure["markdown"])
+        chunk_result = self.request_json(f"/api/knowledge/{document_id}/chunks", token=self.token)
+        self.assertTrue(chunk_result["manageable"])
+        self.assertTrue(chunk_result["structure_available"])
+        self.assertEqual(chunk_result["versions"][0]["status"], "active")
+        self.assertEqual(chunk_result["chunks"][0]["section_path"], ["产品资料"])
+        self.assertEqual(chunk_result["chunks"][0]["block_ids"], [structure["blocks"][0]["id"], structure["blocks"][1]["id"]])
+        self.assertEqual(chunk_result["chunks"][0]["policy_version"], "structure-token-v1:standard:r1")
+        self.assertGreater(chunk_result["chunks"][0]["token_count"], 0)
+
+        rechunked = self.request_json(
+            f"/api/knowledge/{document_id}/rechunk",
+            {"preset": "long_document"},
+            self.token,
+        )
+        self.assertEqual(rechunked["active_chunk_version"], 2)
+        chunk_result = self.request_json(f"/api/knowledge/{document_id}/chunks", token=self.token)
+        self.assertEqual(chunk_result["document"]["active_chunk_version"], 2)
+        self.assertEqual(chunk_result["document"]["chunk_preset"], "long_document")
+        self.assertEqual([version["status"] for version in chunk_result["versions"]], ["active", "archived"])
+        with app.db() as conn:
+            active_ids = {
+                row["id"] for row in conn.execute(
+                    "SELECT id FROM knowledge_chunks WHERE document_id = ? AND active = 1",
+                    (document_id,),
+                )
+            }
+            indexed_ids = {
+                row["chunk_id"] for row in conn.execute(
+                    "SELECT chunk_id FROM knowledge_chunks_fts WHERE document_id = ?",
+                    (document_id,),
+                )
+            }
+        self.assertEqual(indexed_ids, active_ids)
+        rolled_back = self.request_json(
+            f"/api/knowledge/{document_id}/chunk-rollback",
+            {"version": 1},
+            self.token,
+        )
+        self.assertEqual(rolled_back["active_chunk_version"], 1)
+        chunk_result = self.request_json(f"/api/knowledge/{document_id}/chunks", token=self.token)
+        self.assertEqual(chunk_result["document"]["chunk_preset"], "standard")
+        self.assertTrue(all(chunk["chunk_version"] == 1 for chunk in chunk_result["chunks"]))
+        with app.db() as conn:
+            self.assertEqual(
+                {
+                    row["chunk_id"] for row in conn.execute(
+                        "SELECT chunk_id FROM knowledge_chunks_fts WHERE document_id = ?",
+                        (document_id,),
+                    )
+                },
+                {
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM knowledge_chunks WHERE document_id = ? AND active = 1",
+                        (document_id,),
+                    )
+                },
+            )
+        with patch.object(
+            app.KNOWLEDGE_SERVICE,
+            "searchable_chunks",
+            wraps=app.KNOWLEDGE_SERVICE.searchable_chunks,
+        ) as legacy_scan:
+            results = self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"]
+        legacy_scan.assert_not_called()
         self.assertEqual(results[0]["filename"], "product.md")
+        self.assertEqual(results[0]["retrieval_backend"], "fts5-bm25-v1")
+        self.assertGreaterEqual(results[0]["bm25_score"], 0)
+        short_results = self.request_json(f"/api/knowledge/search?query={quote('指标')}", token=self.token)["results"]
+        self.assertEqual(short_results[0]["retrieval_backend"], "python_lexical_v1")
+        with app.db() as conn:
+            index_state = conn.execute("SELECT * FROM knowledge_search_index_state WHERE id = 1").fetchone()
+            traces = conn.execute(
+                """SELECT query_sha256, backend, candidate_count, selected_count,
+                          fallback_reason, candidate_summary_json
+                   FROM knowledge_retrieval_traces WHERE user_id = ?
+                   ORDER BY created_at DESC""",
+                (self.request_json("/api/me", token=self.token)["user"]["id"],),
+            ).fetchall()
+        self.assertEqual(index_state["backend"], "fts5_trigram")
+        self.assertEqual(index_state["policy_version"], "fts5-bm25-v1")
+        self.assertEqual(traces[0]["backend"], "python_lexical_v1")
+        self.assertEqual(traces[0]["fallback_reason"], "insufficient_query_terms")
+        self.assertEqual(len(traces[0]["query_sha256"]), 64)
+        self.assertNotIn("指标", traces[0]["candidate_summary_json"])
+        self.assertEqual(traces[1]["backend"], "fts5-bm25-v1")
+        self.assertGreater(traces[1]["candidate_count"], 0)
+        self.assertGreater(traces[1]["selected_count"], 0)
 
         events = self.chat({"thread_id": "", "content": "请根据知识库说明北极星指标"})
         answer = "".join(event["data"].get("content", "") for event in events)
@@ -1657,7 +1854,13 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(context["knowledge_refs"][0]["filename"], "product.md")
         self.assertEqual(context["knowledge_route"], "retrieved")
         self.assertEqual(context["knowledge_match_count"], 1)
-        self.assertEqual(context["retrieval_policy"]["version"], "lexical-retrieval-v1")
+        self.assertEqual(context["retrieval_policy"]["version"], "hybrid-rrf-v1")
+        candidate_trace = context["retrieval_trace"]["candidate_retrieval"]
+        self.assertEqual(candidate_trace["policy_version"], "hybrid-rrf-v1")
+        self.assertEqual(candidate_trace["backend"], "fts5-bm25-v1")
+        self.assertGreater(candidate_trace["candidate_count"], 0)
+        self.assertTrue(candidate_trace["candidates"][0]["selected"])
+        self.assertNotIn("content", candidate_trace["candidates"][0])
         self.assertIn("knowledge_retrieved", [event["type"] for event in self.request_json(f"/api/runs/{run['id']}", token=self.token)["events"]])
         thread_context = self.request_json(f"/api/threads/{thread_id}/context", token=self.token)
         self.assertEqual(thread_context["sources"][0]["filename"], "product.md")
@@ -1695,7 +1898,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         metrics = self.request_json("/api/metrics", token=self.token)
         self.assertEqual(metrics["feedback"]["document_citation_accuracy"], 0.0)
         self.assertFalse(metrics["feedback"]["sufficient_for_retrieval_claim"])
-        self.assertEqual(metrics["retrieval_policy"]["version"], "lexical-retrieval-v1")
+        self.assertEqual(metrics["retrieval_policy"]["version"], "hybrid-rrf-v1")
         diagnostics = self.request_json("/api/retrieval-diagnostics", token=self.token)
         self.assertEqual(diagnostics["sample"]["state"], "insufficient")
         self.assertEqual(diagnostics["sample"]["document_feedback_count"], 1)
@@ -1705,7 +1908,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(diagnostics["documents"][0]["reference"]["run_id"], run["id"])
         self.assertEqual(diagnostics["documents"][0]["reference"]["position"], citation_item["position"])
         self.assertIn("coverage", diagnostics["documents"][0]["reference"]["score_breakdown"])
-        self.assertEqual(diagnostics["policy_feedback"][0]["retrieval_policy_version"], "lexical-retrieval-v1")
+        self.assertEqual(diagnostics["policy_feedback"][0]["retrieval_policy_version"], "hybrid-rrf-v1")
         self.assertEqual(diagnostics["policy_feedback"][0]["state"], "observing")
 
         generic_events = self.chat({"thread_id": thread_id, "content": "请分析一下这个平台的界面布局"})
@@ -1718,6 +1921,44 @@ class AgentPlatformApiTests(unittest.TestCase):
 
         self.request_json(f"/api/knowledge/{document_id}", token=self.token, method="DELETE")
         self.assertEqual(self.request_json(f"/api/knowledge/search?query={quote('北极星指标')}", token=self.token)["results"], [])
+        with app.db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM knowledge_chunks_fts WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()[0], 0)
+
+    def test_knowledge_processing_failure_and_idempotent_replay_are_observable(self):
+        source = "# 幂等资料\n\n同一个上传请求只创建一份资料。"
+        payload = {
+            "filename": "idempotent.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(source.encode("utf-8")).decode("ascii"),
+            "idempotency_key": "fixed-upload-request-123",
+        }
+        first = self.request_json("/api/knowledge", payload, self.token)
+        replay = self.request_json("/api/knowledge", payload, self.token)
+        self.assertEqual(replay["document"]["id"], first["document"]["id"])
+        self.assertTrue(replay["idempotent_replay"])
+        with app.db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM knowledge_ingestion_runs WHERE idempotency_key = 'fixed-upload-request-123'"
+            ).fetchone()[0], 1)
+
+        invalid = dict(payload)
+        invalid.update({
+            "filename": "broken.pdf",
+            "mime_type": "application/pdf",
+            "content_base64": base64.b64encode(b"not a pdf").decode("ascii"),
+            "idempotency_key": "failed-upload-request-123",
+        })
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request_json("/api/knowledge", invalid, self.token)
+        self.assertEqual(error.exception.code, 400)
+        recent = self.request_json("/api/knowledge", token=self.token)["processing_runs"]
+        failed = next(item for item in recent if item["filename"] == "broken.pdf")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["current_stage"], "validating")
+        self.assertEqual(failed["error_code"], "valueerror")
 
     def test_knowledge_file_can_be_previewed_downloaded_and_is_owner_isolated(self):
         original_knowledge_dir = app.KNOWLEDGE_DIR
@@ -1768,6 +2009,20 @@ class AgentPlatformApiTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(denied, timeout=3)
             self.assertEqual(error.exception.code, 404)
+            denied_structure = urllib.request.Request(
+                f"{self.base_url}/api/knowledge/{document_id}/structure",
+                headers={"Authorization": f"Bearer {other['token']}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(denied_structure, timeout=3)
+            self.assertEqual(error.exception.code, 404)
+            denied_chunks = urllib.request.Request(
+                f"{self.base_url}/api/knowledge/{document_id}/chunks",
+                headers={"Authorization": f"Bearer {other['token']}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(denied_chunks, timeout=3)
+            self.assertEqual(error.exception.code, 404)
         finally:
             app.HTML_ARTIFACT_PREVIEW_ENABLED = original_preview_flag
             app.KNOWLEDGE_DIR = original_knowledge_dir
@@ -1806,14 +2061,242 @@ class AgentPlatformApiTests(unittest.TestCase):
         with app.db() as conn:
             conn.execute("""INSERT INTO retrieval_policies
                 (version, config_json, status, parent_version, changed_variable, created_at)
-                VALUES ('candidate-bad-neighbors', ?, 'candidate', 'lexical-retrieval-v1', 'neighbor_radius', ?)""", (json.dumps({"limit": 4, "max_excerpt_chars": 900, "max_total_chars": 2800, "neighbor_radius": 0}), app.now()))
+                VALUES ('candidate-bad-neighbors', ?, 'candidate', 'hybrid-rrf-v1', 'neighbor_radius', ?)""", (json.dumps({"limit": 4, "max_excerpt_chars": 900, "max_total_chars": 2800, "neighbor_radius": 0}), app.now()))
         blocked = self.request_json("/api/retrieval-policies/candidate-bad-neighbors/evaluate", {}, self.token)
         self.assertEqual(blocked["status"], "blocked")
         self.assertEqual(blocked["experiment"]["decision"], "rollback")
         published = self.request_json(f"/api/retrieval-policies/{candidate['version']}/publish", {}, self.token)
         self.assertEqual(published["active"]["version"], candidate["version"])
         rolled_back = self.request_json("/api/retrieval-policies/rollback", {}, self.token)
-        self.assertEqual(rolled_back["active"]["version"], "lexical-retrieval-v1")
+        self.assertEqual(rolled_back["active"]["version"], "hybrid-rrf-v1")
+
+    def test_p51_7_presets_roles_custom_candidate_and_retrieval_lab(self):
+        invitation = app.create_trial_invitation("knowledge-admin@example.com", 600)
+        member = self.request_json("/api/trial-invitations/accept", {
+            "token": invitation,
+            "email": "knowledge-admin@example.com",
+            "name": "知识管理员",
+            "password": "a-strong-password",
+        })
+        ordinary = self.request_json("/api/knowledge-presets", token=member["token"])
+        self.assertEqual(len(ordinary["presets"]), 3)
+        self.assertFalse(ordinary["manageable"])
+        self.assertNotIn("revision", ordinary["presets"][0])
+        request = urllib.request.Request(
+            f"{self.base_url}/api/knowledge-presets/standard",
+            data=json.dumps({
+                "parser_profile": "structure_preserving",
+                "chunk_config": {
+                    "target_tokens": 700, "max_tokens": 1000, "overlap_tokens": 100,
+                },
+            }).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {member['token']}",
+            },
+            method="PATCH",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(error.exception.code, 403)
+        with app.db() as conn:
+            conn.execute(
+                "UPDATE users SET is_knowledge_admin = 1 WHERE id = ?",
+                (member["user"]["id"],),
+            )
+        updated = self.request_json(
+            "/api/knowledge-presets/standard",
+            {
+                "parser_profile": "structure_preserving",
+                "chunk_config": {
+                    "target_tokens": 700, "max_tokens": 1000, "overlap_tokens": 100,
+                },
+            },
+            member["token"],
+            method="PATCH",
+        )
+        self.assertEqual(updated["preset"]["revision"], 2)
+
+        active = self.request_json("/api/retrieval-policies", token=self.token)["active"]
+        candidate_config = dict(active["config"])
+        candidate_config["candidate_limit"] = 72
+        candidate = self.request_json(
+            "/api/retrieval-policies/candidates",
+            {"config": candidate_config},
+            self.token,
+        )["policy"]
+        self.assertEqual(candidate["status"], "candidate")
+        publish = urllib.request.Request(
+            f"{self.base_url}/api/retrieval-policies/{candidate['version']}/publish",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+            },
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(publish, timeout=3)
+        self.assertEqual(error.exception.code, 409)
+
+        self.request_json("/api/knowledge", {
+            "filename": "retrieval-lab.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(
+                "# 发布流程\nAtlas 发布审批由产品负责人签字。\n\n签字后进入部署窗口。".encode()
+            ).decode(),
+        }, self.token)
+        lab = self.request_json("/api/retrieval-lab/compare", {
+            "query": "Atlas 发布审批负责人",
+            "left_version": active["version"],
+            "right_version": candidate["version"],
+        }, self.token)
+        self.assertEqual(lab["left"]["version"], active["version"])
+        self.assertEqual(lab["right"]["version"], candidate["version"])
+        self.assertIn("rewrite", lab["left"]["stages"])
+        self.assertIn("lexical_candidates", lab["left"]["stages"])
+        self.assertIn("vector_candidates", lab["left"]["stages"])
+        self.assertIn("fusion", lab["left"]["stages"])
+        self.assertIn("rerank", lab["left"]["stages"])
+        self.assertIn("final_context", lab["left"]["stages"])
+        with app.db() as conn:
+            stored = conn.execute(
+                "SELECT query_sha256, summary_json FROM retrieval_lab_experiments WHERE id = ?",
+                (lab["experiment_id"],),
+            ).fetchone()
+        self.assertEqual(stored["query_sha256"], app.query_sha256("Atlas 发布审批负责人"))
+        self.assertNotIn("Atlas", stored["summary_json"])
+
+    def test_p51_8_history_migration_shadow_canary_and_rollback(self):
+        uploaded = self.request_json("/api/knowledge", {
+            "filename": "legacy-release.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(
+                "# Atlas 发布\nAtlas 发布审批由产品负责人签字。\n\n签字后进入部署窗口。".encode()
+            ).decode(),
+        }, self.token)["document"]
+        document_id = uploaded["id"]
+        with app.db() as conn:
+            conn.execute(
+                """UPDATE knowledge_documents
+                   SET filename = 'legacy-release', document_ir_version = 0, parser_version = '',
+                       parsed_block_count = 0, chunk_policy_version = 'fixed-char-v1'
+                   WHERE id = ?""",
+                (document_id,),
+            )
+            conn.execute(
+                "UPDATE knowledge_chunks SET policy_version = 'fixed-char-v1' WHERE document_id = ?",
+                (document_id,),
+            )
+            conn.execute(
+                """UPDATE knowledge_chunk_versions SET policy_version = 'fixed-char-v1'
+                   WHERE document_id = ? AND version = 1""",
+                (document_id,),
+            )
+            conn.execute("DELETE FROM knowledge_document_blocks WHERE document_id = ?", (document_id,))
+        before = self.request_json("/api/knowledge-migrations", token=self.token)
+        self.assertEqual(before["eligible_count"], 1)
+        batch = self.request_json("/api/knowledge-migrations/batches", {
+            "preset": "standard", "limit": 10,
+        }, self.token)["batch"]
+        unverified = urllib.request.Request(
+            f"{self.base_url}/api/knowledge-migrations/{batch['id']}/promote",
+            data=json.dumps({"percentage": 25}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+            },
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(unverified, timeout=3)
+        self.assertEqual(error.exception.code, 409)
+        staged = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/run", {}, self.token
+        )
+        self.assertEqual(staged["status"], "staged")
+        self.assertTrue(staged["active_versions_unchanged"])
+        with app.db() as conn:
+            document = conn.execute(
+                "SELECT active_chunk_version, document_ir_version FROM knowledge_documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            item = conn.execute(
+                "SELECT * FROM knowledge_migration_items WHERE batch_id = ?",
+                (batch["id"],),
+            ).fetchone()
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM knowledge_chunks WHERE document_id = ? AND active = 1",
+                (document_id,),
+            ).fetchone()[0]
+        self.assertEqual(document["active_chunk_version"], 1)
+        self.assertEqual(document["document_ir_version"], 1)
+        self.assertGreater(item["target_chunk_version"], 1)
+        self.assertEqual(active_count, item["source_chunk_count"])
+
+        invitation = app.create_trial_invitation("migration-member@example.com", 600)
+        member = self.request_json("/api/trial-invitations/accept", {
+            "token": invitation,
+            "email": "migration-member@example.com",
+            "name": "迁移隔离用户",
+            "password": "a-strong-password",
+        })
+        self.request_json(
+            "/api/knowledge/search?query=Atlas", token=member["token"]
+        )
+        with app.db() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM knowledge_migration_shadow_diffs WHERE batch_id = ?",
+                    (batch["id"],),
+                ).fetchone()[0],
+                0,
+            )
+        evaluation = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/evaluate", {}, self.token
+        )
+        self.assertEqual(evaluation["status"], "verified")
+        self.assertTrue(all(evaluation["evaluation"]["gates"].values()))
+        canary = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/promote",
+            {"percentage": 25}, self.token,
+        )
+        self.assertEqual(canary["status"], "canary")
+        with app.db() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT active_chunk_version FROM knowledge_documents WHERE id = ?",
+                    (document_id,),
+                ).fetchone()[0],
+                item["target_chunk_version"],
+            )
+        rolled_back = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/rollback", {}, self.token
+        )
+        self.assertEqual(rolled_back["status"], "rolled_back")
+        with app.db() as conn:
+            restored = conn.execute(
+                "SELECT active_chunk_version FROM knowledge_documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()[0]
+            shadow = conn.execute(
+                """SELECT query_sha256, baseline_documents_json,
+                          candidate_documents_json
+                   FROM knowledge_migration_shadow_diffs WHERE batch_id = ?""",
+                (batch["id"],),
+            ).fetchall()
+        self.assertEqual(restored, 1)
+        self.assertTrue(shadow)
+        self.assertTrue(all(len(row["query_sha256"]) == 64 for row in shadow))
+        self.assertNotIn("Atlas", json.dumps([dict(row) for row in shadow], ensure_ascii=False))
+        active = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/promote",
+            {"percentage": 100}, self.token,
+        )
+        self.assertEqual(active["status"], "active")
+        after = self.request_json("/api/knowledge-migrations", token=self.token)
+        self.assertEqual(after["document_count"], before["document_count"])
+        self.assertEqual(after["acl_sha256"], before["acl_sha256"])
 
     def test_xlsx_knowledge_extraction_preserves_sheet_and_cell_text(self):
         workbook = io.BytesIO()

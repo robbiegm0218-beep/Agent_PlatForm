@@ -4,7 +4,7 @@ window.AgentState = {
   threads: [], folders: [], collapsedFolderIds: new Set(), spacesCollapsed: false, tasksCollapsed: false,
   demoMembersBySpace: {}, currentThreadId: "", pendingFolderId: "", messages: [], runs: [],
   threadContext: { sources: [], outputs: [] }, skills: [], models: [], artifacts: [], tools: [],
-  knowledgeDocuments: [], memories: [], selectedSkillIds: [], activeView: "chat", streaming: false,
+  knowledgeDocuments: [], knowledgeProcessingRuns: [], memories: [], selectedSkillIds: [], activeView: "chat", streaming: false,
   currentThreadEditable: true, spaceComposerFolder: null, knowledgeUploadSpaceId: "", currentSpaceId: "",
   selectedArtifactId: "", artifactPreviewOpen: false, artifactPreviewRevision: 0,
 };

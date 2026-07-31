@@ -108,6 +108,11 @@
 .governance-item strong { color: var(--text); font-size: 12px; }
 .governance-item small { color: var(--muted); font-size: 11px; }
 .retrieval-governance button { justify-self: start; }
+.retrieval-lab { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.retrieval-lab > input, .retrieval-lab > select { width: 100%; min-width: 0; }
+.retrieval-lab-output { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.retrieval-lab-output p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .retrieval-lab-output { grid-template-columns: 1fr; } }
 .tool-form { display: grid; gap: 8px; margin-top: 12px; }
 .tool-form label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .tool-result { max-height: 180px; overflow: auto; margin: 0; padding: 8px; border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 12px; white-space: pre-wrap; }

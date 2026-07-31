@@ -12,7 +12,7 @@ from pathlib import Path
 
 COUNTED_TABLES = (
     "users", "threads", "messages", "runs", "knowledge_documents",
-    "knowledge_chunks", "artifacts", "memories", "run_feedback",
+    "knowledge_chunks", "knowledge_ingestion_runs", "knowledge_pipeline_events", "artifacts", "memories", "run_feedback",
     "citation_feedback_items",
 )
 
