@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent_Platform</title>
-    <link rel="stylesheet" href="/static/styles.css?v=p50-5-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=p52-8-1" />
   </head>
   <body class="booting">
     <main id="app">
@@ -129,6 +129,23 @@
                         <option value="auto">按需查找</option>
                         <option value="off">不查文件</option>
                         <option value="required">优先查找</option>
+                      </select>
+                    </label>
+                    <div id="knowledgeDefaultsHint" class="knowledge-defaults-hint">配置中心默认：均衡 · 自动范围</div>
+                    <label>本次检索预设
+                      <select id="retrievalProfileSelect" aria-label="选择本次检索预设">
+                        <option value="default">使用配置中心默认</option>
+                        <option value="precise">精准</option>
+                        <option value="balanced">均衡</option>
+                        <option value="high_recall">高召回</option>
+                      </select>
+                    </label>
+                    <label>本次资料范围
+                      <select id="knowledgeScopeOverrideSelect" aria-label="选择本次资料范围">
+                        <option value="default">使用配置中心默认</option>
+                        <option value="auto">自动</option>
+                        <option value="general">仅通用库</option>
+                        <option value="current_project">当前项目</option>
                       </select>
                     </label>
                     <input id="knowledgeModeSelect" type="hidden" value="auto" />
@@ -302,7 +319,13 @@
               <h2>知识库</h2>
               <span>本地资料仅在检索命中后用于对话；图片会在本机进行 OCR，不会上传到外部服务</span>
             </div>
-            <button id="uploadKnowledgeButton" class="icon-text-button" type="button">上传资料</button>
+            <div class="knowledge-header-actions">
+              <button id="knowledgeConfigurationButton" class="knowledge-configuration-entry" type="button" aria-label="打开知识库配置中心">
+                <span class="knowledge-configuration-entry-icon" aria-hidden="true"></span>
+                <span><strong>知识库设置</strong><small>检索、切分与索引</small></span>
+              </button>
+              <button id="uploadKnowledgeButton" class="icon-text-button" type="button">上传资料</button>
+            </div>
             <input id="knowledgeFileInput" type="file" accept=".md,.txt,.docx,.pdf,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/png,image/jpeg,image/webp,image/tiff" class="hidden" />
           </header>
           <div class="knowledge-toolbar">
@@ -320,6 +343,30 @@
           </section>
           <div id="knowledgeResults" class="knowledge-results hidden"></div>
           <div id="knowledgeList" class="card-grid"></div>
+        </section>
+
+        <section id="knowledgeConfigurationPage" class="page knowledge-configuration-page hidden">
+          <header class="page-header knowledge-configuration-header">
+            <div class="knowledge-configuration-title">
+              <button id="backToKnowledgeButton" class="configuration-back-button" type="button" aria-label="返回知识库"><span aria-hidden="true">‹</span> 知识库</button>
+              <div>
+                <span class="configuration-eyebrow">知识库设置</span>
+                <h2>配置中心</h2>
+                <p>管理个人检索、文档处理、检索策略与索引迁移</p>
+              </div>
+            </div>
+            <span id="knowledgeConfigurationRole" class="status-pill">正在确认权限</span>
+          </header>
+          <div class="knowledge-configuration-shell">
+            <nav id="knowledgeConfigurationTabs" class="knowledge-configuration-tabs" aria-label="知识库配置分类" role="tablist"></nav>
+            <div id="knowledgeConfigurationNotice" class="knowledge-configuration-notice" aria-live="polite"></div>
+            <main id="knowledgeConfigurationContent" class="knowledge-configuration-content" tabindex="-1">
+              <div class="configuration-state configuration-loading" role="status">
+                <strong>正在加载知识库配置</strong>
+                <span>正在合并个人偏好、处理预设和索引状态…</span>
+              </div>
+            </main>
+          </div>
         </section>
 
         <section id="artifactsPage" class="page hidden">
@@ -356,10 +403,24 @@
           <div id="memoryNotice" class="notice memory-notice"></div>
           <div id="memoryList" class="card-grid"></div>
         </section>
+        <dialog id="knowledgeUploadDialog" class="knowledge-upload-dialog">
+          <form method="dialog">
+            <div><h3>上传资料</h3><p id="knowledgeUploadFilename"></p></div>
+            <label>本次切分预设
+              <select id="knowledgeUploadPresetSelect">
+                <option value="standard">标准</option>
+                <option value="long_document">长文档</option>
+                <option value="table_dense">表格密集</option>
+              </select>
+              <small>本次选择不会修改配置中心默认值。</small>
+            </label>
+            <div class="dialog-actions"><button id="cancelKnowledgeUpload" type="button" class="secondary">取消</button><button id="confirmKnowledgeUpload" type="button">开始上传</button></div>
+          </form>
+        </dialog>
       </section>
     </main>
     <script src="/static/core/storage.js?v=p48-4-3"></script>
-    <script src="/static/core/state.js?v=p48-4-3"></script>
+    <script src="/static/core/state.js?v=p52-7-1"></script>
     <script src="/static/core/dom.js?v=p48-4-3"></script>
     <script src="/static/core/api.js?v=p48-4-3"></script>
     <script src="/static/knowledge/library.js?v=p48-4-3"></script>
@@ -367,14 +428,15 @@
     <script src="/static/views/resources.js?v=p48-4-3"></script>
     <script src="/static/views/capabilities.js?v=p48-4-3"></script>
     <script src="/static/views/settings.js?v=p48-4-3"></script>
-    <script src="/static/views/audit.js?v=p50-3-1"></script>
+    <script src="/static/views/knowledge-configuration.js?v=p52-8-1"></script>
+    <script src="/static/views/audit.js?v=p52-7-1"></script>
     <script src="/static/chat/composer.js?v=p50-4-1"></script>
-    <script src="/static/chat/stream.js?v=p48-4-3"></script>
-    <script src="/static/chat/execution-mode.js?v=p50-3-1"></script>
+    <script src="/static/chat/stream.js?v=p52-3-1"></script>
+    <script src="/static/chat/execution-mode.js?v=p52-3-1"></script>
     <script src="/static/chat/markdown.js?v=p48-4-3"></script>
     <script src="/static/chat/interactions.js?v=p48-4-3"></script>
     <script src="/static/chat/run-trace.js?v=p48-4-3"></script>
     <script src="/static/chat/artifact-preview.js?v=p50-4-3"></script>
-    <script src="/static/app.js?v=p50-5-1"></script>
+    <script src="/static/app.js?v=p52-8-2"></script>
   </body>
 </html>

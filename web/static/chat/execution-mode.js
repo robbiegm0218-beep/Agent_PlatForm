@@ -55,6 +55,8 @@ window.AgentExecutionMode = function createExecutionMode({ state, els, api, getC
             knowledge_mode: els.knowledgeModeSelect.value,
             web_mode: els.webModeSelect.value,
             file_mode: els.fileModeSelect.value,
+            retrieval_profile: els.retrievalProfileSelect?.value || "default",
+            knowledge_scope: els.knowledgeScopeOverrideSelect?.value || "default",
             skill_ids: state.selectedSkillIds.length ? state.selectedSkillIds : undefined,
           }),
         });

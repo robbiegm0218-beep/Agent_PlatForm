@@ -40,6 +40,58 @@ class KnowledgeService:
                   ))
                 )""", (document_id, user_id, user_id)).fetchone()
 
+    def resolve_visible_reference_chunk(
+        self,
+        document_id: str,
+        user_id: str,
+        position: int,
+        reference_excerpt: str = "",
+        chunk_version: int = 0,
+    ):
+        """Resolve the exact cited chunk without leaking across the document ACL.
+
+        New Runs persist ``chunk_version`` and ``primary_excerpt``. For older
+        Runs, the stored neighbor-expanded excerpt starts with the primary
+        chunk, so prefix matching selects the historical version that produced
+        the citation. Active content is only the final fallback.
+        """
+        with self.db_factory() as conn:
+            rows = conn.execute(
+                """SELECT knowledge_chunks.id, knowledge_chunks.document_id,
+                          knowledge_chunks.position, knowledge_chunks.content,
+                          knowledge_chunks.chunk_version, knowledge_chunks.active
+                   FROM knowledge_chunks
+                   JOIN knowledge_documents
+                     ON knowledge_documents.id = knowledge_chunks.document_id
+                   WHERE knowledge_chunks.document_id = ?
+                     AND knowledge_chunks.position = ?
+                     AND ((knowledge_documents.scope = 'general' AND knowledge_documents.user_id = ?)
+                       OR (knowledge_documents.scope = 'project' AND EXISTS (
+                         SELECT 1 FROM space_members
+                         WHERE space_members.space_id = knowledge_documents.project_space_id
+                           AND space_members.user_id = ?
+                       )))
+                   ORDER BY knowledge_chunks.active DESC,
+                            knowledge_chunks.chunk_version DESC""",
+                (document_id, max(0, int(position)), user_id, user_id),
+            ).fetchall()
+        if not rows:
+            return None
+        if chunk_version > 0:
+            exact = next((row for row in rows if int(row["chunk_version"]) == chunk_version), None)
+            if exact:
+                return exact
+        reference = str(reference_excerpt or "").strip()
+        if reference:
+            matched = [
+                row for row in rows
+                if reference.startswith(str(row["content"] or "").strip())
+                or str(row["content"] or "").strip().startswith(reference)
+            ]
+            if matched:
+                return max(matched, key=lambda row: len(str(row["content"] or "")))
+        return rows[0]
+
     def list_for_space(self, space_id: str):
         with self.db_factory() as conn:
             return conn.execute("""SELECT knowledge_documents.id, knowledge_documents.filename, knowledge_documents.mime_type,
@@ -491,6 +543,109 @@ class KnowledgeService:
             self._refresh_fts_document(conn, document_id)
         return version
 
+    def activate_reprocessed_document(
+        self,
+        document_id: str,
+        actor_id: str,
+        chunks,
+        blocks,
+        *,
+        ingestion_run_id: str,
+        document_ir_version: int,
+        parser_version: str,
+        normalized_sha256: str,
+        created_at: int,
+    ) -> int:
+        """Atomically replace parsed structure and activate a complete chunk version."""
+        document = self.get_manageable(document_id, actor_id)
+        if not document:
+            raise ValueError("知识库文件不存在或无管理权限")
+        if not chunks:
+            raise ValueError("重新处理未生成可检索片段")
+        with self.db_factory() as conn:
+            current_version = int(document["active_chunk_version"])
+            version = int(conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM knowledge_chunk_versions WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()[0])
+            rows = [
+                dict(
+                    chunk,
+                    id=f"{chunk['id']}_v{version}",
+                    chunk_version=version,
+                    active=0,
+                    created_at=created_at,
+                )
+                for chunk in chunks
+            ]
+            self._insert_chunks(conn, rows)
+            policy_version = rows[0]["policy_version"]
+            preset = rows[0]["preset"]
+            conn.execute(
+                """INSERT INTO knowledge_chunk_versions
+                   (id, document_id, version, policy_version, preset, status, chunk_count,
+                    created_by_user_id, supersedes_version, created_at, activated_at)
+                   VALUES (?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, 0)""",
+                (
+                    f"chunk_version_{document_id}_{version}", document_id, version,
+                    policy_version, preset, len(rows), actor_id, current_version, created_at,
+                ),
+            )
+            conn.execute("DELETE FROM knowledge_document_blocks WHERE document_id = ?", (document_id,))
+            conn.executemany(
+                """INSERT INTO knowledge_document_blocks
+                   (id, document_id, ingestion_run_id, ordinal, block_type, text,
+                    section_path_json, source_location_json, metadata_json, char_count,
+                    content_sha256, parser_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        block["block_id"], block["document_id"], block["ingestion_run_id"],
+                        block["ordinal"], block["block_type"], block["text"],
+                        block["section_path_json"], block["source_location_json"],
+                        block["metadata_json"], block["char_count"], block["content_sha256"],
+                        block["parser_version"], block["created_at"],
+                    )
+                    for block in blocks
+                ],
+            )
+            conn.execute("UPDATE knowledge_chunks SET active = 0 WHERE document_id = ?", (document_id,))
+            conn.execute(
+                "UPDATE knowledge_chunks SET active = 1 WHERE document_id = ? AND chunk_version = ?",
+                (document_id, version),
+            )
+            conn.execute(
+                "UPDATE knowledge_chunk_versions SET status = 'archived' WHERE document_id = ? AND status = 'active'",
+                (document_id,),
+            )
+            conn.execute(
+                "UPDATE knowledge_chunk_versions SET status = 'active', activated_at = ? WHERE document_id = ? AND version = ?",
+                (created_at, document_id, version),
+            )
+            conn.execute(
+                """UPDATE knowledge_documents
+                   SET active_chunk_version = ?, chunk_policy_version = ?, chunk_preset = ?,
+                       chunk_count = ?, document_ir_version = ?, parser_version = ?,
+                       parsed_block_count = ?, normalized_text_sha256 = ?,
+                       active_ingestion_run_id = ?, processing_status = 'ready', updated_at = ?
+                   WHERE id = ?""",
+                (
+                    version, policy_version, preset, len(rows), document_ir_version,
+                    parser_version, len(blocks), normalized_sha256, ingestion_run_id,
+                    created_at, document_id,
+                ),
+            )
+            self._refresh_fts_document(conn, document_id)
+        return version
+
+    def reindex_document(self, document_id: str, actor_id: str) -> int:
+        document = self.get_manageable(document_id, actor_id)
+        if not document:
+            raise ValueError("知识库文件不存在或无管理权限")
+        with self.db_factory() as conn:
+            self._refresh_fts_document(conn, document_id)
+        return int(document["active_chunk_version"])
+
     def stage_migration_version(
         self,
         document_id: str,
@@ -779,6 +934,18 @@ class KnowledgeService:
                         "DELETE FROM knowledge_migration_batches WHERE id = ?",
                         (batch_id,),
                     )
+            reprocessing_batch_ids = [
+                str(item[0]) for item in conn.execute(
+                    "SELECT batch_id FROM knowledge_reprocessing_items WHERE document_id = ?",
+                    (document_id,),
+                ).fetchall()
+            ]
+            conn.execute("DELETE FROM knowledge_reprocessing_items WHERE document_id = ?", (document_id,))
+            for batch_id in reprocessing_batch_ids:
+                if not conn.execute(
+                    "SELECT 1 FROM knowledge_reprocessing_items WHERE batch_id = ? LIMIT 1", (batch_id,)
+                ).fetchone():
+                    conn.execute("DELETE FROM knowledge_reprocessing_batches WHERE id = ?", (batch_id,))
             conn.execute("DELETE FROM knowledge_pipeline_events WHERE ingestion_run_id IN (SELECT id FROM knowledge_ingestion_runs WHERE document_id = ?)", (document_id,))
             conn.execute("DELETE FROM knowledge_ingestion_runs WHERE document_id = ?", (document_id,))
             conn.execute("DELETE FROM knowledge_documents WHERE id = ?", (document_id,))
@@ -795,6 +962,17 @@ class KnowledgeService:
             ]
             if document_ids:
                 marks = ",".join("?" for _ in document_ids)
+                conn.execute(
+                    f"DELETE FROM knowledge_reprocessing_items WHERE document_id IN ({marks})",
+                    document_ids,
+                )
+                conn.execute(
+                    """DELETE FROM knowledge_reprocessing_batches
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM knowledge_reprocessing_items
+                         WHERE knowledge_reprocessing_items.batch_id = knowledge_reprocessing_batches.id
+                       )"""
+                )
                 conn.execute(
                     f"DELETE FROM knowledge_migration_items WHERE document_id IN ({marks})",
                     document_ids,

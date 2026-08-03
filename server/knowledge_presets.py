@@ -75,11 +75,13 @@ class KnowledgePresetService:
         timestamp = self.now()
         with self.db_factory() as conn:
             current = conn.execute(
-                "SELECT revision FROM knowledge_processing_presets WHERE id = ?",
+                "SELECT revision, parser_profile, chunk_config_json FROM knowledge_processing_presets WHERE id = ?",
                 (preset_id,),
             ).fetchone()
             if not current:
                 raise ValueError("知识处理预设不存在")
+            if str(current["parser_profile"]) == parser_profile and json.loads(current["chunk_config_json"]) == config:
+                raise ValueError("处理预设没有发生变化")
             revision = int(current[0]) + 1
             conn.execute(
                 """UPDATE knowledge_processing_presets
@@ -92,5 +94,30 @@ class KnowledgePresetService:
                     revision, actor_user_id, timestamp, preset_id,
                 ),
             )
+            conn.execute(
+                """INSERT INTO knowledge_processing_preset_revisions
+                   (preset_id, revision, parser_profile, chunk_config_json,
+                    created_by_user_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (preset_id, revision, parser_profile, json.dumps(config, ensure_ascii=False, sort_keys=True), actor_user_id, timestamp),
+            )
         _, item = self.policy(preset_id)
         return item
+
+    def revisions(self, preset_id: str, limit: int = 20) -> list[dict]:
+        if preset_id not in PRESET_IDS:
+            raise ValueError("切分预设无效")
+        with self.db_factory() as conn:
+            rows = conn.execute(
+                """SELECT preset_id, revision, parser_profile, chunk_config_json,
+                          created_by_user_id, created_at
+                   FROM knowledge_processing_preset_revisions
+                   WHERE preset_id = ? ORDER BY revision DESC LIMIT ?""",
+                (preset_id, min(max(limit, 1), 50)),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["chunk_config"] = json.loads(item.pop("chunk_config_json"))
+            result.append(item)
+        return result

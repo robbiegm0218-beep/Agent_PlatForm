@@ -14,6 +14,7 @@ const spaceWorkspace = window.AgentSpaceWorkspace;
 const resourceViews = window.AgentResourceViews;
 const capabilityViews = window.AgentCapabilityViews;
 const settingsView = window.AgentSettingsView;
+const knowledgeConfigurationView = window.AgentKnowledgeConfigurationView;
 const auditView = window.AgentAuditView;
 const executionMode = window.AgentExecutionMode({ state, els, api: window.AgentApi, getChatContent });
 
@@ -96,7 +97,7 @@ function showWorkspace(reveal = true) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadMemories(), loadArtifacts()]);
+  await Promise.all([loadThreads(), loadFolders(), loadSkills(), loadApps(), loadModels(), loadKnowledge(), loadMemories(), loadArtifacts(), loadKnowledgeConfiguration({ render: false })]);
   renderThreads();
   renderMessages();
 }
@@ -106,12 +107,29 @@ function persistWorkspaceState() {
     view: state.activeView,
     threadId: state.currentThreadId,
     spaceId: state.activeView === "space" ? state.currentSpaceId : "",
+    knowledgeConfigurationTab: state.knowledgeConfigurationTab,
+    knowledgeReturnState: state.knowledgeReturnState,
   });
 }
 
 async function restoreWorkspaceState() {
   const saved = storage.loadWorkspace(UI_STATE_KEY);
   const view = VALID_VIEWS.has(saved.view) ? saved.view : "chat";
+  if (typeof saved.knowledgeConfigurationTab === "string") {
+    state.knowledgeConfigurationTab = saved.knowledgeConfigurationTab;
+  }
+  if (saved.knowledgeReturnState && typeof saved.knowledgeReturnState === "object") {
+    state.knowledgeReturnState = {
+      scrollTop: Math.max(0, Number(saved.knowledgeReturnState.scrollTop || 0)),
+      search: String(saved.knowledgeReturnState.search || ""),
+      scope: saved.knowledgeReturnState.scope === "project" ? "project" : "general",
+      projectId: String(saved.knowledgeReturnState.projectId || ""),
+    };
+    els.knowledgeSearch.value = state.knowledgeReturnState.search;
+    els.knowledgeScopeSelect.value = state.knowledgeReturnState.scope;
+    renderKnowledgeProjectOptions();
+    els.knowledgeProjectSelect.value = state.knowledgeReturnState.projectId;
+  }
   const thread = state.threads.find((item) => item.id === saved.threadId);
   if (thread) {
     await loadThread(thread.id);
@@ -321,7 +339,7 @@ function knowledgePreviewResource(document) {
     kind: document.file_kind || document.kind || "knowledge",
     previewable: document.previewable !== false,
     preview_url: `/api/knowledge/${id}/preview`,
-    highlight_excerpt: document.excerpt || "",
+    highlight_excerpt: document.highlight_excerpt || document.primary_excerpt || document.excerpt || "",
     highlight_position: Number(document.position || 0),
   };
 }
@@ -393,6 +411,13 @@ function renderKnowledge(documents) {
           onRechunk: async (preset) => {
             if (!window.confirm(`使用“${preset}”预设生成新切分版本并切换？`)) return;
             await api(`/api/knowledge/${document.id}/rechunk`, { method: "POST", body: JSON.stringify({ preset }) });
+            await loadKnowledge();
+            await showChunks();
+          },
+          onReprocess: async (mode, preset) => {
+            const label = mode === "reparse" ? "重新解析并切分" : "重建倒排索引";
+            if (!window.confirm(`${label}“${document.filename}”？处理成功前会继续使用当前活动版本。`)) return;
+            await api(`/api/knowledge/${document.id}/reprocess`, { method: "POST", body: JSON.stringify({ mode, preset }) });
             await loadKnowledge();
             await showChunks();
           },
@@ -935,7 +960,7 @@ function renderThreadContext() {
     return {
       icon: "◫",
       title: source.filename,
-      detail: `片段 ${source.position + 1}${source.excerpt ? ` · ${source.excerpt}` : ""}`,
+      detail: `片段 ${source.position + 1}${source.highlight_excerpt || source.excerpt ? ` · ${source.highlight_excerpt || source.excerpt}` : ""}`,
       onClick: () => openKnowledge(source),
       titleAttr: "预览本次回答调用的知识库文件",
     };
@@ -1067,11 +1092,7 @@ async function loadRetrievalDiagnostics() {
         }), button);
       },
       onCompare: (payload) => api("/api/retrieval-lab/compare", { method: "POST", body: JSON.stringify(payload) }),
-      onCreateMigration: (button) => reload(() => api("/api/knowledge-migrations/batches", { method: "POST", body: JSON.stringify({ preset: "standard", limit: 10 }) }), button),
-      onRunMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/run`, { method: "POST", body: "{}" }), button),
-      onEvaluateMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/evaluate`, { method: "POST", body: "{}" }), button),
-      onPromoteMigration: (id, percentage, button) => reload(() => api(`/api/knowledge-migrations/${id}/promote`, { method: "POST", body: JSON.stringify({ percentage }) }), button),
-      onRollbackMigration: (id, button) => reload(() => api(`/api/knowledge-migrations/${id}/rollback`, { method: "POST", body: "{}" }), button),
+      onOpenKnowledgeConfiguration: () => { state.knowledgeConfigurationTab = "index"; openKnowledgeConfiguration(); },
     };
   } catch (_error) {
     // Policy controls are deliberately hidden from non-administrators.
@@ -1352,6 +1373,366 @@ function renderApps(apps, tools = []) {
   });
 }
 
+function captureKnowledgeReturnState() {
+  state.knowledgeReturnState = {
+    scrollTop: els.knowledgePage.scrollTop,
+    search: els.knowledgeSearch.value,
+    scope: els.knowledgeScopeSelect.value,
+    projectId: els.knowledgeProjectSelect.value,
+  };
+}
+
+function renderKnowledgeConfiguration() {
+  if (!state.knowledgeConfiguration) return;
+  els.knowledgeConfigurationNotice.textContent = "";
+  els.knowledgeConfigurationNotice.classList.remove("is-error");
+  state.knowledgeConfigurationTab = knowledgeConfigurationView.render(
+    els,
+    state.knowledgeConfiguration,
+    state.knowledgeConfigurationTab,
+    escapeHtml,
+    {
+      processingRuns: state.knowledgeProcessingRuns,
+      onTab: (tab) => {
+        state.knowledgeConfigurationTab = tab;
+        persistWorkspaceState();
+        renderKnowledgeConfiguration();
+      },
+      onSavePreferences: saveKnowledgePreferences,
+      documents: state.knowledgeDocuments,
+      reprocessingBatches: state.knowledgeReprocessingBatches,
+      onSavePreset: saveKnowledgeProcessingPreset,
+      onCreateReprocessingBatch: createKnowledgeReprocessingBatch,
+      onRunReprocessingBatch: runKnowledgeReprocessingBatch,
+      onRetryReprocessingItem: retryKnowledgeReprocessingItem,
+      retrievalGovernance: state.knowledgeRetrievalGovernance,
+      spaces: state.folders,
+      onCompareRetrievalPolicies: compareKnowledgeRetrievalPolicies,
+      onCreateRetrievalCandidate: createKnowledgeRetrievalCandidate,
+      onEvaluateRetrievalPolicy: evaluateKnowledgeRetrievalPolicy,
+      onPublishRetrievalPolicy: publishKnowledgeRetrievalPolicy,
+      onRollbackRetrievalPolicy: rollbackKnowledgeRetrievalPolicy,
+      onCreateSuggestionCandidate: createKnowledgeSuggestionCandidate,
+      embeddingGovernance: state.knowledgeEmbeddingGovernance,
+      onRebuildEmbeddingIndex: rebuildKnowledgeEmbeddingIndex,
+      onRunEmbeddingIndex: runKnowledgeEmbeddingIndex,
+      onRollbackEmbeddingDocument: rollbackKnowledgeEmbeddingDocument,
+      migrationGovernance: state.knowledgeMigrationGovernance,
+      onCreateMigrationBatch: createKnowledgeMigrationBatch,
+      onRunMigrationBatch: (id) => operateKnowledgeMigration(id, "run", "迁移版本已暂存，生产版本未变化"),
+      onEvaluateMigrationBatch: (id) => operateKnowledgeMigration(id, "evaluate", "Shadow 门禁评测已完成"),
+      onPromoteMigrationBatch: promoteKnowledgeMigration,
+      onRollbackMigrationBatch: (id) => operateKnowledgeMigration(id, "rollback", "迁移批次已回滚到源版本", true),
+      onRetryMigrationItem: retryKnowledgeMigrationItem,
+    },
+  );
+}
+
+function renderKnowledgeDefaults() {
+  const preferences = state.knowledgeConfiguration?.user_preferences;
+  if (!preferences) return;
+  const profiles = { precise: "精准", balanced: "均衡", high_recall: "高召回" };
+  const scopes = { auto: "自动范围", general: "仅通用库", current_project: "当前项目" };
+  els.knowledgeDefaultsHint.textContent = `配置中心默认：${profiles[preferences.retrieval_profile] || "均衡"} · ${scopes[preferences.default_scope] || "自动范围"}`;
+  if (!state.pendingKnowledgeUploadFile) els.knowledgeUploadPresetSelect.value = preferences.default_upload_preset || "standard";
+}
+
+async function saveKnowledgePreferences(preferences) {
+  try {
+    const data = await api("/api/knowledge-configuration/preferences", { method: "PATCH", body: JSON.stringify(preferences) });
+    state.knowledgeConfiguration.user_preferences = data.preferences;
+    renderKnowledgeConfiguration();
+    renderKnowledgeDefaults();
+    knowledgeConfigurationView.showSaveSuccess(els, "默认值已保存，将用于后续对话与上传");
+  } catch (error) {
+    knowledgeConfigurationView.showSaveError(els, error.message);
+  }
+}
+
+async function saveKnowledgeProcessingPreset(presetId, payload) {
+  const current = state.knowledgeConfiguration?.processing?.presets?.find((item) => item.id === presetId);
+  if (!current) return;
+  const changes = [];
+  if (current.parser_profile !== payload.parser_profile) changes.push(`解析：${current.parser_profile} → ${payload.parser_profile}`);
+  Object.entries(payload.chunk_config).forEach(([key, value]) => {
+    if (Number(current.chunk_config?.[key]) !== Number(value)) changes.push(`${key}：${current.chunk_config?.[key]} → ${value}`);
+  });
+  if (!changes.length) {
+    knowledgeConfigurationView.showSaveError(els, "配置没有发生变化");
+    return;
+  }
+  if (!window.confirm(`将保存 ${current.label} 的新修订：\n\n${changes.join("\n")}\n\n只影响后续上传或显式重新处理，现有资料不会自动变化。继续吗？`)) return;
+  try {
+    const data = await api(`/api/knowledge-presets/${encodeURIComponent(presetId)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    const index = state.knowledgeConfiguration.processing.presets.findIndex((item) => item.id === presetId);
+    state.knowledgeConfiguration.processing.presets[index] = { ...data.preset, revisions: [
+      { revision: data.preset.revision, parser_profile: data.preset.parser_profile, chunk_config: data.preset.chunk_config },
+      ...(current.revisions || []),
+    ].slice(0, 5) };
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `${current.label} 已保存为 r${data.preset.revision}，现有活动版本保持不变`);
+  } catch (error) {
+    knowledgeConfigurationView.showSaveError(els, error.message);
+  }
+}
+
+async function refreshKnowledgeReprocessingBatches() {
+  if (!state.knowledgeConfiguration || state.knowledgeConfiguration.role === "user") {
+    state.knowledgeReprocessingBatches = [];
+    return;
+  }
+  const data = await api("/api/knowledge-reprocessing/batches");
+  state.knowledgeReprocessingBatches = data.batches || [];
+}
+
+async function createKnowledgeReprocessingBatch(payload) {
+  if (!payload.document_ids?.length) {
+    knowledgeConfigurationView.showSaveError(els, "请至少选择一个文件");
+    return;
+  }
+  if (!window.confirm(`将创建 ${payload.document_ids.length} 个文件的受限批任务。每次手动执行一项，失败不替换旧版本。继续吗？`)) return;
+  try {
+    await api("/api/knowledge-reprocessing/batches", { method: "POST", body: JSON.stringify(payload) });
+    await refreshKnowledgeReprocessingBatches();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, "批任务已创建，请按需执行下一项");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function runKnowledgeReprocessingBatch(batchId) {
+  try {
+    const data = await api(`/api/knowledge-reprocessing/${encodeURIComponent(batchId)}/run`, { method: "POST", body: "{}" });
+    await Promise.all([refreshKnowledgeReprocessingBatches(), loadKnowledge()]);
+    renderKnowledgeConfiguration();
+    const item = data.processed_item;
+    knowledgeConfigurationView.showSaveSuccess(els, item ? `${item.status === "succeeded" ? "处理完成" : "处理失败"}：${item.document_id}` : "批任务没有待处理项");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function retryKnowledgeReprocessingItem(batchId, itemId) {
+  try {
+    await api(`/api/knowledge-reprocessing/${encodeURIComponent(batchId)}/retry`, { method: "POST", body: JSON.stringify({ item_id: itemId }) });
+    await refreshKnowledgeReprocessingBatches();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, "失败项已重新排队");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function refreshKnowledgeRetrievalGovernance() {
+  if (!state.knowledgeConfiguration || state.knowledgeConfiguration.role !== "platform_admin") {
+    state.knowledgeRetrievalGovernance = {};
+    return;
+  }
+  state.knowledgeRetrievalGovernance = await api("/api/retrieval-policies");
+}
+
+async function refreshKnowledgeEmbeddingGovernance() {
+  if (!state.knowledgeConfiguration || state.knowledgeConfiguration.role !== "platform_admin") {
+    state.knowledgeEmbeddingGovernance = {};
+    return;
+  }
+  state.knowledgeEmbeddingGovernance = await api("/api/embedding-index");
+}
+
+async function refreshKnowledgeMigrationGovernance() {
+  if (!state.knowledgeConfiguration || state.knowledgeConfiguration.role !== "platform_admin") {
+    state.knowledgeMigrationGovernance = {};
+    return;
+  }
+  state.knowledgeMigrationGovernance = await api("/api/knowledge-migrations");
+}
+
+async function compareKnowledgeRetrievalPolicies(payload) {
+  try {
+    const result = await api("/api/retrieval-lab/compare", { method: "POST", body: JSON.stringify(payload) });
+    state.knowledgeRetrievalGovernance.lab_result = result;
+    await refreshKnowledgeRetrievalGovernance();
+    state.knowledgeRetrievalGovernance.lab_result = result;
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, "双策略实验完成；生产策略与生产检索状态未变化");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function createKnowledgeMigrationBatch(payload) {
+  const eligible = Number(state.knowledgeMigrationGovernance?.eligible_count || 0);
+  if (!window.confirm(`将按“${payload.preset}”预设迁移最多 ${payload.limit} 份历史资料（当前可迁移 ${eligible} 份）。\n\n先生成暂存版本，不替换生产版本。继续吗？`)) return;
+  try {
+    await api("/api/knowledge-migrations/batches", { method: "POST", body: JSON.stringify(payload) });
+    await refreshKnowledgeMigrationGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, "迁移批次已创建；请手动执行暂存");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function operateKnowledgeMigration(batchId, action, message, destructive = false) {
+  if (destructive && !window.confirm("确认回滚该迁移批次？已切换的资料将恢复到迁移前版本。")) return;
+  try {
+    await api(`/api/knowledge-migrations/${encodeURIComponent(batchId)}/${action}`, { method: "POST", body: "{}" });
+    await refreshKnowledgeMigrationGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, message);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function promoteKnowledgeMigration(batchId, percentage) {
+  if (!window.confirm(`确认将迁移批次发布到 ${percentage}%？\n\n只有通过全部门禁的暂存版本会被切换；仍可回滚。`)) return;
+  try {
+    await api(`/api/knowledge-migrations/${encodeURIComponent(batchId)}/promote`, { method: "POST", body: JSON.stringify({ percentage }) });
+    await refreshKnowledgeMigrationGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `迁移批次已发布到 ${percentage}%`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function retryKnowledgeMigrationItem(batchId, itemId) {
+  try {
+    await api(`/api/knowledge-migrations/${encodeURIComponent(batchId)}/retry`, { method: "POST", body: JSON.stringify({ item_id: itemId }) });
+    await refreshKnowledgeMigrationGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, "失败项已重新排队，请再次执行暂存");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function rebuildKnowledgeEmbeddingIndex() {
+  const count = Number(state.knowledgeEmbeddingGovernance?.inventory?.document_count || 0);
+  if (!window.confirm(`将为当前 ${count} 份知识库资料创建向量索引任务？\n\n任务在后台逐项执行；失败不会阻断 FTS5/BM25。`)) return;
+  try {
+    const data = await api("/api/embedding-index/rebuild", { method: "POST", body: JSON.stringify({ confirm_document_count: count }) });
+    await refreshKnowledgeEmbeddingGovernance();
+    state.knowledgeConfiguration.index.embedding = state.knowledgeEmbeddingGovernance.index;
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `已确认 ${data.document_count} 份资料，向量任务已入队`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function runKnowledgeEmbeddingIndex() {
+  try {
+    const data = await api("/api/embedding-index/run", { method: "POST", body: "{}" });
+    await refreshKnowledgeEmbeddingGovernance();
+    state.knowledgeConfiguration.index.embedding = state.knowledgeEmbeddingGovernance.index;
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, data.job ? `任务 ${data.job.job_id} 已处理：${data.job.status}` : "当前没有等待中的向量任务");
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function rollbackKnowledgeEmbeddingDocument(documentId, modelVersion) {
+  if (!documentId || !modelVersion) return;
+  const target = (state.knowledgeEmbeddingGovernance?.rollback_targets || []).find((item) => item.document_id === documentId);
+  if (!window.confirm(`将“${target?.filename || documentId}”的活动向量版本切换到：\n${modelVersion}\n\n文件、切分版本和 FTS5/BM25 不会变化。`)) return;
+  try {
+    await api(`/api/knowledge/${encodeURIComponent(documentId)}/embedding-rollback`, { method: "POST", body: JSON.stringify({ model_version: modelVersion }) });
+    await refreshKnowledgeEmbeddingGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `${target?.filename || documentId} 已回滚到所选向量版本`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+function retrievalCandidateDiff(config) {
+  const active = state.knowledgeConfiguration?.retrieval?.active_config || {};
+  const labels = {
+    limit: "最终片段数量", max_excerpt_chars: "单片段长度", max_total_chars: "总上下文预算",
+    neighbor_radius: "相邻片段半径", hybrid_enabled: "混合检索", vector_min_score: "向量门槛",
+    rrf_k: "RRF k", candidate_limit: "候选数量", rewrite_enabled: "查询改写",
+  };
+  return Object.keys(config).filter((key) => config[key] !== active[key]).map((key) => ({
+    key, label: labels[key] || key, before: active[key], after: config[key],
+    risk: ["hybrid_enabled", "rewrite_enabled"].includes(key) ? "高" : (["limit", "max_total_chars", "candidate_limit", "neighbor_radius"].includes(key) ? "中" : "低"),
+  }));
+}
+
+async function createKnowledgeRetrievalCandidate(config) {
+  const changes = retrievalCandidateDiff(config);
+  if (!changes.length) {
+    knowledgeConfigurationView.showSaveError(els, "候选策略至少需要修改一个参数");
+    return;
+  }
+  const detail = changes.map((item) => `[${item.risk}风险] ${item.label}：${item.before} → ${item.after}`).join("\n");
+  if (!window.confirm(`将基于当前活动版本创建候选：\n\n${detail}\n\n此操作不会修改生产策略；候选需先通过固定集和混合检索门禁。继续吗？`)) return;
+  try {
+    const data = await api("/api/retrieval-policies/candidates", { method: "POST", body: JSON.stringify({ config }) });
+    await refreshKnowledgeRetrievalGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `候选 ${data.policy.version} 已创建，生产策略未变化`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function evaluateKnowledgeRetrievalPolicy(version) {
+  try {
+    const data = await api(`/api/retrieval-policies/${encodeURIComponent(version)}/evaluate`, { method: "POST", body: "{}" });
+    await refreshKnowledgeRetrievalGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, data.status === "verified" ? `${version} 已通过全部质量门禁` : `${version} 未通过门禁，已阻止发布`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function publishKnowledgeRetrievalPolicy(version, parentVersion) {
+  const activeVersion = state.knowledgeRetrievalGovernance?.active?.version || state.knowledgeConfiguration?.retrieval?.active_version;
+  if (!window.confirm(`发布已验证候选 ${version}？\n\n父版本：${parentVersion}\n当前活动：${activeVersion}\n回滚目标：${parentVersion}\n\n发布会影响后续全局检索。`)) return;
+  try {
+    await api(`/api/retrieval-policies/${encodeURIComponent(version)}/publish`, { method: "POST", body: "{}" });
+    await loadKnowledgeConfiguration({ render: false });
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `${version} 已发布；${parentVersion} 已保留为稳定回滚目标`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function rollbackKnowledgeRetrievalPolicy() {
+  const active = state.knowledgeRetrievalGovernance?.active?.version || "当前活动策略";
+  if (!window.confirm(`将 ${active} 回滚到其父稳定版本？此操作会影响后续全局检索。`)) return;
+  try {
+    const data = await api("/api/retrieval-policies/rollback", { method: "POST", body: "{}" });
+    await loadKnowledgeConfiguration({ render: false });
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `已回滚到 ${data.active.version}`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function createKnowledgeSuggestionCandidate(suggestionId) {
+  if (!window.confirm("将该反馈建议创建为单变量候选？生产策略不会立即变化。")) return;
+  try {
+    const data = await api(`/api/retrieval-suggestions/${encodeURIComponent(suggestionId)}/candidate`, { method: "POST", body: "{}" });
+    await refreshKnowledgeRetrievalGovernance();
+    renderKnowledgeConfiguration();
+    knowledgeConfigurationView.showSaveSuccess(els, `候选 ${data.policy.version} 已创建`);
+  } catch (error) { knowledgeConfigurationView.showSaveError(els, error.message); }
+}
+
+async function loadKnowledgeConfiguration({ render = true } = {}) {
+  if (state.knowledgeConfigurationLoading) return;
+  state.knowledgeConfigurationLoading = true;
+  if (render) knowledgeConfigurationView.renderLoading(els);
+  try {
+    const data = await api("/api/knowledge-configuration");
+    if (!data.configuration) throw new Error("服务端未返回知识库配置快照");
+    state.knowledgeConfiguration = data.configuration;
+    await Promise.all([refreshKnowledgeReprocessingBatches(), refreshKnowledgeRetrievalGovernance(), refreshKnowledgeEmbeddingGovernance(), refreshKnowledgeMigrationGovernance()]);
+    renderKnowledgeDefaults();
+    if (render) renderKnowledgeConfiguration();
+  } catch (error) {
+    state.knowledgeConfiguration = null;
+    if (render) knowledgeConfigurationView.renderError(els, error.message, loadKnowledgeConfiguration);
+  } finally {
+    state.knowledgeConfigurationLoading = false;
+  }
+}
+
+function openKnowledgeConfiguration() {
+  captureKnowledgeReturnState();
+  switchView("knowledge-configuration");
+}
+
+function returnToKnowledge() {
+  switchView("knowledge");
+  const saved = state.knowledgeReturnState;
+  els.knowledgeSearch.value = saved.search;
+  els.knowledgeScopeSelect.value = saved.scope;
+  syncKnowledgeScopeControls();
+  els.knowledgeProjectSelect.value = saved.projectId;
+  renderKnowledge(state.knowledgeDocuments);
+  if (saved.search) searchKnowledge();
+  requestAnimationFrame(() => { els.knowledgePage.scrollTop = saved.scrollTop; });
+}
+
 function switchView(view) {
   if (state.artifactPreviewOpen) artifactPreview.showContext(state, els);
   if (view !== "space") restoreChatComposer();
@@ -1362,14 +1743,17 @@ function switchView(view) {
   els.skillsPage.classList.toggle("hidden", view !== "skills");
   els.settingsPage.classList.toggle("hidden", view !== "settings");
   els.knowledgePage.classList.toggle("hidden", view !== "knowledge");
+  els.knowledgeConfigurationPage.classList.toggle("hidden", view !== "knowledge-configuration");
   els.memoriesPage.classList.toggle("hidden", view !== "memories");
   els.artifactsPage.classList.toggle("hidden", view !== "artifacts");
   els.threadContextPanel.classList.toggle("hidden", view !== "chat");
   if (view === "artifacts") loadArtifacts();
   if (view === "memories") loadMemories();
   if (view === "settings") loadPersonalHostingStatus();
+  if (view === "knowledge-configuration") loadKnowledgeConfiguration();
   document.querySelectorAll(".nav-button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.view === view);
+    const navigationView = view === "knowledge-configuration" ? "knowledge" : view;
+    button.classList.toggle("active", button.dataset.view === navigationView);
   });
 }
 
@@ -1767,7 +2151,7 @@ els.chatForm.addEventListener("submit", async (event) => {
   }
 });
 
-[els.sourceModeSelect, els.fileModeSelect]
+[els.sourceModeSelect, els.fileModeSelect, els.retrievalProfileSelect, els.knowledgeScopeOverrideSelect]
   .forEach((select) => select.addEventListener("change", executionMode.scheduleRoutePreview));
 
 [els.modelSelect, els.taskModeSelect].forEach((select) => select.addEventListener("change", () => {
@@ -1893,6 +2277,8 @@ els.agentRolloutButton.addEventListener("click", async () => {
 });
 
 els.viewKnowledgeButton.addEventListener("click", () => switchView("knowledge"));
+els.knowledgeConfigurationButton.addEventListener("click", openKnowledgeConfiguration);
+els.backToKnowledgeButton.addEventListener("click", returnToKnowledge);
 els.viewArtifactsButton.addEventListener("click", () => switchView("artifacts"));
 
 els.skillPickerButton.addEventListener("click", () => {
@@ -1987,6 +2373,25 @@ els.knowledgeFileInput.addEventListener("change", async () => {
     els.knowledgeFileInput.value = "";
     return;
   }
+  state.pendingKnowledgeUploadFile = file;
+  els.knowledgeUploadFilename.textContent = file.name;
+  els.knowledgeUploadPresetSelect.value = state.knowledgeConfiguration?.user_preferences?.default_upload_preset || "standard";
+  els.knowledgeUploadDialog.showModal();
+});
+
+function cancelKnowledgeUpload() {
+  state.pendingKnowledgeUploadFile = null;
+  state.knowledgeUploadSpaceId = "";
+  els.knowledgeFileInput.value = "";
+  els.knowledgeUploadDialog.close();
+}
+
+els.cancelKnowledgeUpload.addEventListener("click", cancelKnowledgeUpload);
+els.knowledgeUploadDialog.addEventListener("cancel", (event) => { event.preventDefault(); cancelKnowledgeUpload(); });
+els.confirmKnowledgeUpload.addEventListener("click", async () => {
+  const file = state.pendingKnowledgeUploadFile;
+  if (!file) return;
+  els.confirmKnowledgeUpload.disabled = true;
   let uploadedDocument = null;
   let uploadSpaceId = "";
   try {
@@ -1996,7 +2401,7 @@ els.knowledgeFileInput.addEventListener("change", async () => {
     if (els.knowledgeScopeSelect.value === "project" && !projectSpaceId) throw new Error("请先选择项目空间");
     const result = await api(uploadSpaceId ? `/api/folders/${uploadSpaceId}/knowledge` : "/api/knowledge", {
       method: "POST",
-      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId, idempotency_key: window.crypto?.randomUUID?.() || `upload-${Date.now()}-${Math.random().toString(16).slice(2)}` }),
+      body: JSON.stringify({ filename: file.name, mime_type: file.type, content_base64: contentBase64, scope: projectSpaceId ? "project" : "general", project_space_id: projectSpaceId, chunk_preset: els.knowledgeUploadPresetSelect.value, idempotency_key: window.crypto?.randomUUID?.() || `upload-${Date.now()}-${Math.random().toString(16).slice(2)}` }),
     });
     uploadedDocument = result.document;
     // The POST is the durable upload boundary. Refresh independently so a
@@ -2009,8 +2414,11 @@ els.knowledgeFileInput.addEventListener("change", async () => {
       window.alert(error.message || "资料上传失败");
     }
   } finally {
+    state.pendingKnowledgeUploadFile = null;
     els.knowledgeFileInput.value = "";
     state.knowledgeUploadSpaceId = "";
+    els.confirmKnowledgeUpload.disabled = false;
+    els.knowledgeUploadDialog.close();
   }
 });
 els.closeKnowledgeProcessing.addEventListener("click", () => els.knowledgeProcessingPanel.classList.add("hidden"));

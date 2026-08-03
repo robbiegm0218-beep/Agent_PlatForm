@@ -111,6 +111,29 @@ class KnowledgeEmbeddingTests(unittest.TestCase):
         self.assertEqual(document["active_embedding_model_version"], service.config.version)
         self.assertEqual(document["embedding_status"], "ready")
 
+    def test_admin_inventory_status_and_rollback_targets_are_content_free(self):
+        service = self.service(FakeProvider())
+        status = service.status()
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["configuration"]["endpoint_configured"])
+        self.assertTrue(status["configuration"]["credential_configured"])
+        self.assertEqual(status["jobs"], {
+            "queued": 0, "running": 0, "ready": 0, "partial": 0, "failed": 0,
+        })
+        self.assertEqual(service.inventory()["document_count"], 1)
+        self.assertEqual(service.rollback_targets(), [])
+        service.enqueue_document("doc-1", "user-1")
+        service.process_next()
+        targets = service.rollback_targets()
+        self.assertEqual(targets[0]["filename"], "a.md")
+        self.assertEqual(targets[0]["available_model_versions"], [service.config.version])
+        with self.db() as conn:
+            conn.execute("CREATE TABLE thread_folders (id TEXT PRIMARY KEY, user_id TEXT NOT NULL)")
+        self.assertEqual(service.rollback_targets("user-2"), [])
+        self.assertEqual(service.rollback_targets("user-1")[0]["document_id"], "doc-1")
+        self.assertNotIn("content", targets[0])
+        self.assertNotIn("vector", targets[0])
+
     def test_partial_failure_keeps_previous_active_model(self):
         first = self.service(FakeProvider(), "embed-v1")
         first.enqueue_document("doc-1", "user-1")

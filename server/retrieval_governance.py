@@ -48,6 +48,10 @@ def config_from_json(value: object, fallback: RetrievalConfig | None = None, *, 
         invalid = [name for name, (current, low, high) in ranges.items() if current < low or current > high]
         if invalid:
             raise ValueError("检索策略参数超出允许范围：" + "、".join(invalid))
+        if max_total_chars < max_excerpt_chars:
+            raise ValueError("总上下文预算不能小于单片段长度")
+        if candidate_limit < limit:
+            raise ValueError("候选数量不能小于最终片段数量")
     return RetrievalConfig(
         limit=min(max(limit, 1), 20),
         max_excerpt_chars=min(max(max_excerpt_chars, 100), 4000),

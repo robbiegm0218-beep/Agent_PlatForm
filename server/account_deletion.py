@@ -99,6 +99,11 @@ def delete_due_accounts(database: Path, data_dir: Path, *, execute: bool = False
             conn.execute("DELETE FROM knowledge_migration_items WHERE batch_id IN (SELECT id FROM knowledge_migration_batches WHERE actor_user_id = ?)", (user_id,))
             conn.execute("DELETE FROM knowledge_migration_batches WHERE actor_user_id = ?", (user_id,))
             conn.execute("DELETE FROM knowledge_retrieval_traces WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM user_knowledge_preferences WHERE user_id = ?", (user_id,))
+            conn.execute(
+                "DELETE FROM knowledge_configuration_events WHERE actor_user_id = ? OR (scope_type = 'user' AND scope_id = ?)",
+                (user_id, user_id),
+            )
             conn.execute("DELETE FROM space_members WHERE user_id = ?", (user_id,))
             if owned_spaces:
                 marks = placeholders(owned_spaces)

@@ -135,6 +135,19 @@ class KnowledgeIngestionServiceTests(unittest.TestCase):
         self.assertEqual((replay_run, document_id), (run_id, "doc-2"))
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM knowledge_ingestion_runs").fetchone()[0], 1)
 
+    def test_reprocess_run_records_trigger_without_knowledge_content(self):
+        document = {
+            "id": "doc-3", "filename": "guide.md", "scope": "general",
+            "project_space_id": "", "content_hash": "abc", "size_bytes": 12,
+        }
+        run_id = self.service.begin_reprocess(
+            document, "user-1", trigger_type="reparse", parser_profile="structure_preserving"
+        )
+        run = self.conn.execute("SELECT * FROM knowledge_ingestion_runs WHERE id = ?", (run_id,)).fetchone()
+        self.assertEqual((run["trigger_type"], run["status"], run["document_id"]), ("reparse", "running", "doc-3"))
+        event = self.conn.execute("SELECT detail_json FROM knowledge_pipeline_events WHERE ingestion_run_id = ?", (run_id,)).fetchone()[0]
+        self.assertNotIn("guide body", event)
+
 
 class _SharedConnection:
     """Keep one in-memory connection open while preserving context semantics."""

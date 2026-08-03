@@ -276,6 +276,11 @@ class KnowledgeRetriever:
                 "filename": str(row.get("filename", "")),
                 "position": position,
                 "excerpt": excerpt,
+                # Keep the primary hit separate from the neighbor-expanded
+                # model context. The UI uses this exact text to highlight the
+                # cited chunk instead of highlighting adjacent context.
+                "primary_excerpt": primary_content[:self.config.max_excerpt_chars],
+                "chunk_version": int(row.get("chunk_version", 0) or 0),
                 "score": round(score, 6),
                 "matched_terms": matched,
                 "neighbor_positions": sorted(neighbor_positions),

@@ -185,10 +185,6 @@ window.AgentAuditView = {
         Object.assign(document.createElement("small"), { textContent: `待迁移 ${migration.eligible_count || 0} 份 · 先暂存新版本和 Shadow 对比，再按 25% / 100% 激活；旧片段持续可用。` }),
       );
       const latestBatch = (migration.batches || [])[0];
-      if (!latestBatch && migration.eligible_count) {
-        const create = document.createElement("button"); create.type = "button"; create.className = "secondary"; create.textContent = "创建迁移批次";
-        create.addEventListener("click", () => governance.onCreateMigration(create)); admin.append(create);
-      }
       if (latestBatch) {
         const item = document.createElement("div"); item.className = "governance-item";
         const shadow = latestBatch.shadow || {};
@@ -196,17 +192,13 @@ window.AgentAuditView = {
           Object.assign(document.createElement("strong"), { textContent: `${latestBatch.id} · ${latestBatch.status}` }),
           Object.assign(document.createElement("small"), { textContent: `成功 ${latestBatch.succeeded_count || 0}/${latestBatch.total_count || 0} · 灰度 ${latestBatch.rollout_percentage || 0}% · Shadow ${shadow.comparison_count || 0} 次 · 文档重合 ${shadow.document_overlap == null ? "暂无" : `${(shadow.document_overlap * 100).toFixed(1)}%`}` }),
         );
-        const action = (label, callback, primary = false) => {
-          const button = document.createElement("button"); button.type = "button"; if (!primary) button.className = "secondary"; button.textContent = label;
-          button.addEventListener("click", () => callback(button)); item.append(button);
-        };
-        if (["queued", "partial"].includes(latestBatch.status)) action("生成暂存版本", (button) => governance.onRunMigration(latestBatch.id, button));
-        if (latestBatch.status === "staged") action("运行迁移门禁", (button) => governance.onEvaluateMigration(latestBatch.id, button));
-        if (["verified", "rolled_back"].includes(latestBatch.status)) action("灰度 25%", (button) => governance.onPromoteMigration(latestBatch.id, 25, button));
-        if (["verified", "canary", "rolled_back"].includes(latestBatch.status)) action("激活 100%", (button) => governance.onPromoteMigration(latestBatch.id, 100, button), true);
-        if (["canary", "active"].includes(latestBatch.status)) action("恢复迁移前版本", (button) => governance.onRollbackMigration(latestBatch.id, button));
         admin.append(item);
       }
+      const migrationConfiguration = document.createElement("button");
+      migrationConfiguration.type = "button"; migrationConfiguration.className = "secondary";
+      migrationConfiguration.textContent = "在知识库配置中心管理";
+      migrationConfiguration.addEventListener("click", () => governance.onOpenKnowledgeConfiguration());
+      admin.append(migrationConfiguration);
       if (governance.evidence?.source === "trial_feedback_aggregate") {
         admin.append(Object.assign(document.createElement("p"), { textContent: `试用汇总信号：${governance.evidence.document_feedback_count || 0} 条引用评价。仅用于生成离线候选，不展示测试用户或文档内容。` }));
       }

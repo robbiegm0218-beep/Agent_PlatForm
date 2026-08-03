@@ -2,6 +2,11 @@
   .artifacts-grid { grid-template-columns: 1fr; }
   .artifact-card { min-height: 232px; }
 }
+@media (min-width: 761px) and (max-width: 1120px) {
+  .configuration-policy-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .configuration-lab > form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .configuration-lab > form > button { justify-self: start; }
+}
 @media (max-width: 760px) {
   .workspace {
     grid-template-columns: 1fr;
@@ -84,10 +89,56 @@
     padding-inline: 16px;
   }
   .knowledge-toolbar select { max-width: none; }
+  .knowledge-header-actions { width: 100%; justify-content: flex-end; }
+  .knowledge-configuration-entry small { display: none; }
+  .knowledge-configuration-header { min-height: 112px; align-items: flex-start; gap: 10px; padding: 12px 16px; }
+  .knowledge-configuration-title { align-items: flex-start; gap: 10px; }
+  .knowledge-configuration-title h2 { font-size: 18px; }
+  .knowledge-configuration-title p { max-width: 270px; font-size: 10px; line-height: 1.4; }
+  .configuration-back-button { min-height: 32px; padding-inline: 6px 8px; }
+  .knowledge-configuration-header > .status-pill { margin-top: 3px; white-space: nowrap; }
+  .knowledge-configuration-shell { padding-inline: 16px; }
+  .knowledge-configuration-tabs { width: 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; }
+  .knowledge-configuration-tabs button { flex: 0 0 auto; }
+  .configuration-summary-grid,
+  .configuration-preset-grid,
+  .configuration-policy-banner,
+  .configuration-policy-fields,
+  .configuration-lab-results,
+  .configuration-definition-list,
+  .retrieval-profile-options,
+  .knowledge-preference-selects,
+  .configuration-policy-toggles { grid-template-columns: 1fr; }
+  .configuration-section-heading,
+  .configuration-health-row,
+  .configuration-security-boundary { align-items: flex-start; flex-direction: column; }
+  .configuration-health-row span,
+  .configuration-security-boundary span { text-align: left; }
+  .configuration-placeholder-action { align-items: flex-start; flex-direction: column; }
+  .configuration-form-actions { align-items: flex-start; flex-direction: column; }
+  .configuration-form-footer > div { width: 100%; }
+  .configuration-form-footer > div button { flex: 1; }
+  .configuration-batch-panel form,
+  .configuration-lab > form,
+  .configuration-migration > form,
+  .configuration-index-progress,
+  .configuration-model-list,
+  .configuration-rollback-list form { grid-template-columns: 1fr; }
+  .configuration-index-actions { justify-content: flex-start; }
   .knowledge-processing-panel,
   .knowledge-results { margin-inline: 16px; }
   .knowledge-processing-heading { align-items: flex-start; }
   .knowledge-structure-layout { grid-template-columns: 1fr; }
+  .knowledge-structure-markdown {
+    position: static;
+    height: auto;
+    min-height: 0;
+    display: block;
+  }
+  .knowledge-structure-markdown pre {
+    height: auto;
+    max-height: 65vh;
+  }
 
   .run-drawer { width: min(380px, 100vw); padding: 14px; }
   .run-drawer-tab { font-size: 11px; }

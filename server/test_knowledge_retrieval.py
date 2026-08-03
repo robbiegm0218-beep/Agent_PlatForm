@@ -38,6 +38,8 @@ class KnowledgeRetrieverTests(unittest.TestCase):
         self.assertEqual(result["position"], 1)
         self.assertEqual(result["neighbor_positions"], [0, 2])
         self.assertIn("数据质量", result["excerpt"])
+        self.assertEqual(result["primary_excerpt"], "碳排放因子选择需要匹配地区和年份。")
+        self.assertNotIn("数据质量", result["primary_excerpt"])
 
     def test_duplicate_content_and_total_budget_are_bounded(self):
         rows = [

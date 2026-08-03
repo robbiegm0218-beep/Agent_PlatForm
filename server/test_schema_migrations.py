@@ -67,6 +67,15 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_migration_batches'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_migration_items'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_migration_shadow_diffs'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'user_knowledge_preferences'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_configuration_events'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_processing_preset_revisions'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_reprocessing_batches'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE name = 'knowledge_reprocessing_items'").fetchone())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM knowledge_processing_preset_revisions").fetchone()[0],
+            3,
+        )
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM knowledge_processing_presets WHERE status = 'active'").fetchone()[0],
             3,

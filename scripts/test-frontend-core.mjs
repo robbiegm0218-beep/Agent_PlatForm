@@ -44,11 +44,21 @@ context.AgentStorage.setToken("token-1");
 for (const file of ["state.js", "dom.js", "api.js"]) {
   vm.runInContext(readFileSync(new URL(`../web/static/core/${file}`, import.meta.url), "utf8"), context);
 }
+vm.runInContext(readFileSync(new URL("../web/static/views/knowledge-configuration.js", import.meta.url), "utf8"), context);
 
 assert.equal(context.AgentState.token, "token-1");
 context.AgentStorage.saveWorkspace("workspace", { view: "knowledge" });
 assert.equal(context.AgentStorage.loadWorkspace("workspace").view, "knowledge");
 assert.equal(context.AgentElements.modelStatus.selector, "#modelStatus");
+assert.ok(context.AgentUiState.validViews.has("knowledge-configuration"));
+assert.deepEqual(
+  Array.from(context.AgentKnowledgeConfigurationView.visibleTabs({ capabilities: [] }), (tab) => tab.id),
+  ["overview", "index"],
+);
+assert.deepEqual(
+  Array.from(context.AgentKnowledgeConfigurationView.visibleTabs({ capabilities: [{ capability_id: "retrieval_policy" }] }), (tab) => tab.id),
+  ["overview", "retrieval", "index"],
+);
 
 let request;
 context.fetch = async (path, options) => {
@@ -80,10 +90,12 @@ const spaceWorkspace = readFileSync(new URL("../web/static/space/workspace.js", 
 const resourceViews = readFileSync(new URL("../web/static/views/resources.js", import.meta.url), "utf8");
 const capabilityViews = readFileSync(new URL("../web/static/views/capabilities.js", import.meta.url), "utf8");
 const settingsView = readFileSync(new URL("../web/static/views/settings.js", import.meta.url), "utf8");
+const knowledgeConfigurationView = readFileSync(new URL("../web/static/views/knowledge-configuration.js", import.meta.url), "utf8");
 const auditView = readFileSync(new URL("../web/static/views/audit.js", import.meta.url), "utf8");
 const tokenStyles = readFileSync(new URL("../web/static/styles/tokens-base.css", import.meta.url), "utf8");
 const responsiveStyles = readFileSync(new URL("../web/static/styles/responsive.css", import.meta.url), "utf8");
 const layoutStyles = readFileSync(new URL("../web/static/styles/layout.css", import.meta.url), "utf8");
+const knowledgeStyles = readFileSync(new URL("../web/static/styles/knowledge.css", import.meta.url), "utf8");
 const componentStyles = readFileSync(new URL("../web/static/styles/components.css", import.meta.url), "utf8");
 const styleEntry = readFileSync(new URL("../web/static/styles.css", import.meta.url), "utf8");
 assert.match(app, /storage\.saveWorkspace\(UI_STATE_KEY/);
@@ -114,7 +126,7 @@ assert.match(composer, /document\.createTextNode\(normalized\)/);
 assert.match(app, /addEventListener\("paste"/);
 assert.match(app, /composer\.pastePlainText\(event, els\)/);
 assert.match(loginPage, /\/static\/chat\/composer\.js\?v=p50-4-1/);
-assert.match(loginPage, /\/static\/app\.js\?v=p50-5-1/);
+assert.match(loginPage, /\/static\/app\.js\?v=p52-8-2/);
 assert.match(stream, /window\.AgentChatStream/);
 assert.match(executionMode, /window\.AgentExecutionMode/);
 assert.match(markdown, /window\.AgentMarkdown/);
@@ -132,7 +144,7 @@ assert.match(artifactPreview, /scrollIntoView\(\{ block: "center", behavior: "sm
 assert.match(loginPage, /id="artifactPreviewSurface"[^>]+role="document"/);
 assert.match(loginPage, /id="artifactPreviewContent"/);
 assert.match(loginPage, /\/static\/chat\/artifact-preview\.js\?v=p50-4-3/);
-assert.match(loginPage, /\/static\/styles\.css\?v=p50-5-1/);
+assert.match(loginPage, /\/static\/styles\.css\?v=p52-8-1/);
 assert.match(tokenStyles, /\.login-form\s*\{[\s\S]*?display:\s*grid;[\s\S]*?gap:\s*18px;/);
 assert.match(tokenStyles, /\.login-form > button,[\s\S]*?width:\s*100%;/);
 assert.match(tokenStyles, /\.form-error:empty\s*\{\s*display:\s*none;/);
@@ -146,6 +158,8 @@ assert.match(app, /bindKnowledgeSourceButtons\(wrapper, data\.knowledge_sources/
 assert.doesNotMatch(app, /link\.textContent = `调用资料：/);
 assert.match(app, /button\._knowledgeSource = source/);
 assert.match(app, /preview_url: `\/api\/knowledge\/\$\{id\}\/preview`/);
+assert.match(app, /document\.highlight_excerpt \|\| document\.primary_excerpt \|\| document\.excerpt/);
+assert.match(app, /source\.highlight_excerpt \|\| source\.excerpt/);
 assert.match(knowledgeLibrary, /knowledge-preview/);
 assert.match(knowledgeLibrary, /knowledge-structure/);
 assert.match(knowledgeLibrary, /renderStructure\(els, data, escape\)/);
@@ -157,13 +171,71 @@ assert.match(app, /\/api\/knowledge\/\$\{document\.id\}\/rechunk/);
 assert.match(app, /\/api\/knowledge\/\$\{document\.id\}\/chunk-rollback/);
 assert.match(app, /FTS5\/BM25/);
 assert.match(loginPage, /id="knowledgeIndexStatus"/);
+assert.match(loginPage, /id="knowledgeConfigurationButton"/);
+assert.match(loginPage, /id="knowledgeConfigurationPage"/);
+assert.match(loginPage, /id="knowledgeConfigurationTabs"/);
+assert.match(loginPage, /\/static\/views\/knowledge-configuration\.js\?v=p52-8-1/);
+assert.match(loginPage, /\/static\/views\/audit\.js\?v=p52-7-1/);
+assert.match(app, /api\("\/api\/knowledge-configuration"\)/);
+assert.match(app, /captureKnowledgeReturnState\(\)/);
+assert.match(app, /requestAnimationFrame\(\(\) => \{ els\.knowledgePage\.scrollTop = saved\.scrollTop;/);
+assert.match(app, /view === "knowledge-configuration" \? "knowledge" : view/);
+assert.match(knowledgeConfigurationView, /window\.AgentKnowledgeConfigurationView/);
+assert.match(knowledgeConfigurationView, /user_retrieval_profile/);
+assert.match(knowledgeConfigurationView, /processing_presets/);
+assert.match(knowledgeConfigurationView, /retrieval_policy/);
+assert.match(knowledgeConfigurationView, /renderLoading/);
+assert.match(knowledgeConfigurationView, /configuration-forbidden/);
+assert.match(knowledgeConfigurationView, /knowledgePreferencesForm/);
+assert.match(knowledgeConfigurationView, /精准/);
+assert.match(knowledgeConfigurationView, /高召回/);
+assert.match(knowledgeConfigurationView, /data-retrieval-candidate-form/);
+assert.match(knowledgeConfigurationView, /data-evaluate-policy/);
+assert.match(knowledgeConfigurationView, /data-publish-policy/);
+assert.match(knowledgeConfigurationView, /data-rollback-retrieval/);
+assert.match(knowledgeConfigurationView, /FTS\/BM25 字段权重（只读）/);
+assert.match(knowledgeConfigurationView, /data-rebuild-embedding/);
+assert.match(knowledgeConfigurationView, /data-run-embedding/);
+assert.match(knowledgeConfigurationView, /data-embedding-rollback/);
+assert.match(knowledgeConfigurationView, /data-retrieval-lab-form/);
+assert.match(knowledgeConfigurationView, /BM25 候选/);
+assert.match(knowledgeConfigurationView, /data-migration-batch-form/);
+assert.match(knowledgeConfigurationView, /data-retry-migration/);
+assert.match(knowledgeConfigurationView, /发布 25%/);
+assert.match(auditView, /在知识库配置中心管理/);
+assert.doesNotMatch(app, /preset: "standard", limit: 10/);
+assert.match(knowledgeConfigurationView, /环境配置（只读）/);
+assert.match(knowledgeConfigurationView, /不会发起向量网络请求/);
+assert.match(knowledgeConfigurationView, /不返回凭证、服务地址、绝对路径、向量或知识正文/);
+assert.match(app, /\/api\/embedding-index\/rebuild/);
+assert.match(app, /confirm_document_count/);
+assert.match(app, /\/api\/embedding-index\/run/);
+assert.match(app, /embedding-rollback/);
+assert.match(app, /\/api\/retrieval-lab\/compare/);
+assert.match(app, /\/api\/knowledge-migrations\/\$\{encodeURIComponent\(batchId\)\}\/retry/);
+assert.match(app, /\/api\/knowledge-configuration\/preferences/);
+assert.match(loginPage, /id="retrievalProfileSelect"/);
+assert.match(loginPage, /id="knowledgeScopeOverrideSelect"/);
+assert.match(loginPage, /id="knowledgeUploadDialog"/);
+assert.match(stream, /retrieval_profile: els\.retrievalProfileSelect\?\.value/);
+assert.match(stream, /knowledge_scope: els\.knowledgeScopeOverrideSelect\?\.value/);
+assert.match(app, /chunk_preset: els\.knowledgeUploadPresetSelect\.value/);
+assert.doesNotMatch(knowledgeConfigurationView, /prompt\s*\(/);
 assert.match(responsiveStyles, /\.workspace\.artifact-preview-open\s*\{[\s\S]*?grid-template-columns:\s*1fr;[\s\S]*?overflow:\s*hidden;/);
 assert.match(responsiveStyles, /@media \(min-width: 601px\) and \(max-width: 760px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 44%\) minmax\(0, 56%\)/);
 assert.match(layoutStyles, /#settingsPage\s*\{[\s\S]*?min-height:\s*0;[\s\S]*?overflow:\s*hidden;/);
+assert.match(layoutStyles, /#knowledgePage\s*\{[\s\S]*?overflow-y:\s*auto;[\s\S]*?overscroll-behavior:\s*contain;/);
+assert.match(knowledgeStyles, /\.knowledge-structure-markdown\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?height:\s*calc\(100dvh - 190px\);[\s\S]*?grid-template-rows:\s*auto minmax\(0, 1fr\);/);
+assert.match(knowledgeStyles, /\.knowledge-structure-markdown pre\s*\{[\s\S]*?height:\s*100%;[\s\S]*?max-height:\s*none;[\s\S]*?overflow:\s*auto;/);
 assert.match(componentStyles, /\.settings-stack\s*\{[\s\S]*?flex:\s*1;[\s\S]*?min-height:\s*0;[\s\S]*?overflow-y:\s*auto;/);
 assert.match(styleEntry, /tokens-base\.css\?v=p50-5-1/);
 assert.match(styleEntry, /components\.css\?v=p50-4-1/);
-assert.match(styleEntry, /responsive\.css\?v=p48-3-1/);
+assert.match(styleEntry, /layout\.css\?v=p52-2-1/);
+assert.match(styleEntry, /knowledge\.css\?v=p52-7-1/);
+assert.match(styleEntry, /responsive\.css\?v=p52-7-1/);
+assert.match(layoutStyles, /#knowledgeConfigurationPage\s*\{[\s\S]*?overflow:\s*hidden;/);
+assert.match(knowledgeStyles, /\.knowledge-configuration-content\s*\{[\s\S]*?overflow-y:\s*auto;/);
+assert.match(responsiveStyles, /\.configuration-summary-grid,[\s\S]*?grid-template-columns:\s*1fr;/);
 assert.match(knowledgeLibrary, /window\.AgentKnowledgeLibrary/);
 assert.match(spaceWorkspace, /window\.AgentSpaceWorkspace/);
 assert.match(resourceViews, /window\.AgentResourceViews/);
@@ -173,8 +245,8 @@ assert.match(auditView, /window\.AgentAuditView/);
 assert.match(auditView, /renderDetail/);
 assert.match(loginPage, /自动判断（仅明确相关时读取）/);
 assert.match(loginPage, /普通写作、计划、代码和闲聊不会主动调用知识库/);
-assert.match(loginPage, /\/static\/views\/audit\.js\?v=p50-3-1/);
-assert.match(loginPage, /\/static\/chat\/execution-mode\.js\?v=p50-3-1/);
+assert.match(loginPage, /\/static\/views\/audit\.js\?v=p52-7-1/);
+assert.match(loginPage, /\/static\/chat\/execution-mode\.js\?v=p52-3-1/);
 assert.match(executionMode, /自动判断（仅明确相关时读取）/);
 assert.match(auditView, /auto_route_stages: autoStages/);
 assert.match(auditView, /可判定输入/);

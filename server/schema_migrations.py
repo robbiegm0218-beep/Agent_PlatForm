@@ -534,6 +534,86 @@ def _knowledge_history_migration_and_rollout(conn: sqlite3.Connection) -> None:
             ON knowledge_migration_shadow_diffs(batch_id, created_at DESC)""")
 
 
+def _knowledge_configuration_read_model(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_knowledge_preferences (
+            user_id TEXT PRIMARY KEY,
+            retrieval_profile TEXT NOT NULL DEFAULT 'balanced',
+            default_scope TEXT NOT NULL DEFAULT 'auto',
+            default_upload_preset TEXT NOT NULL DEFAULT 'standard',
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_configuration_events (
+            id TEXT PRIMARY KEY,
+            actor_user_id TEXT NOT NULL,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL DEFAULT '',
+            configuration_area TEXT NOT NULL,
+            changed_fields_json TEXT NOT NULL DEFAULT '[]',
+            before_version TEXT NOT NULL DEFAULT '',
+            after_version TEXT NOT NULL,
+            source TEXT NOT NULL,
+            impact_scope TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_configuration_events_actor
+            ON knowledge_configuration_events(actor_user_id, created_at DESC)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_configuration_events_scope
+            ON knowledge_configuration_events(scope_type, scope_id, created_at DESC)""")
+
+
+def _knowledge_reprocessing_and_preset_revisions(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_processing_preset_revisions (
+            preset_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            parser_profile TEXT NOT NULL,
+            chunk_config_json TEXT NOT NULL,
+            created_by_user_id TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (preset_id, revision)
+        )""")
+    conn.execute("""INSERT OR IGNORE INTO knowledge_processing_preset_revisions
+            (preset_id, revision, parser_profile, chunk_config_json,
+             created_by_user_id, created_at)
+            SELECT id, revision, parser_profile, chunk_config_json,
+                   updated_by_user_id, updated_at
+            FROM knowledge_processing_presets""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_reprocessing_batches (
+            id TEXT PRIMARY KEY,
+            actor_user_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            preset TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            processed_count INTEGER NOT NULL DEFAULT 0,
+            succeeded_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_reprocessing_batches_actor
+            ON knowledge_reprocessing_batches(actor_user_id, created_at DESC)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_reprocessing_items (
+            id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            processing_run_id TEXT NOT NULL DEFAULT '',
+            source_chunk_version INTEGER NOT NULL DEFAULT 0,
+            target_chunk_version INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(batch_id, document_id)
+        )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_reprocessing_items_batch
+            ON knowledge_reprocessing_items(batch_id, status, document_id)""")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "personal_accounts_and_security_events", _personal_accounts),
     Migration(2, "account_deletion_requests", _account_deletion_requests),
@@ -547,6 +627,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(10, "knowledge_vector_index", _knowledge_vector_index),
     Migration(11, "knowledge_configuration_and_retrieval_lab", _knowledge_configuration_and_retrieval_lab),
     Migration(12, "knowledge_history_migration_and_rollout", _knowledge_history_migration_and_rollout),
+    Migration(13, "knowledge_configuration_read_model", _knowledge_configuration_read_model),
+    Migration(14, "knowledge_reprocessing_and_preset_revisions", _knowledge_reprocessing_and_preset_revisions),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

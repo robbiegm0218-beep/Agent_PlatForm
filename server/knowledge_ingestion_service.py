@@ -102,6 +102,29 @@ class KnowledgeIngestionService:
             self._event(conn, run_id, "uploaded", "completed", {"size_bytes": size_bytes})
         return run_id, ""
 
+    def begin_reprocess(self, document: dict, actor_user_id: str, *, trigger_type: str,
+                        parser_profile: str) -> str:
+        if trigger_type not in {"reparse", "rechunk", "reindex"}:
+            raise ValueError("资料重新处理类型无效")
+        run_id = self.new_id("knowledge_ingestion")
+        current = self.now()
+        with self.db_factory() as conn:
+            conn.execute(
+                """INSERT INTO knowledge_ingestion_runs
+                   (id, document_id, user_id, filename, scope, project_space_id,
+                    trigger_type, status, current_stage, parser_profile,
+                    raw_sha256, size_bytes, started_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 'uploaded', ?, ?, ?, ?, ?)""",
+                (
+                    run_id, document["id"], actor_user_id, document["filename"],
+                    document["scope"], document["project_space_id"], trigger_type,
+                    parser_profile, document["content_hash"], int(document["size_bytes"]),
+                    current, current,
+                ),
+            )
+            self._event(conn, run_id, "uploaded", "completed", {"trigger_type": trigger_type})
+        return run_id
+
     def stage(self, run_id: str, stage: str, status: str, detail: dict | None = None) -> None:
         if stage not in PIPELINE_STAGES:
             raise ValueError(f"知识处理阶段无效：{stage}")

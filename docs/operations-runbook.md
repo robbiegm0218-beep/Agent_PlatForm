@@ -9,5 +9,11 @@
 | 磁盘不足 | 健康接口 `startup.disk_space.ok=false` | 删除可确认的临时文件或扩容；不要删除数据库、知识库和产物目录。 |
 | OCR 缺失 | 启动检查 `image_ocr` 未配置 | 安装 Tesseract 或改传 Markdown/TXT；图片不会上传外部。 |
 | 升级失败 | 服务未启动或迁移未就绪 | 保留故障现场，使用升级快照进行隔离恢复；确认数据一致后再覆盖恢复。 |
+| 检索候选无法发布 | 候选未评测、门禁失败或父版本过期 | 不直接改数据库；基于当前活动版本重新创建候选，运行固定集与混合门禁后再确认发布。 |
+| 向量任务失败或未配置 | Provider 关闭、凭证/模型错误或部分片段失败 | 保持 FTS5/BM25 回退；检查只读配置状态和脱敏错误，修复环境变量并重启后重新入队。 |
+| 历史迁移停在 partial | 一个或多个文档暂存失败 | 在配置中心逐项重试；活动批次结束前不创建新批次，不跳过 Shadow 门禁。 |
+| 迁移灰度异常 | 25%/100% 后质量或运行状态异常 | 立即执行“恢复迁移前版本”，复核文档数量、ACL 指纹、FTS 和活动策略，再分析内容安全摘要。 |
 
 日常执行：`scripts/operational-check.sh`；恢复演练：`python3 -m server.recovery_drill --database agent_platform.db --data-dir data`。两者都不会修改源实例。
+
+知识库配置发布门禁：`scripts/check-knowledge-configuration-release.sh`。失败时停止发布，保留现有活动策略、活动切分和 FTS 回退，不构建 Docker 镜像。

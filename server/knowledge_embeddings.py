@@ -331,6 +331,7 @@ class KnowledgeEmbeddingService:
         )
 
     def status(self) -> dict:
+        job_statuses = ("queued", "running", "ready", "partial", "failed")
         result = {
             "enabled": self.config.enabled,
             "provider": self.config.provider,
@@ -338,6 +339,16 @@ class KnowledgeEmbeddingService:
             "dimensions": self.config.dimensions,
             "model_version": self.config.version if self.config.enabled else "",
             "fallback": "fts5-bm25",
+            "configuration": {
+                "source": "environment",
+                "read_only": True,
+                "endpoint_configured": bool(self.config.base_url),
+                "credential_configured": bool(self.config.api_key),
+                "model_configured": bool(self.config.model),
+                "dimensions_configured": self.config.dimensions > 0,
+                "timeout_seconds": self.config.timeout_seconds,
+                "restart_required_after_change": True,
+            },
         }
         with self.db_factory() as conn:
             counts = {
@@ -346,7 +357,7 @@ class KnowledgeEmbeddingService:
                     "SELECT status, COUNT(*) AS count FROM knowledge_embedding_jobs GROUP BY status"
                 ).fetchall()
             }
-        result["jobs"] = counts
+        result["jobs"] = {status: counts.get(status, 0) for status in job_statuses}
         return result
 
     def recent_jobs(self, limit: int = 50) -> list[dict]:
@@ -367,6 +378,61 @@ class KnowledgeEmbeddingService:
                    FROM knowledge_embedding_models
                    ORDER BY activated_at DESC, created_at DESC"""
             ).fetchall()]
+
+    def inventory(self) -> dict:
+        """Return aggregate, content-free index coverage for admin impact previews."""
+        with self.db_factory() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS document_count,
+                          SUM(CASE WHEN embedding_status = 'ready' THEN 1 ELSE 0 END) AS ready_document_count,
+                          SUM(CASE WHEN embedding_status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending_document_count,
+                          SUM(CASE WHEN embedding_status IN ('partial', 'failed') THEN 1 ELSE 0 END) AS failed_document_count
+                   FROM knowledge_documents"""
+            ).fetchone()
+        return {key: int(row[key] or 0) for key in row.keys()}
+
+    def rollback_targets(self, actor_user_id: str = "", limit: int = 200) -> list[dict]:
+        """List complete vector versions per document without returning vectors or text."""
+        with self.db_factory() as conn:
+            if actor_user_id:
+                documents = conn.execute(
+                    """SELECT id, filename, active_chunk_version, active_embedding_model_version
+                       FROM knowledge_documents WHERE
+                         (scope = 'general' AND user_id = ?) OR
+                         (scope = 'project' AND EXISTS (
+                           SELECT 1 FROM thread_folders
+                           WHERE thread_folders.id = knowledge_documents.project_space_id
+                             AND thread_folders.user_id = ?
+                         ))
+                       ORDER BY created_at DESC, id LIMIT ?""",
+                    (actor_user_id, actor_user_id, min(max(limit, 1), 500)),
+                ).fetchall()
+            else:
+                documents = conn.execute(
+                    """SELECT id, filename, active_chunk_version, active_embedding_model_version
+                       FROM knowledge_documents ORDER BY created_at DESC, id LIMIT ?""",
+                    (min(max(limit, 1), 500),),
+                ).fetchall()
+            targets = []
+            for document in documents:
+                total = int(conn.execute(
+                    "SELECT COUNT(*) FROM knowledge_chunks WHERE document_id = ? AND chunk_version = ?",
+                    (document["id"], document["active_chunk_version"]),
+                ).fetchone()[0])
+                versions = [] if total == 0 else [str(row["model_version"]) for row in conn.execute(
+                    """SELECT model_version FROM knowledge_chunk_embeddings
+                       WHERE document_id = ? AND chunk_version = ? AND status = 'ready'
+                       GROUP BY model_version HAVING COUNT(*) = ? ORDER BY MAX(updated_at) DESC""",
+                    (document["id"], document["active_chunk_version"], total),
+                ).fetchall()]
+                if versions:
+                    targets.append({
+                        "document_id": str(document["id"]),
+                        "filename": str(document["filename"]),
+                        "active_model_version": str(document["active_embedding_model_version"] or ""),
+                        "available_model_versions": versions,
+                    })
+        return targets
 
     def rollback_document(self, document_id: str, model_version: str) -> None:
         timestamp = self.now()

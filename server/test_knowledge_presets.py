@@ -34,6 +34,19 @@ class KnowledgePresetServiceTests(unittest.TestCase):
         policy, _ = self.service.policy("standard")
         self.assertEqual(policy.version, "structure-token-v1:standard:r2")
         self.assertEqual(policy.target_tokens, 700)
+        revisions = self.service.revisions("standard")
+        self.assertEqual([item["revision"] for item in revisions], [2, 1])
+        self.assertEqual(revisions[0]["chunk_config"]["target_tokens"], 700)
+        self.assertNotIn("chunk_config_json", revisions[0])
+
+    def test_unchanged_configuration_does_not_create_revision(self):
+        _, current = self.service.policy("standard")
+        with self.assertRaisesRegex(ValueError, "没有发生变化"):
+            self.service.update("standard", {
+                "parser_profile": current["parser_profile"],
+                "chunk_config": current["chunk_config"],
+            }, "knowledge-admin")
+        self.assertEqual(len(self.service.revisions("standard")), 1)
 
     def test_invalid_preset_configuration_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "最大 Token"):

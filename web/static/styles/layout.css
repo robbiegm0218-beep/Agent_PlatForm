@@ -132,6 +132,7 @@
 #skillsPage,
 #settingsPage,
 #knowledgePage,
+#knowledgeConfigurationPage,
 #memoriesPage,
 #artifactsPage { grid-column: 2 / -1; }
 
@@ -140,9 +141,23 @@
   overflow: hidden;
 }
 
+#knowledgePage {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+#knowledgeConfigurationPage {
+  min-height: 0;
+  overflow: hidden;
+}
+
 .workspace.artifact-preview-open .chat-page,
 .workspace.artifact-preview-open .space-page,
 .workspace.artifact-preview-open #knowledgePage,
+.workspace.artifact-preview-open #knowledgeConfigurationPage,
 .workspace.artifact-preview-open #artifactsPage {
   grid-column: 2;
 }

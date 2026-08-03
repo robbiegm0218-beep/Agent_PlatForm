@@ -159,7 +159,12 @@ class AgentPlatformApiTests(unittest.TestCase):
         report = self.request_json("/api/embedding-index", token=self.token)
         self.assertFalse(report["index"]["enabled"])
         self.assertEqual(report["index"]["fallback"], "fts5-bm25")
+        self.assertFalse(report["index"]["configuration"]["credential_configured"])
+        self.assertEqual(report["inventory"]["document_count"], 0)
+        self.assertEqual(report["recent_errors"], [])
+        self.assertEqual(report["rollback_targets"], [])
         self.assertNotIn("api_key", json.dumps(report))
+        self.assertNotIn("config_fingerprint", json.dumps(report))
         with self.assertRaises(urllib.error.HTTPError) as disabled:
             self.request_json("/api/embedding-index/rebuild", {}, self.token)
         self.assertEqual(disabled.exception.code, 409)
@@ -176,6 +181,56 @@ class AgentPlatformApiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as forbidden:
             self.request_json("/api/embedding-index", token=viewer)
         self.assertEqual(forbidden.exception.code, 403)
+
+    def test_embedding_admin_operations_require_current_impact_confirmation_and_redact_errors(self):
+        class EnabledEmbeddingFixture:
+            class Config:
+                enabled = True
+
+            config = Config()
+
+            @staticmethod
+            def status():
+                return {"enabled": True, "provider": "fixture", "model": "safe-model", "dimensions": 3, "model_version": "fixture:v1", "fallback": "fts5-bm25", "configuration": {}, "jobs": {"queued": 0, "running": 0, "ready": 0, "partial": 0, "failed": 1}}
+
+            @staticmethod
+            def recent_jobs(limit=50):
+                return [{"id": "job-1", "document_id": "private-doc", "chunk_version": 1, "model_version": "fixture:v1", "status": "failed", "total_count": 1, "reused_count": 0, "succeeded_count": 0, "failed_count": 1, "error_message": "request https://private.example/v1 api_key=secret-value", "created_at": 1, "started_at": 1, "completed_at": 2, "updated_at": 2}]
+
+            @staticmethod
+            def models():
+                return [{"version": "fixture:v1", "provider": "fixture", "model": "safe-model", "dimensions": 3, "config_fingerprint": "private-fingerprint", "status": "active", "created_at": 1, "activated_at": 1}]
+
+            @staticmethod
+            def inventory():
+                return {"document_count": 0, "ready_document_count": 0, "pending_document_count": 0, "failed_document_count": 0}
+
+            @staticmethod
+            def rollback_targets(actor_user_id="", limit=200):
+                return []
+
+            @staticmethod
+            def enqueue_document(document_id, requested_by_user_id=""):
+                return {"status": "queued"}
+
+            @staticmethod
+            def process_next():
+                return None
+
+        with patch.object(app, "KNOWLEDGE_EMBEDDING_SERVICE", EnabledEmbeddingFixture()):
+            report = self.request_json("/api/embedding-index", token=self.token)
+            serialized = json.dumps(report)
+            self.assertNotIn("private-doc", serialized)
+            self.assertNotIn("private.example", serialized)
+            self.assertNotIn("secret-value", serialized)
+            self.assertNotIn("private-fingerprint", serialized)
+            self.assertIn("[ENDPOINT]", report["recent_errors"][0]["message"])
+            with self.assertRaises(urllib.error.HTTPError) as stale:
+                self.request_json("/api/embedding-index/rebuild", {"confirm_document_count": 1}, self.token)
+            self.assertEqual(stale.exception.code, 409)
+            rebuilt = self.request_json("/api/embedding-index/rebuild", {"confirm_document_count": 0}, self.token)
+            self.assertEqual(rebuilt["document_count"], 0)
+            self.assertIsNone(self.request_json("/api/embedding-index/run", {}, self.token)["job"])
 
     def test_api_security_headers_and_cross_origin_write_are_rejected(self):
         request = urllib.request.Request(f"{self.base_url}/api/health")
@@ -303,6 +358,12 @@ class AgentPlatformApiTests(unittest.TestCase):
 
     def test_personal_data_export_requires_confirmation_and_excludes_credentials(self):
         thread = self.request_json("/api/threads", {"title": "导出测试"}, self.token)["thread"]
+        self.request_json(
+            "/api/knowledge-configuration/preferences",
+            {"retrieval_profile": "precise", "default_scope": "general"},
+            self.token,
+            method="PATCH",
+        )
         with app.db() as conn:
             conn.execute(
                 "INSERT INTO messages (id, thread_id, run_id, role, content, created_at) VALUES (?, ?, '', 'user', ?, ?)",
@@ -319,6 +380,12 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(content_type, "application/json")
         self.assertEqual(exported["format"], "agent-platform-personal-data-export/v1")
         self.assertIn("需要保留的对话内容", [item["content"] for item in exported["messages"]])
+        self.assertEqual(exported["knowledge_preferences"][0]["retrieval_profile"], "precise")
+        self.assertEqual(
+            exported["knowledge_configuration_event_index"][0]["configuration_area"],
+            "user_preferences",
+        )
+        self.assertNotIn("precise", exported["knowledge_configuration_event_index"][0]["changed_fields_json"])
         self.assertIn("password_hash", exported["exclusions"])
         events = self.request_json("/api/security-events", token=self.token)["events"]
         self.assertTrue(any(item["event_type"] == "personal_data_export" for item in events))
@@ -414,6 +481,9 @@ class AgentPlatformApiTests(unittest.TestCase):
             conn.execute("INSERT INTO knowledge_documents (id, user_id, filename, storage_path, mime_type, content_hash, size_bytes, chunk_count, created_at, created_by_user_id) VALUES ('delete_doc', ?, 'source.md', ?, 'text/markdown', 'hash', 1, 1, ?, ?)", (user_id, str(knowledge_file), app.now(), user_id))
             conn.execute("INSERT INTO artifacts (id, user_id, run_id, filename, kind, storage_path, created_at) VALUES ('delete_artifact', ?, 'delete_run', 'answer.md', 'markdown', ?, ?)", (user_id, str(artifact_file), app.now()))
             conn.execute("INSERT INTO account_deletion_requests (user_id, status, requested_at, scheduled_for, cancelled_at) VALUES (?, 'scheduled', 0, 0, 0)", (user_id,))
+        app.KNOWLEDGE_CONFIGURATION_SERVICE.update_preferences(
+            user_id, {"retrieval_profile": "high_recall"}
+        )
         preview = delete_due_accounts(app.DB_PATH, data_dir, execute=False, current_ns=1)
         self.assertTrue(preview["dry_run"])
         self.assertEqual(preview["planned"][0]["user_id"], user_id)
@@ -425,6 +495,86 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertFalse(artifact_file.exists())
         with app.db() as conn:
             self.assertIsNone(conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone())
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM user_knowledge_preferences WHERE user_id = ?", (user_id,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM knowledge_configuration_events WHERE actor_user_id = ?", (user_id,)).fetchone()[0], 0)
+
+    def test_p52_1_configuration_read_model_preferences_and_isolation(self):
+        administrator = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]
+        self.assertEqual(administrator["role"], "platform_admin")
+        self.assertEqual(administrator["user_preferences"]["retrieval_profile"], "balanced")
+        self.assertEqual(administrator["user_preferences"]["version"], 0)
+        self.assertTrue(administrator["migrations"]["visible"])
+        self.assertFalse(administrator["security"]["secret_values_exposed"])
+        self.assertTrue(administrator["retrieval"]["active_config"])
+
+        invitation = app.create_trial_invitation("configuration-user@example.com", 600)
+        member = self.request_json("/api/trial-invitations/accept", {
+            "token": invitation,
+            "email": "configuration-user@example.com",
+            "name": "配置用户",
+            "password": "a-strong-password",
+        })
+        ordinary = self.request_json(
+            "/api/knowledge-configuration", token=member["token"]
+        )["configuration"]
+        self.assertEqual(ordinary["role"], "user")
+        self.assertFalse(ordinary["migrations"]["visible"])
+        self.assertNotIn(
+            "retrieval_policy",
+            {item["capability_id"] for item in ordinary["capabilities"]},
+        )
+        user_profile_capability = next(
+            item for item in ordinary["capabilities"]
+            if item["capability_id"] == "user_retrieval_profile"
+        )
+        self.assertEqual(user_profile_capability["surfaces"], ["ui", "api"])
+        self.assertIn("user", user_profile_capability["writable_roles"])
+
+        updated = self.request_json(
+            "/api/knowledge-configuration/preferences",
+            {
+                "retrieval_profile": "high_recall",
+                "default_scope": "general",
+                "default_upload_preset": "long_document",
+            },
+            member["token"],
+            method="PATCH",
+        )
+        self.assertEqual(updated["preferences"]["version"], 1)
+        self.assertEqual(updated["change"]["before_version"], "user-preferences-v0")
+        self.assertEqual(updated["change"]["after_version"], "user-preferences-v1")
+        self.assertEqual(updated["change"]["source"], "user_preference")
+        self.assertEqual(updated["change"]["impact_scope"], "future_user_defaults")
+
+        unchanged = self.request_json(
+            "/api/knowledge-configuration/preferences",
+            {"retrieval_profile": "high_recall"},
+            member["token"],
+            method="PATCH",
+        )
+        self.assertEqual(unchanged["preferences"]["version"], 1)
+        self.assertEqual(unchanged["change"]["changed_fields"], [])
+        self.assertEqual(
+            self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]["user_preferences"]["version"],
+            0,
+        )
+        with app.db() as conn:
+            events = conn.execute(
+                "SELECT changed_fields_json FROM knowledge_configuration_events WHERE actor_user_id = ?",
+                (member["user"]["id"],),
+            ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("high_recall", events[0]["changed_fields_json"])
+
+        request = urllib.request.Request(
+            f"{self.base_url}/api/knowledge-configuration/preferences",
+            data=json.dumps({"unknown": True}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {member['token']}"},
+            method="PATCH",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(error.exception.code, 400)
 
     def test_models_expose_provider_neutral_capabilities(self):
         result = self.request_json("/api/models", token=self.token)
@@ -1343,6 +1493,54 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(required_context["execution_modes"]["web"], "off")
         self.assertIn(required_context["knowledge_route"], {"retrieved", "required_no_match"})
 
+    def test_p52_user_defaults_and_request_override_are_frozen_per_run(self):
+        saved = self.request_json(
+            "/api/knowledge-configuration/preferences",
+            {"retrieval_profile": "high_recall", "default_scope": "general"},
+            self.token,
+            method="PATCH",
+        )["preferences"]
+        self.assertEqual(saved["retrieval_profile"], "high_recall")
+        events = self.chat({
+            "thread_id": "", "content": "整理一个简单的发布检查清单",
+            "knowledge_mode": "off", "retrieval_profile": "precise",
+            "knowledge_scope": "current_project",
+        })
+        thread_id = next(event["data"]["thread_id"] for event in events if event["event"] == "meta")
+        run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
+        context = json.loads(run["execution_context"])
+        frozen = context["knowledge_configuration"]
+        self.assertEqual(frozen["retrieval_profile"], "precise")
+        self.assertEqual(frozen["retrieval_profile_source"], "request_override")
+        self.assertEqual(frozen["requested_scope"], "current_project")
+        self.assertEqual(frozen["effective_scope"], "general")
+        self.assertEqual(frozen["scope_fallback_reason"], "current_project_unavailable")
+        self.assertTrue(frozen["global_policy_version"])
+        self.assertEqual(context["knowledge_refs"], [])
+        current = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]["user_preferences"]
+        self.assertEqual(current["retrieval_profile"], "high_recall")
+        self.assertEqual(current["default_scope"], "general")
+
+    def test_p52_current_project_scope_uses_existing_acl_without_accepting_project_ids(self):
+        space = self.request_json("/api/folders", {"name": "P52 项目", "section": "project"}, self.token)["folder"]
+        document = self.request_json(f"/api/folders/{space['id']}/knowledge", {
+            "filename": "p52-project.md", "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("P52项目口令是ProjectScopeOnly。".encode("utf-8")).decode("ascii"),
+        }, self.token)["document"]
+        thread = self.request_json("/api/threads", {"title": "P52 范围", "folder_id": space["id"]}, self.token)["thread"]
+        project_preview = self.request_json("/api/route-preview", {
+            "thread_id": thread["id"], "content": "P52项目口令是什么？", "knowledge_mode": "required",
+            "knowledge_scope": "current_project",
+        }, self.token)
+        self.assertEqual(project_preview["knowledge_configuration"]["effective_scope"], "current_project")
+        self.assertGreater(project_preview["knowledge_matches"], 0)
+        general_preview = self.request_json("/api/route-preview", {
+            "thread_id": thread["id"], "content": "P52项目口令是什么？", "knowledge_mode": "required",
+            "knowledge_scope": "general", "project_space_id": document["project_space_id"],
+        }, self.token)
+        self.assertEqual(general_preview["knowledge_configuration"]["effective_scope"], "general")
+        self.assertEqual(general_preview["knowledge_matches"], 0)
+
     def test_invalid_execution_mode_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as invalid:
             self.request_json("/api/chat", {"thread_id": "", "content": "测试", "web_mode": "always"}, self.token)
@@ -1718,6 +1916,26 @@ class AgentPlatformApiTests(unittest.TestCase):
         finally:
             app.KNOWLEDGE_EMBEDDING_SERVICE = original_service
 
+    def test_p52_upload_uses_user_default_and_request_override_without_rewriting_preference(self):
+        self.request_json(
+            "/api/knowledge-configuration/preferences",
+            {"default_upload_preset": "long_document"},
+            self.token,
+            method="PATCH",
+        )
+        common = {
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("# P52\n\n验证上传预设。".encode("utf-8")).decode("ascii"),
+        }
+        default_upload = self.request_json("/api/knowledge", {**common, "filename": "p52-default.md"}, self.token)
+        override_upload = self.request_json("/api/knowledge", {
+            **common, "filename": "p52-override.md", "chunk_preset": "table_dense",
+        }, self.token)
+        self.assertEqual(default_upload["document"]["chunk_preset"], "long_document")
+        self.assertEqual(override_upload["document"]["chunk_preset"], "table_dense")
+        preferences = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]["user_preferences"]
+        self.assertEqual(preferences["default_upload_preset"], "long_document")
+
     def test_local_knowledge_upload_retrieval_citation_and_delete(self):
         source = "# 产品资料\n\n北极星指标是每周完成首次核心任务的活跃用户数。"
         uploaded = self.request_json(
@@ -1852,6 +2070,8 @@ class AgentPlatformApiTests(unittest.TestCase):
         run = self.request_json(f"/api/threads/{thread_id}/runs", token=self.token)["runs"][0]
         context = json.loads(run["execution_context"])
         self.assertEqual(context["knowledge_refs"][0]["filename"], "product.md")
+        primary_excerpt = context["knowledge_refs"][0]["primary_excerpt"]
+        self.assertIn("北极星指标", primary_excerpt)
         self.assertEqual(context["knowledge_route"], "retrieved")
         self.assertEqual(context["knowledge_match_count"], 1)
         self.assertEqual(context["retrieval_policy"]["version"], "hybrid-rrf-v1")
@@ -1865,6 +2085,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         thread_context = self.request_json(f"/api/threads/{thread_id}/context", token=self.token)
         self.assertEqual(thread_context["sources"][0]["filename"], "product.md")
         self.assertEqual(thread_context["sources"][0]["position"], 0)
+        self.assertEqual(thread_context["sources"][0]["highlight_excerpt"], primary_excerpt)
 
         feedback = self.request_json(
             f"/api/runs/{run['id']}/feedback",
@@ -1895,6 +2116,7 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(run_detail["citation_feedback_items"][0]["position"], citation_item["position"])
         self.assertEqual(run_detail["knowledge_sources"][0]["document_id"], document_id)
         self.assertEqual(run_detail["knowledge_sources"][0]["kind"], "markdown")
+        self.assertEqual(run_detail["knowledge_sources"][0]["highlight_excerpt"], primary_excerpt)
         metrics = self.request_json("/api/metrics", token=self.token)
         self.assertEqual(metrics["feedback"]["document_citation_accuracy"], 0.0)
         self.assertFalse(metrics["feedback"]["sufficient_for_retrieval_claim"])
@@ -2054,10 +2276,14 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(suggestion_data["evidence"]["document_feedback_count"], 20)
         suggestions = suggestion_data["suggestions"]
         self.assertEqual(suggestions[0]["changed_variable"], "limit")
-        candidate = self.request_json(f"/api/retrieval-suggestions/{suggestions[0]['id']}/candidate", {}, self.token)["policy"]
+        candidate_response = self.request_json(f"/api/retrieval-suggestions/{suggestions[0]['id']}/candidate", {}, self.token)
+        candidate = candidate_response["policy"]
         self.assertEqual(candidate["config"]["limit"], 5)
+        self.assertEqual(candidate_response["change"]["before_version"], "hybrid-rrf-v1")
+        self.assertEqual(candidate_response["change"]["after_version"], candidate["version"])
         evaluated = self.request_json(f"/api/retrieval-policies/{candidate['version']}/evaluate", {}, self.token)
         self.assertEqual(evaluated["status"], "verified")
+        self.assertEqual(evaluated["change"]["after_version"], f"{candidate['version']}:verified")
         with app.db() as conn:
             conn.execute("""INSERT INTO retrieval_policies
                 (version, config_json, status, parent_version, changed_variable, created_at)
@@ -2067,8 +2293,10 @@ class AgentPlatformApiTests(unittest.TestCase):
         self.assertEqual(blocked["experiment"]["decision"], "rollback")
         published = self.request_json(f"/api/retrieval-policies/{candidate['version']}/publish", {}, self.token)
         self.assertEqual(published["active"]["version"], candidate["version"])
+        self.assertEqual(published["change"]["impact_scope"], "global_active")
         rolled_back = self.request_json("/api/retrieval-policies/rollback", {}, self.token)
         self.assertEqual(rolled_back["active"]["version"], "hybrid-rrf-v1")
+        self.assertEqual(rolled_back["change"]["before_version"], candidate["version"])
 
     def test_p51_7_presets_roles_custom_candidate_and_retrieval_lab(self):
         invitation = app.create_trial_invitation("knowledge-admin@example.com", 600)
@@ -2104,6 +2332,15 @@ class AgentPlatformApiTests(unittest.TestCase):
                 "UPDATE users SET is_knowledge_admin = 1 WHERE id = ?",
                 (member["user"]["id"],),
             )
+        knowledge_admin_configuration = self.request_json(
+            "/api/knowledge-configuration", token=member["token"]
+        )["configuration"]
+        retrieval_capability = next(
+            item for item in knowledge_admin_configuration["capabilities"]
+            if item["capability_id"] == "retrieval_policy"
+        )
+        self.assertEqual(retrieval_capability["writable_roles"], ["platform_admin"])
+        self.assertEqual(knowledge_admin_configuration["retrieval"]["active_config"], {})
         updated = self.request_json(
             "/api/knowledge-presets/standard",
             {
@@ -2116,6 +2353,10 @@ class AgentPlatformApiTests(unittest.TestCase):
             method="PATCH",
         )
         self.assertEqual(updated["preset"]["revision"], 2)
+        self.assertEqual(updated["change"]["before_version"], "standard-r1")
+        self.assertEqual(updated["change"]["after_version"], "standard-r2")
+        self.assertEqual(updated["change"]["source"], "processing_preset")
+        self.assertEqual(updated["change"]["impact_scope"], "future_document_versions")
 
         active = self.request_json("/api/retrieval-policies", token=self.token)["active"]
         candidate_config = dict(active["config"])
@@ -2166,6 +2407,197 @@ class AgentPlatformApiTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(stored["query_sha256"], app.query_sha256("Atlas 发布审批负责人"))
         self.assertNotIn("Atlas", stored["summary_json"])
+        policy_snapshot = self.request_json("/api/retrieval-policies", token=self.token)
+        history = next(item for item in policy_snapshot["lab_experiments"] if item["id"] == lab["experiment_id"])
+        self.assertNotIn("query", history)
+        self.assertNotIn("summary_json", history)
+        self.assertEqual(history["summary"]["left_result_count"], lab["left"]["result_count"])
+        with self.assertRaises(urllib.error.HTTPError) as invalid_scope:
+            self.request_json("/api/retrieval-lab/compare", {
+                "query": "Atlas", "left_version": active["version"],
+                "right_version": candidate["version"],
+                "project_space_id": "missing-space", "include_all_projects": True,
+            }, self.token)
+        self.assertEqual(invalid_scope.exception.code, 400)
+
+    def test_p52_7_migration_configuration_single_active_and_explicit_retry(self):
+        uploaded = self.request_json("/api/knowledge", {
+            "filename": "p52-legacy.md", "mime_type": "text/markdown",
+            "content_base64": base64.b64encode("# 旧资料\n迁移失败后应显式重试。".encode()).decode(),
+        }, self.token)["document"]
+        with app.db() as conn:
+            conn.execute(
+                """UPDATE knowledge_documents SET document_ir_version = 0,
+                          parser_version = '', chunk_policy_version = 'fixed-char-v1'
+                   WHERE id = ?""",
+                (uploaded["id"],),
+            )
+        initial = self.request_json("/api/knowledge-migrations", token=self.token)
+        self.assertTrue(initial["can_create_batch"])
+        self.assertEqual(initial["limits"], {"minimum": 1, "maximum": 50, "default": 10})
+        self.assertEqual([item["id"] for item in initial["presets"]], ["standard", "long_document", "table_dense"])
+        self.assertIn("partial", initial["state_machine"])
+        batch = self.request_json("/api/knowledge-migrations/batches", {
+            "preset": "long_document", "limit": 1,
+        }, self.token)["batch"]
+        with app.db() as conn:
+            item = conn.execute(
+                "SELECT id FROM knowledge_migration_items WHERE batch_id = ?",
+                (batch["id"],),
+            ).fetchone()
+            conn.execute(
+                "UPDATE knowledge_migration_items SET status = 'failed', error_message = ? WHERE id = ?",
+                ("provider endpoint=https://secret.example token=private", item["id"]),
+            )
+            conn.execute(
+                "UPDATE knowledge_migration_batches SET status = 'partial', failed_count = 1 WHERE id = ?",
+                (batch["id"],),
+            )
+        active = self.request_json("/api/knowledge-migrations", token=self.token)
+        self.assertFalse(active["can_create_batch"])
+        self.assertEqual(active["active_batch_id"], batch["id"])
+        error_message = active["batches"][0]["items"][0]["error_message"]
+        self.assertNotIn("secret.example", error_message)
+        self.assertNotIn("private", error_message)
+        with self.assertRaises(urllib.error.HTTPError) as duplicate:
+            self.request_json("/api/knowledge-migrations/batches", {
+                "preset": "standard", "limit": 1,
+            }, self.token)
+        self.assertEqual(duplicate.exception.code, 409)
+        retried = self.request_json(
+            f"/api/knowledge-migrations/{batch['id']}/retry",
+            {"item_id": item["id"]}, self.token,
+        )
+        self.assertEqual(retried["status"], "queued")
+        with app.db() as conn:
+            queued = conn.execute(
+                "SELECT status, error_message FROM knowledge_migration_items WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["error_message"], "")
+        with self.assertRaises(urllib.error.HTTPError) as duplicate_retry:
+            self.request_json(
+                f"/api/knowledge-migrations/{batch['id']}/retry",
+                {"item_id": item["id"]}, self.token,
+            )
+        self.assertEqual(duplicate_retry.exception.code, 409)
+
+    def test_p52_4_preset_revisions_document_reprocessing_and_bounded_batch(self):
+        document = self.request_json("/api/knowledge", {
+            "filename": "p52-reprocess.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(
+                "# 发布流程\n\nAtlas 发布审批由产品负责人签字。\n\n签字后进入部署窗口。".encode()
+            ).decode(),
+        }, self.token)["document"]
+        document_id = document["id"]
+        configuration = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]
+        self.assertEqual(configuration["processing"]["ranges"]["target_tokens"], {"min": 200, "max": 1800})
+        self.assertTrue(configuration["processing"]["runtime"]["read_only"])
+
+        invalid = urllib.request.Request(
+            f"{self.base_url}/api/knowledge-presets/standard",
+            data=json.dumps({
+                "parser_profile": "structure_preserving",
+                "chunk_config": {"target_tokens": 900, "max_tokens": 800, "overlap_tokens": 50},
+            }).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"},
+            method="PATCH",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as invalid_error:
+            urllib.request.urlopen(invalid, timeout=3)
+        self.assertEqual(invalid_error.exception.code, 400)
+        updated = self.request_json("/api/knowledge-presets/standard", {
+            "parser_profile": "structure_preserving",
+            "chunk_config": {"target_tokens": 610, "max_tokens": 900, "overlap_tokens": 120},
+        }, self.token, method="PATCH")["preset"]
+        self.assertEqual(updated["revision"], 2)
+        refreshed = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]
+        standard = next(item for item in refreshed["processing"]["presets"] if item["id"] == "standard")
+        self.assertEqual([item["revision"] for item in standard["revisions"][:2]], [2, 1])
+
+        reindex = self.request_json(f"/api/knowledge/{document_id}/reprocess", {
+            "mode": "reindex", "preset": "standard",
+        }, self.token)
+        self.assertEqual(reindex["active_chunk_version"], 1)
+        rechunk = self.request_json(f"/api/knowledge/{document_id}/reprocess", {
+            "mode": "rechunk", "preset": "long_document",
+        }, self.token)
+        self.assertEqual(rechunk["active_chunk_version"], 2)
+        chunks = self.request_json(f"/api/knowledge/{document_id}/chunks", token=self.token)
+        self.assertEqual(chunks["versions"][0]["status"], "active")
+        self.assertEqual(chunks["versions"][1]["status"], "archived")
+        self.request_json(f"/api/knowledge/{document_id}/chunk-rollback", {"version": 1}, self.token)
+        reparsed = self.request_json(f"/api/knowledge/{document_id}/reprocess", {
+            "mode": "reparse", "preset": "standard",
+        }, self.token)
+        self.assertEqual(reparsed["active_chunk_version"], 3)
+        history = self.request_json(f"/api/knowledge/{document_id}/processing", token=self.token)["runs"]
+        self.assertEqual([run["trigger_type"] for run in history[:3]], ["reparse", "rechunk", "reindex"])
+
+        batch = self.request_json("/api/knowledge-reprocessing/batches", {
+            "mode": "reindex", "preset": "standard", "document_ids": [document_id],
+        }, self.token)["batch"]
+        processed = self.request_json(
+            f"/api/knowledge-reprocessing/{batch['id']}/run", {}, self.token
+        )
+        self.assertEqual(processed["processed_item"]["status"], "succeeded")
+        self.assertEqual(processed["batch"]["status"], "completed")
+        listed = self.request_json("/api/knowledge-reprocessing/batches", token=self.token)["batches"]
+        self.assertEqual(listed[0]["items"][0]["attempts"], 1)
+
+    def test_p52_5_retrieval_governance_read_model_gates_publish_and_stale_parent(self):
+        configuration = self.request_json("/api/knowledge-configuration", token=self.token)["configuration"]
+        self.assertEqual(configuration["retrieval"]["ranges"]["candidate_limit"], {"min": 8, "max": 200})
+        self.assertEqual(configuration["retrieval"]["fts_weights"], {
+            "filename": 5.0, "heading": 3.0, "content": 1.0, "tag": 1.5,
+            "read_only": True, "policy_version": "fts5-bm25-v1",
+        })
+        governance = self.request_json("/api/retrieval-policies", token=self.token)
+        self.assertEqual(governance["active"]["version"], "hybrid-rrf-v1")
+        self.assertEqual(governance["ranges"]["vector_min_score"], {"min": 0.5, "max": 0.95})
+        self.assertTrue(governance["fts_weights"]["read_only"])
+
+        active_config = dict(governance["active"]["config"])
+        with self.assertRaises(urllib.error.HTTPError) as invalid_relation:
+            self.request_json("/api/retrieval-policies/candidates", {
+                "config": {**active_config, "max_excerpt_chars": 3000, "max_total_chars": 2000},
+            }, self.token)
+        self.assertEqual(invalid_relation.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as unchanged:
+            self.request_json("/api/retrieval-policies/candidates", {"config": active_config}, self.token)
+        self.assertEqual(unchanged.exception.code, 400)
+
+        first = self.request_json("/api/retrieval-policies/candidates", {
+            "config": {**active_config, "candidate_limit": active_config["candidate_limit"] + 1},
+        }, self.token)["policy"]
+        second = self.request_json("/api/retrieval-policies/candidates", {
+            "config": {**active_config, "rrf_k": active_config["rrf_k"] + 1},
+        }, self.token)["policy"]
+        with self.assertRaises(urllib.error.HTTPError) as unverified:
+            self.request_json(f"/api/retrieval-policies/{first['version']}/publish", {}, self.token)
+        self.assertEqual(unverified.exception.code, 409)
+        self.assertEqual(
+            self.request_json(f"/api/retrieval-policies/{first['version']}/evaluate", {}, self.token)["status"],
+            "verified",
+        )
+        self.assertEqual(
+            self.request_json(f"/api/retrieval-policies/{second['version']}/evaluate", {}, self.token)["status"],
+            "verified",
+        )
+        published = self.request_json(f"/api/retrieval-policies/{first['version']}/publish", {}, self.token)
+        self.assertEqual(published["active"]["version"], first["version"])
+        with self.assertRaises(urllib.error.HTTPError) as stale:
+            self.request_json(f"/api/retrieval-policies/{second['version']}/publish", {}, self.token)
+        self.assertEqual(stale.exception.code, 409)
+        error_body = json.loads(stale.exception.read().decode())
+        self.assertIn("父版本", error_body["error"])
+        timeline = self.request_json("/api/retrieval-policies", token=self.token)
+        self.assertTrue(any(event["event_type"] == "candidate_evaluated" for event in timeline["events"]))
+        self.assertNotIn("detail_json", timeline["events"][0])
+        rolled_back = self.request_json("/api/retrieval-policies/rollback", {}, self.token)
+        self.assertEqual(rolled_back["active"]["version"], "hybrid-rrf-v1")
 
     def test_p51_8_history_migration_shadow_canary_and_rollback(self):
         uploaded = self.request_json("/api/knowledge", {

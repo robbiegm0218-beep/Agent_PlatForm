@@ -1,0 +1,497 @@
+{
+  "configuration_contract": {
+    "capabilities": [
+      {
+        "area": "user",
+        "capability_id": "conversation_sources",
+        "effect_scope": "run",
+        "fields": [
+          "source_mode",
+          "knowledge_mode",
+          "file_mode"
+        ],
+        "label": "对话资料来源",
+        "note": "",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "request_override",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "user",
+        "capability_id": "knowledge_scope",
+        "effect_scope": "document_and_run",
+        "fields": [
+          "scope",
+          "project_space_id",
+          "include_all_projects"
+        ],
+        "label": "通用库与项目范围",
+        "note": "",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "request_override",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "user",
+        "capability_id": "user_retrieval_profile",
+        "effect_scope": "future_user_defaults_and_run",
+        "fields": [
+          "retrieval_profile"
+        ],
+        "label": "用户检索预设",
+        "note": "默认值约束后续 Run；请求覆盖只影响当前 Run。",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "user_preference",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "processing",
+        "capability_id": "upload_chunk_preset",
+        "effect_scope": "document_version",
+        "fields": [
+          "chunk_preset"
+        ],
+        "label": "上传默认切分预设",
+        "note": "用户默认值用于后续上传；上传弹窗可做本次覆盖。",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "user_preference",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "processing",
+        "capability_id": "processing_presets",
+        "effect_scope": "future_document_versions",
+        "fields": [
+          "parser_profile",
+          "target_tokens",
+          "max_tokens",
+          "overlap_tokens"
+        ],
+        "label": "知识处理预设",
+        "note": "配置中心支持解析模式和 Token 切分边界的修订治理。",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "processing_preset",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "processing",
+        "capability_id": "document_rechunk",
+        "effect_scope": "document_version",
+        "fields": [
+          "preset",
+          "chunk_version"
+        ],
+        "label": "文档重新切分与回滚",
+        "note": "",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "processing_preset",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "retrieval",
+        "capability_id": "retrieval_policy",
+        "effect_scope": "global_candidate",
+        "fields": [
+          "limit",
+          "max_excerpt_chars",
+          "max_total_chars",
+          "neighbor_radius",
+          "vector_min_score",
+          "rrf_k",
+          "candidate_limit",
+          "hybrid_enabled",
+          "rewrite_enabled"
+        ],
+        "label": "全局检索策略",
+        "note": "配置中心创建候选；评测通过后才能发布或回滚。",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "retrieval_policy",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "retrieval",
+        "capability_id": "retrieval_lab",
+        "effect_scope": "offline_experiment",
+        "fields": [
+          "left_version",
+          "right_version",
+          "project_space_id",
+          "include_all_projects"
+        ],
+        "label": "双策略检索实验",
+        "note": "",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "retrieval_policy",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "index",
+        "capability_id": "embedding_runtime",
+        "effect_scope": "process_restart",
+        "fields": [
+          "provider",
+          "model",
+          "dimensions",
+          "timeout_seconds",
+          "configured"
+        ],
+        "label": "Embedding 运行配置",
+        "note": "服务地址和密钥不进入配置快照。",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "environment",
+        "surfaces": [
+          "environment"
+        ],
+        "writable_roles": []
+      },
+      {
+        "area": "index",
+        "capability_id": "embedding_jobs",
+        "effect_scope": "background_jobs",
+        "fields": [
+          "rebuild",
+          "process_next",
+          "model_version"
+        ],
+        "label": "向量索引任务",
+        "note": "",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "runtime_status",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "migration",
+        "capability_id": "historical_migration",
+        "effect_scope": "migration_batch",
+        "fields": [
+          "preset",
+          "limit",
+          "rollout_percentage",
+          "rollback"
+        ],
+        "label": "历史资料迁移与灰度",
+        "note": "单活动批次按暂存、Shadow 门禁、灰度、全量与回滚状态推进；失败项需显式重试。",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "processing_preset",
+        "surfaces": [
+          "ui",
+          "api"
+        ],
+        "writable_roles": [
+          "platform_admin"
+        ]
+      },
+      {
+        "area": "security",
+        "capability_id": "safety_limits",
+        "effect_scope": "process_restart",
+        "fields": [
+          "upload_bytes",
+          "archive_files",
+          "archive_bytes",
+          "extracted_chars",
+          "pdf_pages"
+        ],
+        "label": "知识文件安全限制",
+        "note": "",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "environment",
+        "surfaces": [
+          "environment",
+          "fixed_read_only"
+        ],
+        "writable_roles": []
+      },
+      {
+        "area": "retrieval",
+        "capability_id": "fts_field_weights",
+        "effect_scope": "global_fixed",
+        "fields": [
+          "filename_weight",
+          "heading_weight",
+          "content_weight",
+          "tag_weight"
+        ],
+        "label": "FTS/BM25 字段权重",
+        "note": "",
+        "readable_roles": [
+          "platform_admin"
+        ],
+        "source": "code_boundary",
+        "surfaces": [
+          "fixed_read_only"
+        ],
+        "writable_roles": []
+      },
+      {
+        "area": "processing",
+        "capability_id": "ocr_and_table_runtime",
+        "effect_scope": "runtime_capability",
+        "fields": [
+          "ocr_engine",
+          "ocr_languages",
+          "table_parser"
+        ],
+        "label": "OCR 与表格解析能力",
+        "note": "",
+        "readable_roles": [
+          "user",
+          "knowledge_admin",
+          "platform_admin"
+        ],
+        "source": "code_boundary",
+        "surfaces": [
+          "fixed_read_only"
+        ],
+        "writable_roles": []
+      }
+    ],
+    "content_safety": {
+      "absolute_paths_exposed": false,
+      "query_or_knowledge_content_exposed": false,
+      "secret_values_exposed": false
+    },
+    "processing_preset_defaults": {
+      "long_document": {
+        "max_tokens": 1400,
+        "overlap_tokens": 150,
+        "parser_profile": "structure_preserving",
+        "target_tokens": 900
+      },
+      "standard": {
+        "max_tokens": 900,
+        "overlap_tokens": 120,
+        "parser_profile": "structure_preserving",
+        "target_tokens": 600
+      },
+      "table_dense": {
+        "max_tokens": 700,
+        "overlap_tokens": 60,
+        "parser_profile": "structure_preserving",
+        "target_tokens": 420
+      }
+    },
+    "retrieval_policy_baseline": {
+      "candidate_limit": 64,
+      "hybrid_enabled": true,
+      "limit": 4,
+      "max_excerpt_chars": 900,
+      "max_total_chars": 2800,
+      "neighbor_radius": 1,
+      "rewrite_enabled": true,
+      "rrf_k": 60,
+      "vector_min_score": 0.72
+    },
+    "retrieval_policy_ranges": {
+      "candidate_limit": [
+        8,
+        200
+      ],
+      "limit": [
+        1,
+        20
+      ],
+      "max_excerpt_chars": [
+        100,
+        4000
+      ],
+      "max_total_chars": [
+        500,
+        16000
+      ],
+      "neighbor_radius": [
+        0,
+        3
+      ],
+      "rrf_k": [
+        10,
+        200
+      ],
+      "vector_min_score": [
+        0.5,
+        0.95
+      ]
+    },
+    "roles": [
+      "user",
+      "knowledge_admin",
+      "platform_admin"
+    ],
+    "schema_version": 1,
+    "sources": [
+      "request_override",
+      "user_preference",
+      "processing_preset",
+      "retrieval_policy",
+      "runtime_status",
+      "environment",
+      "code_boundary"
+    ],
+    "surfaces": [
+      "ui",
+      "partial_ui",
+      "api",
+      "environment",
+      "fixed_read_only"
+    ],
+    "user_retrieval_profiles": {
+      "balanced": {
+        "candidate_limit": 64,
+        "hybrid_enabled": true,
+        "limit": 4,
+        "max_excerpt_chars": 900,
+        "max_total_chars": 2800,
+        "neighbor_radius": 1,
+        "rewrite_enabled": true,
+        "rrf_k": 60,
+        "vector_min_score": 0.72
+      },
+      "high_recall": {
+        "candidate_limit": 96,
+        "hybrid_enabled": true,
+        "limit": 6,
+        "max_excerpt_chars": 1100,
+        "max_total_chars": 4200,
+        "neighbor_radius": 1,
+        "rewrite_enabled": true,
+        "rrf_k": 60,
+        "vector_min_score": 0.72
+      },
+      "precise": {
+        "candidate_limit": 32,
+        "hybrid_enabled": true,
+        "limit": 3,
+        "max_excerpt_chars": 700,
+        "max_total_chars": 2200,
+        "neighbor_radius": 0,
+        "rewrite_enabled": false,
+        "rrf_k": 60,
+        "vector_min_score": 0.78
+      }
+    }
+  },
+  "contract_sha256": "ea63c64c3d0be87382c1ef95f4f1ace13f1875feaab9359c662e2fc1377a27fa",
+  "failures": [],
+  "hybrid_targeted_gates": {
+    "baseline_negative_accuracy_preserved": true,
+    "baseline_recall_preserved": true,
+    "baseline_top1_preserved": true,
+    "low_vector_not_forced": true,
+    "named_anchor_blocks_implicit_injection": true,
+    "neighbor_expansion": true,
+    "rewrite_preserves_anchors": true,
+    "rrf_shared_candidate_first": true,
+    "semantic_synonym_recalled": true
+  },
+  "phase": "P52-8",
+  "production_behavior_changed": true,
+  "retrieval_baseline": {
+    "cases": 20,
+    "neighbor_accuracy": 1.0,
+    "no_match_accuracy": 1.0,
+    "recall_at_4": 1.0,
+    "top1_accuracy": 1.0
+  },
+  "schema_version": 1
+}

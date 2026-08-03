@@ -84,7 +84,7 @@ window.AgentKnowledgeLibrary = {
     els.knowledgeProcessingList.appendChild(layout);
     els.knowledgeProcessingPanel.classList.remove("hidden");
   },
-  renderChunks(els, data, escape, { onRechunk, onRollback }) {
+  renderChunks(els, data, escape, { onRechunk, onReprocess, onRollback }) {
     const document = data.document || {};
     const chunks = Array.isArray(data.chunks) ? data.chunks : [];
     const versions = Array.isArray(data.versions) ? data.versions : [];
@@ -95,8 +95,10 @@ window.AgentKnowledgeLibrary = {
     const presetLabels = { standard: "标准", long_document: "长文档", table_dense: "表格密集" };
     const options = (data.presets || []).map((preset) => `<option value="${escape(preset.id)}"${preset.id === document.chunk_preset ? " selected" : ""}>${escape(presetLabels[preset.id] || preset.id)} · ${preset.target_tokens}/${preset.max_tokens} Token</option>`).join("");
     const archived = versions.filter((version) => version.status === "archived");
-    toolbar.innerHTML = `<div><strong>活动版本 v${document.active_chunk_version || 1}</strong><span>${escape(document.chunk_policy_version || "fixed-char-v1")} · ${escape(presetLabels[document.chunk_preset] || document.chunk_preset || "标准")}</span></div>${data.manageable && data.structure_available ? `<label>重新切分<select class="knowledge-chunk-preset">${options}</select></label><button class="knowledge-rechunk" type="button">生成并切换</button>` : ""}${data.manageable && archived.length ? `<label>历史版本<select class="knowledge-chunk-version">${archived.map((version) => `<option value="${version.version}">v${version.version} · ${escape(presetLabels[version.preset] || version.preset)} · ${version.chunk_count} 片段</option>`).join("")}</select></label><button class="knowledge-chunk-rollback" type="button">回滚</button>` : ""}`;
+    toolbar.innerHTML = `<div><strong>活动版本 v${document.active_chunk_version || 1}</strong><span>${escape(document.chunk_policy_version || "fixed-char-v1")} · ${escape(presetLabels[document.chunk_preset] || document.chunk_preset || "标准")}</span></div>${data.manageable ? `<label>处理预设<select class="knowledge-chunk-preset">${options}</select></label><button class="knowledge-reparse" type="button">重新解析</button>${data.structure_available ? `<button class="knowledge-rechunk" type="button">重新切分</button>` : ""}<button class="knowledge-reindex" type="button">重建索引</button>` : ""}${data.manageable && archived.length ? `<label>历史版本<select class="knowledge-chunk-version">${archived.map((version) => `<option value="${version.version}">v${version.version} · ${escape(presetLabels[version.preset] || version.preset)} · ${version.chunk_count} 片段</option>`).join("")}</select></label><button class="knowledge-chunk-rollback" type="button">回滚</button>` : ""}`;
     toolbar.querySelector(".knowledge-rechunk")?.addEventListener("click", () => onRechunk(toolbar.querySelector(".knowledge-chunk-preset").value));
+    toolbar.querySelector(".knowledge-reparse")?.addEventListener("click", () => onReprocess?.("reparse", toolbar.querySelector(".knowledge-chunk-preset").value));
+    toolbar.querySelector(".knowledge-reindex")?.addEventListener("click", () => onReprocess?.("reindex", toolbar.querySelector(".knowledge-chunk-preset").value));
     toolbar.querySelector(".knowledge-chunk-rollback")?.addEventListener("click", () => onRollback(Number(toolbar.querySelector(".knowledge-chunk-version").value)));
     els.knowledgeProcessingList.appendChild(toolbar);
     const list = window.document.createElement("div");

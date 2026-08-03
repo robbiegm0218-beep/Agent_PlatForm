@@ -32,6 +32,12 @@ class ChatService:
             not isinstance(requested_skill_ids, list) or not all(isinstance(skill_id, str) for skill_id in requested_skill_ids)
         ):
             raise ValueError("技能参数无效")
+        retrieval_profile_override = str(payload.get("retrieval_profile", "default")).strip()
+        if retrieval_profile_override not in {"default", "precise", "balanced", "high_recall"}:
+            raise ValueError("本次检索预设无效")
+        knowledge_scope_override = str(payload.get("knowledge_scope", "default")).strip()
+        if knowledge_scope_override not in {"default", "auto", "general", "current_project"}:
+            raise ValueError("本次资料范围无效")
         return {
             "content": content,
             "thread_id": str(payload.get("thread_id", "")),
@@ -41,6 +47,8 @@ class ChatService:
             "requested_task_mode": requested_task_mode,
             "requested_skill_ids": requested_skill_ids,
             "execution_modes": resolve_execution_modes(payload),
+            "retrieval_profile_override": retrieval_profile_override,
+            "knowledge_scope_override": knowledge_scope_override,
         }
 
     def get_editable_thread(self, conn, thread_id: str, user_id: str):
@@ -55,20 +63,25 @@ class ChatService:
 
     def freeze_execution_context(self, conn, *, user_id: str, thread_id: str, content: str,
                                  task_profile: dict, execution_modes: dict, requested_skill_ids,
-                                 requested_active_skills, dependencies: dict):
+                                 requested_active_skills, retrieval_profile_override: str = "default",
+                                 knowledge_scope_override: str = "default", dependencies: dict):
         """Build the immutable per-run context before the Run row is created."""
         structured_context = dependencies["refresh_structured_context"](conn, thread_id)
         active_skills = requested_active_skills if requested_active_skills is not None else dependencies["enabled_skills"](user_id, thread_id)
         intent_plan = dependencies["plan_intent"](content, task_profile)
-        project_row = conn.execute("SELECT folder_id FROM threads WHERE id = ?", (thread_id,)).fetchone()
-        project_space_id = project_row["folder_id"] if project_row else ""
+        knowledge_configuration = dependencies["resolve_knowledge_configuration"](
+            conn, user_id, thread_id, retrieval_profile_override, knowledge_scope_override,
+        )
+        project_space_id = knowledge_configuration["project_space_id"]
         intent_plan, knowledge_refs, retrieval_trace = dependencies["resolve_knowledge"](
             user_id, content, intent_plan, execution_modes["knowledge"], project_space_id,
+            knowledge_configuration["retrieval_config"], knowledge_configuration["global_policy_version"],
         )
         memories = dependencies["load_memories"](conn, user_id, thread_id, content)
         execution_context = dependencies["build_execution_context"](
             user_id, task_profile, active_skills, requested_skill_ids, content, knowledge_refs, execution_modes, intent_plan,
         )
+        execution_context["knowledge_configuration"] = knowledge_configuration["snapshot"]
         execution_context["structured_context"] = dependencies["select_structured_context"](structured_context, content)
         execution_context["memories"] = memories
         execution_context["space_context"] = dependencies["load_space_context"](conn, user_id, thread_id)
@@ -89,6 +102,7 @@ class ChatService:
             knowledge_refs, retrieval_trace, evidence_ledger = assess_evidence(
                 user_id, content, intent_plan, project_space_id,
                 (execution_context.get("task_frame") or {}).get("frame"), knowledge_refs, retrieval_trace, task_profile,
+                knowledge_configuration["retrieval_config"], knowledge_configuration["global_policy_version"],
             )
             execution_context["knowledge_refs"] = knowledge_refs
             execution_context["knowledge_match_count"] = len(knowledge_refs)
